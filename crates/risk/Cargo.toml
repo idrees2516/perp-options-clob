@@ -1,0 +1,15 @@
+[package]
+name = "poc-risk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pre-trade risk and liquidation engine for the perp-options-clob exchange"
+
+[dependencies]
+poc-core = { path = "../core" }
+poc-margin = { path = "../margin" }
+
+[lints]
+workspace = true

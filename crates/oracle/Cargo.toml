@@ -1,0 +1,14 @@
+[package]
+name = "poc-oracle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Oracle for the perp-options-clob exchange engine"
+
+[dependencies]
+poc-core = { path = "../core" }
+
+[lints]
+workspace = true

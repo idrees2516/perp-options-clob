@@ -1,0 +1,24 @@
+[package]
+name = "poc-demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "End-to-end demo binary for the perp-options-clob exchange engine"
+
+[[bin]]
+name = "poc-demo"
+path = "src/main.rs"
+
+[dependencies]
+poc-core = { path = "../core" }
+poc-orderbook = { path = "../orderbook" }
+poc-oracle = { path = "../oracle" }
+poc-economics = { path = "../economics" }
+poc-margin = { path = "../margin" }
+poc-risk = { path = "../risk" }
+poc-engine = { path = "../engine" }
+
+[lints]
+workspace = true

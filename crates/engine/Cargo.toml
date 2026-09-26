@@ -1,0 +1,19 @@
+[package]
+name = "poc-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic exchange engine for the perp-options-clob: command-to-event sequencer, settlement, liquidations"
+
+[dependencies]
+poc-core = { path = "../core" }
+poc-orderbook = { path = "../orderbook" }
+poc-oracle = { path = "../oracle" }
+poc-economics = { path = "../economics" }
+poc-margin = { path = "../margin" }
+poc-risk = { path = "../risk" }
+
+[lints]
+workspace = true

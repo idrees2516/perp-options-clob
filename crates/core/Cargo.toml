@@ -1,0 +1,11 @@
+[package]
+name = "poc-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core domain types for the perp-options-clob exchange engine"
+
+[lints]
+workspace = true
