@@ -134,3 +134,8 @@ mkdir -p .github/workflows && mv docs/ci.yml .github/workflows/ci.yml && git com
 
 …or create `.github/workflows/ci.yml` with the file's contents through the
 GitHub web UI, or push with a token that has the `workflow` scope.
+
+## Documentation
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — the why behind every design decision, mapped to production systems.
+- [`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md) — the full implementation audit: what is implemented and verified, every unimplemented part of the designed protocol (including the unwired Everlasting Options roll and the missing option fee premium cap), competitor-mandated features absent from the protocol (RFQ, auctions, volatility surface, market data, ...), the completed economic-incentive architecture, and the prioritized 41-item roadmap (P0 / P1 / P2).
