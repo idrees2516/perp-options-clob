@@ -34,7 +34,7 @@ pub mod funding;
 pub mod incentives;
 pub mod revenue;
 
-pub use fees::{FeeCalculator, FeeQuote, FeeSchedule, FeeTier};
+pub use fees::{FeeCalculator, FeeQuote, FeeSchedule, FeeTier, OptionFeeCaps};
 pub use funding::{EverlastingRoll, FundingCalculator, FundingQuote};
 pub use incentives::{IncentiveParams, LiquidityIncentives, RewardPool, RewardSettlement};
-pub use revenue::{Allocation, RevenueRouter, RevenueSplit};
+pub use revenue::{Allocation, CoveragePolicy, RevenueRouter, RevenueSplit};

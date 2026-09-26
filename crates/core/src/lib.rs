@@ -35,7 +35,8 @@ pub mod types;
 
 pub use errors::{CoreError, MathError};
 pub use instrument::{
-    FundingParams, Instrument, OptionKind, OptionMarginParams, OptionMarket, PerpMarket,
+    EverlastingParams, FundingParams, Instrument, OptionKind, OptionMarginParams, OptionMarket,
+    OptionVariant, PerpMarket,
 };
 pub use num::{apply_bps, mul_div, mul_div_ceil, mul_div_floor, to_i128, Rounding};
 pub use types::{

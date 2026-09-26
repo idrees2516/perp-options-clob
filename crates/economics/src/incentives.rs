@@ -78,6 +78,23 @@ pub struct IncentiveParams {
     pub min_size_lots: u64,
     /// Multiplier applied to two-sided quoting, in "x" units (2 = double).
     pub two_sided_multiplier: u64,
+    /// Resting notional at touch below this floor scores nothing — the
+    /// uptime-grinding defense (quoting one lot on a dead market all
+    /// interval must not farm the reward pool).
+    pub min_touch_notional_quote_minor: u128,
+    /// Cancel-to-quote ratio above which the interval score is penalized
+    /// (see [`LiquidityIncentives::on_quote_cancelled`]). The penalty is
+    /// linear: a maker whose quote ratio is at/below this floor is
+    /// unaffected; at zero quotes kept the score halves (quote-and-pull
+    /// defense).
+    pub min_quote_ratio_bps: u64,
+    /// Lower bound of the randomized sampling delay, ms.
+    pub sample_delay_min_ms: u64,
+    /// Span of the randomized sampling delay, ms (delay is uniform over
+    /// `[min, min+span)` from a deterministic PRNG — unannounced sample
+    /// instants make the score an unbiased estimator of the quoting
+    /// time-integral).
+    pub sample_delay_span_ms: u64,
 }
 
 impl Default for IncentiveParams {
@@ -86,8 +103,36 @@ impl Default for IncentiveParams {
             max_spread_bps: 50, // 0.5% of mid
             min_size_lots: 1,
             two_sided_multiplier: 2,
+            min_touch_notional_quote_minor: 0,
+            min_quote_ratio_bps: 5_000, // 50% quotes kept -> penalty-free
+            sample_delay_min_ms: 30_000,
+            sample_delay_span_ms: 300_000,
         }
     }
+}
+
+/// Deterministic splitmix64 — the PRNG behind unannounced scoring
+/// instants (no wall-clock entropy anywhere: replay reproduces it).
+#[must_use]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The deterministic delay before the next unannounced scoring sample.
+///
+/// `sample_counter` is the number of samples taken so far (engine-side,
+/// advanced only when a sample is taken — so replay of the same tick
+/// sequence reproduces the same instants). Returns a delay in
+/// `[min, min + span)` ms.
+#[must_use]
+pub fn sample_delay(sample_counter: u64, params: &IncentiveParams) -> u64 {
+    let span = params.sample_delay_span_ms.max(1);
+    let r = splitmix64(sample_counter.wrapping_add(0x5DEE_CE66_D000_0001)) % u64::from(span);
+    params.sample_delay_min_ms + r
 }
 
 /// Accumulates maker scores and settles reward pools pro-rata.
@@ -96,6 +141,10 @@ pub struct LiquidityIncentives {
     params: IncentiveParams,
     /// Running score points per subaccount for the current interval.
     scores: HashMap<SubaccountId, u128>,
+    /// Quotes placed this interval (cancel-to-quote ratio numerator).
+    quotes_placed: HashMap<SubaccountId, u64>,
+    /// Quotes cancelled this interval (quote-and-pull tracking).
+    quotes_cancelled: HashMap<SubaccountId, u64>,
     /// Lifetime rewards paid per subaccount (audit trail).
     lifetime_paid: HashMap<SubaccountId, u128>,
 }
@@ -113,8 +162,49 @@ impl LiquidityIncentives {
         Self {
             params,
             scores: HashMap::new(),
+            quotes_placed: HashMap::new(),
+            quotes_cancelled: HashMap::new(),
             lifetime_paid: HashMap::new(),
         }
+    }
+
+    /// Record a quote placement (order resting) for the cancel-to-quote
+    /// ratio. Only resting limit placements count — IOC sweeps are not
+    /// quoting.
+    pub fn on_quote_placed(&mut self, subaccount: SubaccountId) {
+        *self.quotes_placed.entry(subaccount).or_insert(0) += 1;
+    }
+
+    /// Record a quote cancellation. A maker who repeatedly places and
+    /// pulls quotes inside the scoring band still accrues raw score
+    /// points; the ratio penalty applied at settle is the counterweight.
+    pub fn on_quote_cancelled(&mut self, subaccount: SubaccountId) {
+        *self.quotes_cancelled.entry(subaccount).or_insert(0) += 1;
+    }
+
+    /// The quote-ratio penalty multiplier for one subaccount, in bps of
+    /// the raw score (10_000 = unpenalized). Zero-activity makers are
+    /// unpenalized (their score is already zero).
+    #[must_use]
+    pub fn ratio_penalty_bps(&self, subaccount: SubaccountId) -> u64 {
+        let placed = u128::from(self.quotes_placed.get(&subaccount).copied().unwrap_or(0));
+        let cancelled = u128::from(self.quotes_cancelled.get(&subaccount).copied().unwrap_or(0));
+        let total = placed.checked_add(cancelled).unwrap_or(u128::MAX);
+        if total == 0 {
+            return 10_000;
+        }
+        // kept_ratio = placed / total, in bps.
+        let kept_bps =
+            u64::try_from(mul_div_floor(placed, 10_000, total).unwrap_or(0)).unwrap_or(0);
+        // Free below the configured floor; linear to half-score at zero kept.
+        if kept_bps >= self.params.min_quote_ratio_bps || self.params.min_quote_ratio_bps == 0 {
+            return 10_000;
+        }
+        let above = u128::from(self.params.min_quote_ratio_bps);
+        let below = u128::from(kept_bps);
+        // penalty multiplier: 5000 + 5000 * kept / floor  (floor=5000 default)
+        let scaled = 5_000_u128.saturating_add(mul_div_floor(below, 5_000, above).unwrap_or(0));
+        u64::try_from(scaled.min(10_000)).unwrap_or(10_000)
     }
 
     /// Record one observation of a maker's quoting state.
@@ -132,10 +222,26 @@ impl LiquidityIncentives {
         spread_bps: u64,
         two_sided: bool,
     ) -> u128 {
+        self.on_observation_with_notional(subaccount, size_lots, spread_bps, two_sided, u128::MAX)
+    }
+
+    /// [`LiquidityIncentives::on_observation`] with the resting notional at
+    /// touch — the uptime-grinding floor applies (`min_touch_notional`).
+    pub fn on_observation_with_notional(
+        &mut self,
+        subaccount: SubaccountId,
+        size_lots: u64,
+        spread_bps: u64,
+        two_sided: bool,
+        touch_notional_quote_minor: u128,
+    ) -> u128 {
         if size_lots < self.params.min_size_lots
             || spread_bps > self.params.max_spread_bps
             || self.params.max_spread_bps == 0
         {
+            return 0;
+        }
+        if touch_notional_quote_minor < self.params.min_touch_notional_quote_minor {
             return 0;
         }
         // Proximity factor in bps of the maximum: (max - spread)/max.
@@ -174,16 +280,31 @@ impl LiquidityIncentives {
     /// * scores reset for the next interval; an empty pool still resets.
     pub fn settle(&mut self, pool: &mut RewardPool) -> RewardSettlement {
         let budget = pool.available();
-        let total_score: u128 = self.scores.values().copied().sum();
+        // Penalized scores drive both the numerator and the denominator so
+        // pro-rata shares stay normalized (dust, not misallocation, absorbs
+        // the penalty).
+        let penalized: Vec<(SubaccountId, u128)> = self
+            .scores
+            .iter()
+            .map(|(&id, &raw)| {
+                let penalty = u128::from(self.ratio_penalty_bps(id));
+                let score = mul_div_floor(raw, penalty, 10_000).unwrap_or(raw);
+                (id, score)
+            })
+            .collect();
+        let total_score: u128 = penalized.iter().map(|(_, s)| *s).sum();
 
         let mut payments = Vec::new();
         if budget > 0 && total_score > 0 {
             let mut distributed: u128 = 0;
             // Deterministic ascending-id order.
-            let mut ids: Vec<SubaccountId> = self.scores.keys().copied().collect();
+            let mut ids: Vec<SubaccountId> = penalized.iter().map(|(id, _)| *id).collect();
             ids.sort_unstable();
             for id in ids {
-                let score = self.scores[&id];
+                let score = penalized
+                    .iter()
+                    .find(|(i, _)| *i == id)
+                    .map_or(0, |(_, s)| *s);
                 if let Some(payment) = mul_div_floor(budget, score, total_score) {
                     if payment > 0 {
                         distributed = distributed.saturating_add(payment);
@@ -199,6 +320,8 @@ impl LiquidityIncentives {
         }
 
         self.scores.clear();
+        self.quotes_placed.clear();
+        self.quotes_cancelled.clear();
         RewardSettlement {
             payments,
             carried_quote_minor: pool.carried_quote_minor,
@@ -227,6 +350,7 @@ mod tests {
             max_spread_bps: 100,
             min_size_lots: 1,
             two_sided_multiplier: 2,
+            ..IncentiveParams::default()
         })
     }
 
@@ -343,5 +467,58 @@ mod tests {
         }
         let ids: Vec<SubaccountId> = t.scoreboard().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec![1, 3, 7, 9]);
+    }
+
+    #[test]
+    fn quote_and_pull_penalty_binds() {
+        let mut t = tracker();
+        // Honest maker: 4 quotes placed, 1 cancelled -> 80% kept, above floor.
+        for _ in 0..4 {
+            t.on_quote_placed(1);
+        }
+        t.on_quote_cancelled(1);
+        t.on_observation(1, 100, 0, true);
+        assert_eq!(t.ratio_penalty_bps(1), 10_000);
+        // Quote-and-puller: 1 placed, 9 cancelled -> 10% kept, deep penalty.
+        t.on_quote_placed(2);
+        for _ in 0..9 {
+            t.on_quote_cancelled(2);
+        }
+        t.on_observation(2, 100, 0, true);
+        let p2 = t.ratio_penalty_bps(2);
+        assert!(p2 < 10_000, "penalized: {p2}");
+        assert!(p2 >= 5_000, "halved at most: {p2}");
+        // No activity at all: unpenalized.
+        assert_eq!(t.ratio_penalty_bps(3), 10_000);
+    }
+
+    #[test]
+    fn notional_floor_blocks_uptime_grinding() {
+        let mut t = LiquidityIncentives::new(IncentiveParams {
+            min_touch_notional_quote_minor: 1_000,
+            ..IncentiveParams::default()
+        });
+        assert_eq!(t.on_observation_with_notional(1, 10, 0, true, 500), 0);
+        assert!(t.on_observation_with_notional(1, 10, 0, true, 1_500) > 0);
+    }
+
+    #[test]
+    fn sample_jitter_is_deterministic_and_in_range() {
+        let params = IncentiveParams::default();
+        let a = sample_delay(7, &params);
+        let b = sample_delay(7, &params);
+        assert_eq!(a, b, "deterministic");
+        assert!(a >= params.sample_delay_min_ms);
+        assert!(a < params.sample_delay_min_ms + params.sample_delay_span_ms);
+        let c = sample_delay(8, &params);
+        // No guarantee of difference, but across 100 counters at least a few
+        // distinct values must appear (statistical sanity on the PRNG).
+        let distinct: std::collections::HashSet<_> =
+            (0..100).map(|i| sample_delay(i, &params)).collect();
+        assert!(
+            distinct.len() > 10,
+            "jitter actually varies: {}",
+            distinct.len()
+        );
     }
 }

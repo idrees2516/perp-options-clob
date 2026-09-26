@@ -139,4 +139,124 @@ pub enum Command {
         /// Engine wall-clock.
         now: TimestampMs,
     },
+    /// Create an RFQ (an unsigned intent — cannot move funds).
+    RfqCreate {
+        /// Requesting taker.
+        taker: SubaccountId,
+        /// Package legs (instrument, taker side, qty lots).
+        legs: Vec<RfqLegCommand>,
+        /// Empty = open to all makers; otherwise private direction.
+        counterparties: Vec<SubaccountId>,
+        /// Bounds on the taker's total cost.
+        min_total_cost_quote_minor: Option<u128>,
+        max_total_cost_quote_minor: Option<u128>,
+        /// Quoting window.
+        ttl_ms: TimestampMs,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Maker submits (or atomically replaces) a quote on an RFQ.
+    RfqQuote {
+        /// Quoting maker.
+        maker: SubaccountId,
+        /// Target RFQ.
+        rfq_id: u64,
+        /// Price per leg in ticks, aligned with the RFQ's leg order.
+        leg_prices_ticks: Vec<u64>,
+        /// Quote window.
+        ttl_ms: TimestampMs,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Taker atomically executes one quote of their RFQ.
+    RfqExecute {
+        /// Executing taker.
+        taker: SubaccountId,
+        /// The RFQ.
+        rfq_id: u64,
+        /// The accepted quote.
+        quote_id: u64,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Cancel an RFQ (taker) or a quote (maker).
+    RfqCancel {
+        /// Owning subaccount.
+        subaccount: SubaccountId,
+        /// Cancel this RFQ when set.
+        rfq_id: Option<u64>,
+        /// Cancel this quote when set.
+        quote_id: Option<u64>,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Register a privately negotiated, venue-cleared block trade
+    /// (both accounts' consent in the venue trust model). Printed to the
+    /// public tape after the broadcast delay.
+    BlockTrade {
+        /// First counterparty (taker side of each leg).
+        taker: SubaccountId,
+        /// Second counterparty (maker side of each leg).
+        maker: SubaccountId,
+        /// Legs: (symbol, taker side, qty lots, price ticks).
+        legs: Vec<(Symbol, Side, u64, u64)>,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Internal transfer between two subaccounts (margin-neutral for the venue).
+    Transfer {
+        /// Source subaccount.
+        from: SubaccountId,
+        /// Destination subaccount.
+        to: SubaccountId,
+        /// Amount, quote minor.
+        amount_quote_minor: u128,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Configure market-maker protection for (subaccount, currency).
+    SetMmp {
+        /// Protected subaccount.
+        subaccount: SubaccountId,
+        /// Underlying whose instruments the config governs.
+        base_symbol: String,
+        /// Rolling window length (ms).
+        interval_ms: TimestampMs,
+        /// Freeze duration (0 = until manual reset).
+        frozen_time_ms: TimestampMs,
+        /// Cumulative |fill size| in the window that trips the freeze (lots).
+        amount_limit_lots: u64,
+        /// Cumulative |net delta| in the window that trips the freeze (lots).
+        delta_limit_lots: u64,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Enable/disable cancel-on-disconnect for a subaccount.
+    SetCod {
+        /// The subaccount.
+        subaccount: SubaccountId,
+        /// The setting.
+        enabled: bool,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// A session dropped: cancel-on-disconnect pulls the subaccount's
+    /// resting orders and quotes when enabled.
+    SessionDropped {
+        /// The disconnected subaccount.
+        subaccount: SubaccountId,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+}
+
+/// One RFQ package leg as issued by a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RfqLegCommand {
+    /// Instrument symbol.
+    pub symbol: Symbol,
+    /// Taker's side on this leg.
+    pub side: Side,
+    /// Quantity in lots.
+    pub qty_lots: u64,
 }

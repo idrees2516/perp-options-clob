@@ -6,7 +6,9 @@ members = [
     "crates/oracle",
     "crates/economics",
     "crates/margin",
+    "crates/volsurface",
     "crates/risk",
+    "crates/rfq",
     "crates/engine",
     "crates/demo",
 ]

@@ -41,6 +41,7 @@
 pub mod command;
 pub mod engine;
 pub mod event;
+pub mod institutions;
 pub mod sweep;
 
 pub use command::{Command, OrderRequest};
@@ -733,6 +734,586 @@ mod tests {
         let f1 = e.account(1).map(|a| a.funding_pnl_quote_minor).unwrap_or(0);
         let f2 = e.account(2).map(|a| a.funding_pnl_quote_minor).unwrap_or(0);
         assert_eq!(f1 + f2, 0, "funding is zero-sum");
+    }
+
+    // ------------------------------------------------------------------
+    // New-feature integration tests (G-01/02/04, G-11/13, G-31, G-37, MMP)
+    // ------------------------------------------------------------------
+
+    fn wing_call() -> OptionMarket {
+        OptionMarket {
+            symbol: "BTC-EVER-80000-C".into(),
+            variant: poc_core::OptionVariant::Everlasting,
+            everlasting: poc_core::EverlastingParams {
+                interval_ms: 60_000,
+                maturity_multiple: 43_200,
+            },
+            price_band_bps: 100_000, // any price rests: fees are under test
+            ..OptionMarket::default()
+        }
+    }
+
+    fn everlasting_call() -> OptionMarket {
+        OptionMarket {
+            symbol: "BTC-EVER-80000-C".into(),
+            variant: poc_core::OptionVariant::Everlasting,
+            everlasting: poc_core::EverlastingParams {
+                interval_ms: 60_000, // 1-minute rolls for a fast test
+                maturity_multiple: 43_200,
+            },
+            expiry_ts_ms: 0,
+            ..OptionMarket::default()
+        }
+    }
+
+    #[test]
+    fn everlasting_roll_settles_and_conserves() {
+        let mut e = Engine::new(config());
+        e.register_instrument(Instrument::Option(everlasting_call()));
+        seed_oracle(&mut e, T0, 8_000_000);
+        e.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 100_000_000,
+        });
+        e.process(Command::Deposit {
+            subaccount: 2,
+            amount_quote_minor: 100_000_000,
+        });
+        // Long 100 lots vs short 100 lots at a 10_000-tick premium.
+        e.process(Command::Place {
+            request: OrderRequest::limit(2, "BTC-EVER-80000-C", Side::Ask, 10_000, 100),
+            now: T0,
+        });
+        e.process(Command::Place {
+            request: OrderRequest::limit(1, "BTC-EVER-80000-C", Side::Bid, 10_000, 100),
+            now: T0,
+        });
+        assert_eq!(
+            e.account(1).map(|a| a.lots_of("BTC-EVER-80000-C")),
+            Some(100)
+        );
+        // Advance past one roll interval with a live oracle.
+        let t1 = T0 + 61_000;
+        for provider in ["pyth", "chainlink"] {
+            e.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: provider.into(),
+                ts: t1,
+                price_quote_minor: 8_000_000,
+            });
+        }
+        let ev = e.process(Command::Tick { now: t1 });
+        assert!(
+            ev.iter().any(|x| matches!(x, Event::Funding(_))),
+            "everlasting roll settles: {ev:?}"
+        );
+        // Longs paid, shorts received, conservation exact.
+        let long = e.account(1).map(|a| a.funding_pnl_quote_minor);
+        let short = e.account(2).map(|a| a.funding_pnl_quote_minor);
+        assert!(long.is_some_and(|x| x > 0), "long pays the roll: {long:?}");
+        assert_eq!(
+            long,
+            short.map(|x| -x),
+            "roll conserves across the closed set"
+        );
+        // The everlasting position persists (never expires, never delists).
+        assert_eq!(
+            e.account(1).map(|a| a.lots_of("BTC-EVER-80000-C")),
+            Some(100)
+        );
+        assert!(e.instruments().contains_key("BTC-EVER-80000-C"));
+    }
+
+    #[test]
+    fn option_fee_cap_binds_on_wing_trades() {
+        let mut e = Engine::new(config());
+        e.register_instrument(Instrument::Option(wing_call()));
+        seed_oracle(&mut e, T0, 8_000_000);
+        e.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 100_000_000,
+        });
+        e.process(Command::Deposit {
+            subaccount: 2,
+            amount_quote_minor: 100_000_000,
+        });
+        // Deep wing: 1-tick premium ($0.50) x 1 lot (0.01 BTC) -> premium 5c.
+        // Uncapped taker rate (4bps of ~$800 underlying notional = 3.2c-ish)
+        // vs cap 12.5% of 5c = 0.625c -> cap binds at 1 minor unit.
+        e.process(Command::Place {
+            request: OrderRequest::limit(2, "BTC-EVER-80000-C", Side::Ask, 1, 1),
+            now: T0,
+        });
+        let ev = e.process(Command::Place {
+            request: OrderRequest::limit(1, "BTC-EVER-80000-C", Side::Bid, 1, 1),
+            now: T0,
+        });
+        let trade = ev.iter().find_map(|x| match x {
+            Event::TradeExecuted(t) => Some(t.as_ref().clone()),
+            _ => None,
+        });
+        let trade = trade.expect("wing trade fills");
+        let premium = trade.notional_quote_minor;
+        let cap = premium / 8; // 12.5% of premium
+        assert!(
+            u128::try_from(trade.taker_fee_quote_minor).unwrap_or(0) <= cap.max(1),
+            "taker fee {} must be capped near 12.5% of premium {premium}",
+            trade.taker_fee_quote_minor
+        );
+    }
+
+    #[test]
+    fn rfq_lifecycle_quotes_and_executes() {
+        use crate::command::RfqLegCommand;
+        let mut e = engine_with_market();
+        seed_oracle(&mut e, T0, 8_000_000);
+        e.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 100_000_000,
+        });
+        e.process(Command::Deposit {
+            subaccount: 2,
+            amount_quote_minor: 100_000_000,
+        });
+        let legs = vec![RfqLegCommand {
+            symbol: "BTC-PERP".into(),
+            side: Side::Bid,
+            qty_lots: 50,
+        }];
+        let ev = e.process(Command::RfqCreate {
+            taker: 1,
+            legs,
+            counterparties: vec![],
+            min_total_cost_quote_minor: None,
+            max_total_cost_quote_minor: None,
+            ttl_ms: 600_000,
+            now: T0,
+        });
+        assert!(matches!(ev[0], Event::RfqCreated { .. }));
+        let rfq_id = 1; // first id
+        let ev = e.process(Command::RfqQuote {
+            maker: 2,
+            rfq_id,
+            leg_prices_ticks: vec![80_000],
+            ttl_ms: 600_000,
+            now: T0,
+        });
+        assert!(matches!(ev[0], Event::RfqQuoted { .. }));
+        // A second, worse quote loses.
+        e.process(Command::RfqQuote {
+            maker: 2,
+            rfq_id,
+            leg_prices_ticks: vec![80_500],
+            ttl_ms: 600_000,
+            now: T0,
+        });
+        let ev = e.process(Command::RfqExecute {
+            taker: 1,
+            rfq_id,
+            quote_id: 1,
+            now: T0,
+        });
+        let settled = ev.iter().any(|x| matches!(x, Event::RfqSettled { .. }));
+        assert!(settled, "rfq executes: {ev:?}");
+        assert_eq!(e.account(1).map(|a| a.lots_of("BTC-PERP")), Some(50));
+        assert_eq!(e.account(2).map(|a| a.lots_of("BTC-PERP")), Some(-50));
+        // The taker paid a fee; the maker paid zero (Paradigm economics).
+        let taker_fee = e.account(1).map(|a| a.fees_paid_quote_minor);
+        let maker_fee = e.account(2).map(|a| a.fees_paid_quote_minor);
+        assert!(taker_fee.is_some_and(|f| f > 0));
+        assert_eq!(maker_fee, Some(0));
+        // RFQ is filled; executing again fails.
+        let ev = e.process(Command::RfqExecute {
+            taker: 1,
+            rfq_id,
+            quote_id: 2,
+            now: T0,
+        });
+        assert!(matches!(ev[0], Event::RfqRejected { .. }));
+    }
+
+    #[test]
+    fn rfq_directed_flow_is_private() {
+        use crate::command::RfqLegCommand;
+        let mut e = engine_with_market();
+        seed_oracle(&mut e, T0, 8_000_000);
+        e.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 100_000_000,
+        });
+        e.process(Command::Deposit {
+            subaccount: 2,
+            amount_quote_minor: 100_000_000,
+        });
+        e.process(Command::Deposit {
+            subaccount: 3,
+            amount_quote_minor: 100_000_000,
+        });
+        e.process(Command::RfqCreate {
+            taker: 1,
+            legs: vec![RfqLegCommand {
+                symbol: "BTC-PERP".into(),
+                side: Side::Bid,
+                qty_lots: 10,
+            }],
+            counterparties: vec![2],
+            min_total_cost_quote_minor: None,
+            max_total_cost_quote_minor: None,
+            ttl_ms: 600_000,
+            now: T0,
+        });
+        // Maker 3 is not a directed counterparty.
+        let ev = e.process(Command::RfqQuote {
+            maker: 3,
+            rfq_id: 1,
+            leg_prices_ticks: vec![80_000],
+            ttl_ms: 600_000,
+            now: T0,
+        });
+        assert!(matches!(ev[0], Event::RfqRejected { .. }));
+        // Maker 2 is.
+        let ev = e.process(Command::RfqQuote {
+            maker: 2,
+            rfq_id: 1,
+            leg_prices_ticks: vec![80_000],
+            ttl_ms: 600_000,
+            now: T0,
+        });
+        assert!(matches!(ev[0], Event::RfqQuoted { .. }));
+    }
+
+    #[test]
+    fn mmp_trips_cancels_and_freezes() {
+        let mut e = engine_with_market();
+        seed_oracle(&mut e, T0, 8_000_000);
+        e.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 100_000_000,
+        });
+        e.process(Command::Deposit {
+            subaccount: 2,
+            amount_quote_minor: 100_000_000,
+        });
+        // Very tight protection: 50 lots of fills trips it.
+        e.process(Command::SetMmp {
+            subaccount: 2,
+            base_symbol: "BTC".into(),
+            interval_ms: 60_000,
+            frozen_time_ms: 120_000,
+            amount_limit_lots: 50,
+            delta_limit_lots: 0,
+            now: T0,
+        });
+        e.process(Command::Place {
+            request: OrderRequest::limit(2, "BTC-PERP", Side::Ask, 80_000, 50),
+            now: T0,
+        });
+        let ev = e.process(Command::Place {
+            request: OrderRequest::limit(1, "BTC-PERP", Side::Bid, 80_000, 50),
+            now: T0,
+        });
+        assert!(
+            ev.iter().any(|x| matches!(x, Event::MmpTripped { .. })),
+            "{ev:?}"
+        );
+        // Frozen: the maker's next order is rejected while frozen.
+        let ev = e.process(Command::Place {
+            request: OrderRequest::limit(2, "BTC-PERP", Side::Ask, 80_000, 1),
+            now: T0,
+        });
+        assert!(matches!(ev[0], Event::OrderRejection(_)));
+    }
+
+    #[test]
+    fn cancel_on_disconnect_pulls_resting_orders() {
+        let mut e = engine_with_market();
+        seed_oracle(&mut e, T0, 8_000_000);
+        e.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 10_000_000,
+        });
+        e.process(Command::SetCod {
+            subaccount: 1,
+            enabled: true,
+            now: T0,
+        });
+        e.process(Command::Place {
+            request: OrderRequest::limit(1, "BTC-PERP", Side::Bid, 79_000, 10),
+            now: T0,
+        });
+        assert_eq!(e.account(1).map(|a| a.open_orders.len()), Some(1));
+        let ev = e.process(Command::SessionDropped {
+            subaccount: 1,
+            now: T0,
+        });
+        assert!(ev
+            .iter()
+            .any(|x| matches!(x, Event::SessionDisconnected { .. })));
+        assert_eq!(e.account(1).map(|a| a.open_orders.len()), Some(0));
+        // Without CoD enabled, a drop leaves orders resting.
+        e.process(Command::SetCod {
+            subaccount: 1,
+            enabled: false,
+            now: T0,
+        });
+        e.process(Command::Place {
+            request: OrderRequest::limit(1, "BTC-PERP", Side::Bid, 79_000, 10),
+            now: T0,
+        });
+        e.process(Command::SessionDropped {
+            subaccount: 1,
+            now: T0,
+        });
+        assert_eq!(e.account(1).map(|a| a.open_orders.len()), Some(1));
+    }
+
+    #[test]
+    fn internal_transfers_move_free_equity() {
+        let mut e = engine_with_market();
+        seed_oracle(&mut e, T0, 8_000_000);
+        e.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 1_000_000,
+        });
+        e.process(Command::Deposit {
+            subaccount: 2,
+            amount_quote_minor: 0,
+        });
+        let ev = e.process(Command::Transfer {
+            from: 1,
+            to: 2,
+            amount_quote_minor: 400_000,
+            now: T0,
+        });
+        assert!(matches!(ev[0], Event::TransferExecuted { .. }));
+        assert_eq!(e.account(1).map(|a| a.cash_quote_minor), Some(600_000));
+        assert_eq!(e.account(2).map(|a| a.cash_quote_minor), Some(400_000));
+        // Beyond free equity: rejected (all cash is margin-committed here? no
+        // position — but 2M is more than the account holds).
+        let ev = e.process(Command::Transfer {
+            from: 1,
+            to: 2,
+            amount_quote_minor: 2_000_000,
+            now: T0,
+        });
+        assert!(matches!(ev[0], Event::TransferRejected { .. }));
+    }
+
+    #[test]
+    fn block_trades_register_and_print_late() {
+        let mut e = engine_with_market();
+        seed_oracle(&mut e, T0, 8_000_000);
+        e.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 100_000_000,
+        });
+        e.process(Command::Deposit {
+            subaccount: 2,
+            amount_quote_minor: 100_000_000,
+        });
+        let ev = e.process(Command::BlockTrade {
+            taker: 1,
+            maker: 2,
+            legs: vec![("BTC-PERP".into(), Side::Bid, 20, 80_000)],
+            now: T0,
+        });
+        assert!(matches!(ev[0], Event::BlockRegistered { .. }));
+        // Block settled as a venue trade immediately...
+        assert_eq!(e.account(1).map(|a| a.lots_of("BTC-PERP")), Some(20));
+        // ...but prints to the public tape only after the delay.
+        let t1 = T0 + 500_000;
+        e.process(Command::OracleUpdate {
+            base_symbol: "BTC".into(),
+            provider: "pyth".into(),
+            ts: t1,
+            price_quote_minor: 8_000_000,
+        });
+        let ev = e.process(Command::Tick { now: t1 });
+        assert!(
+            !ev.iter().any(|x| matches!(x, Event::BlockPrinted { .. })),
+            "too early"
+        );
+        let t2 = T0 + poc_rfq::BlockLedger::DEFAULT_DELAY_MS + 1;
+        e.process(Command::OracleUpdate {
+            base_symbol: "BTC".into(),
+            provider: "pyth".into(),
+            ts: t2,
+            price_quote_minor: 8_000_000,
+        });
+        let ev = e.process(Command::Tick { now: t2 });
+        assert!(
+            ev.iter().any(|x| matches!(x, Event::BlockPrinted { .. })),
+            "prints after delay"
+        );
+    }
+
+    #[test]
+    fn vol_surface_governs_mark_iv() {
+        let mut e = Engine::new(config());
+        e.register_instrument(Instrument::Option(everlasting_call()));
+        seed_oracle(&mut e, T0, 8_000_000);
+        // Default anchor IV is 5500 bps (55%) when no config IV is set.
+        let before = e.vol_surface_view().mark_iv_bps("BTC-EVER-80000-C");
+        assert_eq!(before, Some(5_500));
+        e.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 100_000_000,
+        });
+        e.process(Command::Deposit {
+            subaccount: 2,
+            amount_quote_minor: 100_000_000,
+        });
+        // A two-sided book at a rich premium pushes the blended IV toward
+        // the book's implied level, clamped by the per-sweep move limit.
+        e.process(Command::Place {
+            request: OrderRequest::limit(2, "BTC-EVER-80000-C", Side::Ask, 12_000, 100),
+            now: T0,
+        });
+        e.process(Command::Place {
+            request: OrderRequest::limit(1, "BTC-EVER-80000-C", Side::Bid, 11_900, 100),
+            now: T0,
+        });
+        for i in 0..5 {
+            let t = T0 + i * 1_000;
+            e.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: "pyth".into(),
+                ts: t,
+                price_quote_minor: 8_000_000,
+            });
+            e.process(Command::Tick { now: t });
+        }
+        let after = e.vol_surface_view().mark_iv_bps("BTC-EVER-80000-C");
+        // The mark IV moved toward the richer book, but within the clamp.
+        let after = after.unwrap_or(5_500);
+        assert!(after >= 5_500, "richer book pulls IV up: {after}");
+        assert!(after < 20_000, "sanity band holds: {after}");
+    }
+
+    #[test]
+    fn greeks_view_reports_option_positions() {
+        let mut e = Engine::new(config());
+        e.register_instrument(Instrument::Option(everlasting_call()));
+        seed_oracle(&mut e, T0, 8_000_000);
+        e.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 100_000_000,
+        });
+        e.process(Command::Deposit {
+            subaccount: 2,
+            amount_quote_minor: 100_000_000,
+        });
+        let ev = e.process(Command::Place {
+            request: OrderRequest::limit(2, "BTC-EVER-80000-C", Side::Ask, 10_000, 100),
+            now: T0,
+        });
+        assert!(
+            ev.iter().any(|x| matches!(x, Event::OrderResting { .. })),
+            "ASKREST {ev:?}"
+        );
+        let ev = e.process(Command::Place {
+            request: OrderRequest::limit(1, "BTC-EVER-80000-C", Side::Bid, 10_000, 100),
+            now: T0,
+        });
+        assert!(
+            ev.iter().any(|x| matches!(x, Event::TradeExecuted(_))),
+            "BIDTRADE {ev:?}"
+        );
+        let greeks = e.greeks_view(1).unwrap_or_default();
+        assert_eq!(greeks.len(), 1);
+        let (_, delta, _vega) = greeks[0].clone();
+        assert!(delta > 0, "long ATM-ish call has positive delta: {delta}");
+    }
+
+    #[test]
+    fn new_features_replay_bit_for_bit() {
+        let mut e = engine_with_market();
+        e.register_instrument(Instrument::Option(everlasting_call()));
+        seed_oracle(&mut e, T0, 8_000_000);
+        e.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 100_000_000,
+        });
+        e.process(Command::Deposit {
+            subaccount: 2,
+            amount_quote_minor: 100_000_000,
+        });
+        // CLOB trade on the perp.
+        e.process(Command::Place {
+            request: OrderRequest::limit(2, "BTC-PERP", Side::Ask, 80_100, 30),
+            now: T0,
+        });
+        e.process(Command::Place {
+            request: OrderRequest::limit(1, "BTC-PERP", Side::Bid, 80_100, 30),
+            now: T0,
+        });
+        // Option trade on the everlasting market.
+        e.process(Command::Place {
+            request: OrderRequest::limit(2, "BTC-EVER-80000-C", Side::Ask, 10_000, 100),
+            now: T0,
+        });
+        e.process(Command::Place {
+            request: OrderRequest::limit(1, "BTC-EVER-80000-C", Side::Bid, 10_000, 100),
+            now: T0,
+        });
+        // RFQ flow.
+        use crate::command::RfqLegCommand;
+        e.process(Command::RfqCreate {
+            taker: 1,
+            legs: vec![RfqLegCommand {
+                symbol: "BTC-PERP".into(),
+                side: Side::Bid,
+                qty_lots: 20,
+            }],
+            counterparties: vec![],
+            min_total_cost_quote_minor: None,
+            max_total_cost_quote_minor: None,
+            ttl_ms: 600_000,
+            now: T0,
+        });
+        e.process(Command::RfqQuote {
+            maker: 2,
+            rfq_id: 1,
+            leg_prices_ticks: vec![80_200],
+            ttl_ms: 600_000,
+            now: T0,
+        });
+        e.process(Command::RfqExecute {
+            taker: 1,
+            rfq_id: 1,
+            quote_id: 1,
+            now: T0,
+        });
+        // A roll interval + ticks.
+        let t1 = T0 + 61_000;
+        for provider in ["pyth", "chainlink"] {
+            e.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: provider.into(),
+                ts: t1,
+                price_quote_minor: 8_000_000,
+            });
+        }
+        e.process(Command::Tick { now: t1 });
+
+        // Replay: same journal into a fresh engine, identical state.
+        let replayed = Engine::replay(config(), e.journal());
+        for sub in [1_u64, 2] {
+            let a = e.account(sub).cloned();
+            let b = replayed.account(sub).cloned();
+            assert_eq!(a, b, "subaccount {sub} matches after replay");
+        }
+        assert_eq!(
+            e.vol_surface_view().mark_iv_bps("BTC-EVER-80000-C"),
+            replayed.vol_surface_view().mark_iv_bps("BTC-EVER-80000-C"),
+            "vol surface replay is exact"
+        );
+        assert_eq!(e.insurance().balance(), replayed.insurance().balance());
+        assert_eq!(e.stats().trades, replayed.stats().trades);
+        assert_eq!(
+            e.stats().funding_intervals,
+            replayed.stats().funding_intervals
+        );
     }
 
     #[test]

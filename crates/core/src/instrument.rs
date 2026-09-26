@@ -121,10 +121,44 @@ impl Default for OptionMarginParams {
     }
 }
 
+/// Lifecycle variant of an option market.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OptionVariant {
+    /// Classic dated expiry: settles on the 30-minute TWAP at `expiry_ts_ms`
+    /// and delists (Deribit shape).
+    Dated,
+    /// Everlasting: no expiry. Each funding interval the long pays the
+    /// short the mark-premium TWAP — the funding *is* the roll (Paradigm
+    /// "Everlasting Options", White & SBF 2021). Funding cadence and the
+    /// effective maturity come from `everlasting`.
+    Everlasting,
+}
+
+/// Perpetual-option roll parameters (only read for [`OptionVariant::Everlasting`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EverlastingParams {
+    /// Roll/funding interval in ms (Paradigm paper default: 1 hour).
+    pub interval_ms: TimestampMs,
+    /// Effective maturity multiple: the marking horizon is
+    /// `interval_ms * maturity_multiple` (the paper's concentration point
+    /// scaled up so short intervals do not pin gamma at zero). Default 24
+    /// gives an hourly-rolled option the risk profile of a 1-day option.
+    pub maturity_multiple: u32,
+}
+
+impl Default for EverlastingParams {
+    fn default() -> Self {
+        Self {
+            interval_ms: 3_600_000,
+            maturity_multiple: 24,
+        }
+    }
+}
+
 /// European, cash-settled option market.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptionMarket {
-    /// Instrument symbol, e.g. `BTC-20260327-80000-C`.
+    /// Instrument symbol, e.g. `BTC-20260327-80000-C` or `BTC-EVER-80000-C`.
     pub symbol: Symbol,
     /// Underlying base symbol the option references (oracle key).
     pub base_symbol: String,
@@ -133,7 +167,12 @@ pub struct OptionMarket {
     /// Strike in quote minor units per `1.0` base. `$80,000.00` -> `8_000_000`.
     pub strike_quote_minor: u128,
     /// Expiry (ms epoch). Settlement uses the 30-minute TWAP ending at expiry.
+    /// Ignored (leave 0) for [`OptionVariant::Everlasting`].
     pub expiry_ts_ms: TimestampMs,
+    /// Lifecycle variant: dated or everlasting.
+    pub variant: OptionVariant,
+    /// Everlasting roll parameters (unused for dated options).
+    pub everlasting: EverlastingParams,
     /// Quote currency precision (minor units per major).
     pub quote_decimals: u32,
     /// Base currency precision (minor units per major).
@@ -168,6 +207,8 @@ impl Default for OptionMarket {
             kind: OptionKind::Call,
             strike_quote_minor: 8_000_000,
             expiry_ts_ms: 0,
+            variant: OptionVariant::Dated,
+            everlasting: EverlastingParams::default(),
             quote_decimals: 2,
             base_decimals: 5,
             tick_size_quote_minor: 50,
@@ -175,6 +216,34 @@ impl Default for OptionMarket {
             price_band_bps: 2_000,
             max_order_lots: 10_000,
             margin: OptionMarginParams::default(),
+        }
+    }
+}
+
+impl OptionMarket {
+    /// Time to expiry used for marking, in milliseconds.
+    ///
+    /// Dated: the calendar distance to expiry (0 at/after expiry).
+    /// Everlasting: the effective maturity implied by the roll — the
+    /// funding interval scaled by the configured multiple (the Paradigm
+    /// concentration horizon). This is the horizon the mark, the greeks,
+    /// and the scenario grid all share, so an hourly-rolled contract is
+    /// margined like the ~1-day option it economically is.
+    #[must_use]
+    pub fn tte_ms(&self, _now: TimestampMs) -> u128 {
+        match self.variant {
+            OptionVariant::Dated => u128::from(self.expiry_ts_ms.saturating_sub(_now)),
+            OptionVariant::Everlasting => u128::from(self.everlasting.interval_ms)
+                .saturating_mul(u128::from(self.everlasting.maturity_multiple)),
+        }
+    }
+
+    /// The roll interval that drives funding settlement (everlasting only).
+    #[must_use]
+    pub fn roll_interval_ms(&self) -> TimestampMs {
+        match self.variant {
+            OptionVariant::Dated => 0,
+            OptionVariant::Everlasting => self.everlasting.interval_ms,
         }
     }
 }

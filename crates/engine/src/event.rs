@@ -269,6 +269,177 @@ pub enum Event {
         /// Time of the resume.
         ts: TimestampMs,
     },
+    /// An RFQ was published (unsigned intent; id assigned at apply).
+    RfqCreated {
+        /// Requesting taker.
+        taker: SubaccountId,
+        /// The priced package legs.
+        legs: Vec<poc_rfq::RfqLeg>,
+        /// Private direction (empty = open to all makers).
+        counterparties: Vec<SubaccountId>,
+        /// Cost bounds.
+        min_total_cost_quote_minor: Option<u128>,
+        max_total_cost_quote_minor: Option<u128>,
+        /// Quoting window.
+        ttl_ms: TimestampMs,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A maker quote landed on an RFQ (id assigned at apply).
+    RfqQuoted {
+        /// Target RFQ.
+        rfq_id: u64,
+        /// Quoting maker.
+        maker: SubaccountId,
+        /// Per-leg prices, ticks.
+        leg_prices_ticks: Vec<u64>,
+        /// Quote window.
+        ttl_ms: TimestampMs,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// An RFQ action was rejected at the plan gate.
+    RfqRejected {
+        /// The requesting account.
+        subaccount: SubaccountId,
+        /// Why.
+        reason: &'static str,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// An RFQ execution settled as venue trades (fees + margin applied).
+    RfqSettled {
+        /// The RFQ.
+        rfq_id: u64,
+        /// The executed quote.
+        quote_id: u64,
+        /// Taker / maker.
+        taker: SubaccountId,
+        maker: SubaccountId,
+        /// Per-leg trades (synthetic order ids; prices in ticks).
+        trades: Vec<Trade>,
+        /// Taker fees per leg (maker pays zero — Paradigm economics).
+        taker_fees_quote_minor: Vec<i128>,
+    },
+    /// An RFQ or quote was cancelled / expired.
+    RfqClosed {
+        /// The RFQ id (0 = quote-only action).
+        rfq_id: u64,
+        /// The quote id when a single quote was acted on.
+        quote_id: Option<u64>,
+        /// Why (`cancelled` | `expired` | `filled`).
+        reason: &'static str,
+    },
+    /// Cancel-on-disconnect setting changed.
+    CodChanged {
+        /// Subaccount.
+        subaccount: SubaccountId,
+        /// The new setting.
+        enabled: bool,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A block trade registered (private until broadcast; id at apply).
+    BlockRegistered {
+        /// Counterparties.
+        taker: SubaccountId,
+        maker: SubaccountId,
+        /// Legs (symbol, taker side, qty, price ticks).
+        legs: Vec<(Symbol, Side, u64, u64)>,
+        /// Package notional, quote minor.
+        total_notional_quote_minor: u128,
+        /// Taker fees per leg (the block fee rail; maker pays zero).
+        taker_fees_quote_minor: Vec<i128>,
+        /// Public print time.
+        broadcast_ts: TimestampMs,
+    },
+    /// A block printed to the public tape after its delay.
+    BlockPrinted {
+        /// The block id.
+        block_id: u64,
+    },
+    /// An internal transfer settled.
+    TransferExecuted {
+        /// Source.
+        from: SubaccountId,
+        /// Destination.
+        to: SubaccountId,
+        /// Amount, quote minor.
+        amount_quote_minor: u128,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// An internal transfer was denied.
+    TransferRejected {
+        /// Source.
+        from: SubaccountId,
+        /// Destination.
+        to: SubaccountId,
+        /// Requested amount.
+        requested: u128,
+        /// Why.
+        reason: &'static str,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// MMP configuration recorded.
+    MmpConfigured {
+        /// Subaccount.
+        subaccount: SubaccountId,
+        /// Underlying.
+        base_symbol: String,
+        /// Rolling window (ms).
+        interval_ms: TimestampMs,
+        /// Freeze duration (ms; 0 = manual reset only).
+        frozen_time_ms: TimestampMs,
+        /// Amount limit (lots).
+        amount_limit_lots: u64,
+        /// Delta limit (lots).
+        delta_limit_lots: u64,
+    },
+    /// MMP tripped: resting orders cancelled, trading frozen for the window.
+    MmpTripped {
+        /// Subaccount.
+        subaccount: SubaccountId,
+        /// Underlying.
+        base_symbol: String,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// Cancel-on-disconnect executed for a dropped session.
+    SessionDisconnected {
+        /// Subaccount.
+        subaccount: SubaccountId,
+        /// Resting orders pulled.
+        canceled_orders: Vec<poc_core::OrderId>,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// One volatility-surface observation (book touch -> blend input).
+    SurfaceObserved(Box<SurfaceObservation>),
+    /// The governance sweep ran (move clamps + staleness fallback).
+    SurfaceSwept {
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// A circuit breaker tripped (price dislocation / cascade velocity).
+    BreakerTripped {
+        /// Which breaker (`price-dislocation` | `cascade-velocity`).
+        kind: &'static str,
+        /// Instrument (price breaker) or empty (velocity breaker).
+        symbol: Symbol,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A circuit breaker released after its cooldown.
+    BreakerReleased {
+        /// Which breaker.
+        kind: &'static str,
+        /// Instrument.
+        symbol: Symbol,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
 }
 
 /// Why an order left the book.
@@ -301,6 +472,31 @@ pub struct AccountView {
     pub funding_received_quote_minor: i128,
     /// Resting order ids.
     pub open_order_ids: Vec<OrderId>,
+}
+
+/// One governed-surface book observation (G-04).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceObservation {
+    /// Option market.
+    pub symbol: Symbol,
+    /// Oracle spot, quote minor per base.
+    pub spot_quote_minor: u128,
+    /// Strike, quote minor per base.
+    pub strike_quote_minor: u128,
+    /// Call side.
+    pub is_call: bool,
+    /// Effective time to expiry, ms.
+    pub tte_ms: u128,
+    /// Best bid premium, quote minor per base.
+    pub bid_quote_minor: u128,
+    /// Best ask premium, quote minor per base.
+    pub ask_quote_minor: u128,
+    /// Resting size at best bid, lots.
+    pub bid_lots: u64,
+    /// Resting size at best ask, lots.
+    pub ask_lots: u64,
+    /// Engine wall-clock.
+    pub ts: TimestampMs,
 }
 
 /// Top-of-book + halt state of one instrument.

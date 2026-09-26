@@ -182,6 +182,26 @@ impl LimitOrderBook {
         }
     }
 
+    /// Resting size at the best bid and ask (lots) — the surface's
+    /// touch-size gate (`(0, 0)` when a side is empty).
+    #[must_use]
+    pub fn best_touch_sizes(&self) -> (u64, u64) {
+        let bid = self.best_bid();
+        let ask = self.best_ask();
+        let mut sizes = (0_u64, 0_u64);
+        for resting in self.resting_orders() {
+            if let Some(p) = resting.order.price_ticks {
+                if Some(p) == bid {
+                    sizes.0 = sizes.0.saturating_add(resting.order.open_qty());
+                }
+                if Some(p) == ask {
+                    sizes.1 = sizes.1.saturating_add(resting.order.open_qty());
+                }
+            }
+        }
+        sizes
+    }
+
     /// Top-of-book snapshot `(bid, ask)` in ticks.
     #[must_use]
     pub fn bbo(&self) -> (Option<u64>, Option<u64>) {

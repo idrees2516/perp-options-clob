@@ -1,0 +1,15 @@
+[package]
+name = "poc-volsurface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Live governed volatility surface for option mark IV (perp-options-clob)"
+
+[dependencies]
+poc-core = { path = "../core" }
+poc-margin = { path = "../margin" }
+
+[lints]
+workspace = true

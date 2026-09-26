@@ -35,7 +35,9 @@ dependencies = [
  "poc-margin",
  "poc-oracle",
  "poc-orderbook",
+ "poc-rfq",
  "poc-risk",
+ "poc-volsurface",
 ]
 
 [[package]]
@@ -60,7 +62,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "poc-rfq"
+version = "0.1.0"
+dependencies = [
+ "poc-core",
+]
+
+[[package]]
 name = "poc-risk"
+version = "0.1.0"
+dependencies = [
+ "poc-core",
+ "poc-margin",
+]
+
+[[package]]
+name = "poc-volsurface"
 version = "0.1.0"
 dependencies = [
  "poc-core",

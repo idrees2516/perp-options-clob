@@ -135,7 +135,44 @@ mkdir -p .github/workflows && mv docs/ci.yml .github/workflows/ci.yml && git com
 …or create `.github/workflows/ci.yml` with the file's contents through the
 GitHub web UI, or push with a token that has the `workflow` scope.
 
-## Documentation
+## September 2026 — Gap-Closure Release (v0.2)
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — the why behind every design decision, mapped to production systems.
-- [`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md) — the full implementation audit: what is implemented and verified, every unimplemented part of the designed protocol (including the unwired Everlasting Options roll and the missing option fee premium cap), competitor-mandated features absent from the protocol (RFQ, auctions, volatility surface, market data, ...), the completed economic-incentive architecture, and the prioritized 41-item roadmap (P0 / P1 / P2).
+This release closes the highest-priority items from the audit's 41-item gap
+register, with design choices taken from live competitor documentation
+(see `docs/DESIGN_SOURCES.md` for the extracted rules and their sources):
+
+- **The everlasting roll is live (F-1/G-01)** — `OptionVariant::Everlasting`
+  markets settle the Paradigm Everlasting-Options funding each interval:
+  longs pay shorts the mark-premium TWAP per lot; the claim never expires.
+  Effective maturity = roll interval × configured multiple, shared by marks,
+  greeks, and the margin grid.
+- **Live governed volatility surface (G-04)** — new `poc-volsurface` crate:
+  anchor → blend → govern. Book touches invert through the implied-vol
+  solver inside a sanity band, EWMA-blend into the mark IV, per-sweep move
+  clamps and staleness fallback to the anchor. Every observation is
+  journaled (`SurfaceObserved`), so replay reproduces the surface exactly.
+- **Option fee premium caps (F-2)** — `min(rate × underlying notional,
+  12.5% × premium)` for takers, `2.5%` for makers (the Deribit/Derive rule).
+- **RFQ system (G-11/G-14/G-38)** — new `poc-rfq` crate + engine wiring:
+  multi-leg packages, private directed counterparties, firm maker quotes
+  with TTL, atomic execution through the full margin + fee + journal path,
+  Derive's grouped multi-leg fee discounts (cheapest group free, next two
+  at 50%), maker-pays-zero dealer economics.
+- **Block trades with delayed broadcast (G-13)** — venue-cleared negotiated
+  packages that print to the public tape after a 15-minute delay.
+- **Market-maker protection (MMP)** — per (subaccount, currency) rolling
+  windows on cumulative fill size and net delta; trips cancel resting
+  orders and freeze the currency for the configured window.
+- **Cancel-on-disconnect (G-37)** — persisted setting; a dropped session
+  pulls the subaccount's resting orders.
+- **Exact time-indexed fee-volume ledger (G-22)** — day-bucketed trailing
+  30-day window replaces the decay approximation.
+- **Insurance coverage policy (G-40)** — liquidation-penalty ladder that
+  boosts when coverage thins; above target, insurance fee share overflows
+  to the buyback pool.
+- **Circuit breakers (G-21)** — sustained BBO/oracle dislocation trips a
+  per-instrument cooldown.
+- **Internal transfers (G-31)** and **position greeks view (G-28)**.
+
+Test suite: **181 passing** (was 123). Replay determinism extends to the new
+subsystems — see `new_features_replay_bit_for_bit`.

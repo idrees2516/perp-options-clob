@@ -74,11 +74,157 @@ pub(crate) fn plan_tick(engine: &Engine, now: TimestampMs) -> Vec<Event> {
     // 6. Liquidity scoring and rewards.
     events.extend(plan_liquidity(engine, now, &marks));
 
-    // 7. Liquidation cascade (needs live marks; skipped while halted).
+    // 7. Volatility surface: observe book touches, govern the marks (G-04).
+    if let Some(marks) = &marks {
+        events.extend(plan_vol_surface(engine, now, marks));
+    }
+
+    // 8. RFQ + block sweeps: expiries and delayed broadcasts (G-11/G-13).
+    events.extend(plan_rfq_sweep(engine, now));
+    events.extend(plan_block_sweep(engine, now));
+
+    // 9. Price-dislocation circuit breaker (G-21).
+    events.extend(plan_price_breaker(engine, now));
+
+    // 10. Liquidation cascade (needs live marks; skipped while halted or
+    // velocity-suspended).
     if let Some(marks) = &marks {
         events.extend(plan_liquidations(engine, now, marks));
     }
 
+    events
+}
+
+/// Feed the option books' touches into the governed surface (G-04).
+///
+/// The plan is pure: observations are journaled as `SurfaceObserved`
+/// events and the governance sweep as `SurfaceSwept`, so replay drives
+/// the surface through the identical observation sequence — the
+/// determinism the rest of the engine already guarantees.
+fn plan_vol_surface(
+    engine: &Engine,
+    now: TimestampMs,
+    marks: &BTreeMap<String, MarkSet>,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    for (symbol, instrument) in &engine.instruments {
+        let Instrument::Option(m) = instrument else {
+            continue;
+        };
+        let Some(book) = engine.books.get(symbol) else {
+            continue;
+        };
+        let Some(set) = marks.get(instrument.base_symbol()) else {
+            continue;
+        };
+        let (Some(bid_ticks), Some(ask_ticks)) = book.bbo() else {
+            continue;
+        };
+        let (Some(bid), Some(ask)) = (
+            instrument.price_quote_minor(bid_ticks),
+            instrument.price_quote_minor(ask_ticks),
+        ) else {
+            continue;
+        };
+        let sizes = book.best_touch_sizes();
+        events.push(Event::SurfaceObserved(Box::new(
+            crate::event::SurfaceObservation {
+                symbol: symbol.clone(),
+                spot_quote_minor: set.spot_quote_minor_per_base,
+                strike_quote_minor: m.strike_quote_minor,
+                is_call: matches!(m.kind, poc_core::OptionKind::Call),
+                tte_ms: m.tte_ms(now),
+                bid_quote_minor: bid,
+                ask_quote_minor: ask,
+                bid_lots: sizes.0,
+                ask_lots: sizes.1,
+                ts: now,
+            },
+        )));
+    }
+    events.push(Event::SurfaceSwept { now });
+    events
+}
+
+/// Expire RFQs and quotes past their windows (journaled; apply mutates).
+fn plan_rfq_sweep(engine: &Engine, now: TimestampMs) -> Vec<Event> {
+    let mut events = Vec::new();
+    for id in engine.rfq_book.expired_rfq_ids(now) {
+        events.push(Event::RfqClosed {
+            rfq_id: id,
+            quote_id: None,
+            reason: "expired",
+        });
+    }
+    for id in engine.rfq_book.expired_quote_ids(now) {
+        events.push(Event::RfqClosed {
+            rfq_id: 0,
+            quote_id: Some(id),
+            reason: "expired",
+        });
+    }
+    events
+}
+
+/// Print due blocks to the public tape (delayed broadcast, G-13).
+fn plan_block_sweep(engine: &Engine, now: TimestampMs) -> Vec<Event> {
+    engine
+        .blocks
+        .due_ids(now)
+        .into_iter()
+        .map(|id| Event::BlockPrinted { block_id: id })
+        .collect()
+}
+
+/// Price-dislocation breaker (G-21): a BBO mid sustained beyond the
+/// dislocation band from the oracle mark trips the instrument breaker
+/// for a cooldown. The dYdX v4 halt-band shape, deterministic and journaled.
+fn plan_price_breaker(engine: &Engine, now: TimestampMs) -> Vec<Event> {
+    let mut events = Vec::new();
+    let params = &engine.config.breaker;
+    for (symbol, instrument) in &engine.instruments {
+        let Instrument::Perp(_) = instrument else {
+            continue;
+        };
+        let Some(book) = engine.books.get(symbol) else {
+            continue;
+        };
+        let (Some(bid), Some(ask)) = book.bbo() else {
+            continue;
+        };
+        let Some(bid_q) = instrument.price_quote_minor(bid) else {
+            continue;
+        };
+        let Some(ask_q) = instrument.price_quote_minor(ask) else {
+            continue;
+        };
+        let mid = (bid_q + ask_q) / 2;
+        let Some(set) = engine
+            .oracles
+            .get(instrument.base_symbol())
+            .and_then(|o| o.mark(now))
+        else {
+            continue;
+        };
+        let diff = mid.abs_diff(set);
+        let dislocated = mid > 0
+            && poc_core::mul_div(diff, 10_000, mid, poc_core::Rounding::Floor)
+                .map_or(false, |bps| bps > u128::from(params.dislocation_bps));
+        let blocked = engine.is_breaker_blocked(symbol, now);
+        if dislocated && !blocked {
+            events.push(Event::BreakerTripped {
+                kind: "price-dislocation",
+                symbol: symbol.clone(),
+                ts: now,
+            });
+        } else if !dislocated && blocked {
+            events.push(Event::BreakerReleased {
+                kind: "price-dislocation",
+                symbol: symbol.clone(),
+                ts: now,
+            });
+        }
+    }
     events
 }
 
@@ -238,6 +384,74 @@ fn plan_funding(
             })));
         }
     }
+
+    // Everlasting options: the roll IS the funding (G-01, Paradigm EO).
+    // Longs pay shorts the interval's mark-premium TWAP per lot; the
+    // claim never expires, never settles, never delists.
+    for (symbol, instrument) in &engine.instruments {
+        let Instrument::Option(m) = instrument else {
+            continue;
+        };
+        if m.variant != poc_core::OptionVariant::Everlasting {
+            continue;
+        }
+        let Some(&due) = engine.next_funding_ts.get(symbol) else {
+            continue;
+        };
+        if now < due {
+            continue;
+        }
+        let interval = m.everlasting.interval_ms;
+        // Premium TWAP over the interval from book samples; fallback to the
+        // current model mark when the book never printed (fail-safe, same
+        // convention as the perp index TWAP fallback).
+        let premium_twap_per_base = engine.mark_twap(symbol, now, interval).or_else(|| {
+            marks
+                .as_ref()
+                .and_then(|ms| ms.get(instrument.base_symbol()))
+                .and_then(|set| set.marks.get(symbol))
+                .and_then(|mark| match mark {
+                    poc_margin::Mark::Option {
+                        premium_quote_minor_per_base,
+                        ..
+                    } => Some(*premium_quote_minor_per_base),
+                    _ => None,
+                })
+        });
+        let Some(premium_twap_per_base) = premium_twap_per_base else {
+            continue;
+        };
+        let Some(base_unit) = 10_u128.checked_pow(m.base_decimals) else {
+            continue;
+        };
+        let per_lot = poc_core::mul_div(
+            premium_twap_per_base,
+            m.lot_size_base_minor,
+            base_unit,
+            poc_core::Rounding::NearestHalfUp,
+        )
+        .unwrap_or(0);
+        if per_lot == 0 {
+            continue;
+        }
+        events.push(Event::Funding(Box::new(FundingSettled {
+            symbol: symbol.clone(),
+            rate_bps: 0, // the roll settles per-lot amounts, not a rate
+            ts: now,
+        })));
+        for (sub, account) in &engine.accounts {
+            let lots = account.lots_of(symbol);
+            if lots == 0 {
+                continue;
+            }
+            let credit = -(to_i128(per_lot).saturating_mul(i128::from(lots)));
+            events.push(Event::FundingFlow(Box::new(FundingPaid {
+                subaccount: *sub,
+                symbol: symbol.clone(),
+                credit_quote_minor: credit,
+            })));
+        }
+    }
     events
 }
 
@@ -255,7 +469,11 @@ fn plan_option_expiry(
         .instruments
         .values()
         .filter_map(|i| match i {
-            Instrument::Option(m) if m.expiry_ts_ms <= now => Some(m.symbol.clone()),
+            Instrument::Option(m)
+                if m.expiry_ts_ms <= now && m.variant == poc_core::OptionVariant::Dated =>
+            {
+                Some(m.symbol.clone())
+            }
             _ => None,
         })
         .collect();

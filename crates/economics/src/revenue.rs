@@ -181,9 +181,101 @@ pub fn share_half_up(amount: u128, bps: u64) -> Option<u128> {
     poc_core::mul_div(amount, u128::from(bps), 10_000, Rounding::NearestHalfUp)
 }
 
+/// Insurance-fund coverage policy (G-40): the liquidation penalty and the
+/// buyback allocation are functions of the fund's *coverage* — its balance
+/// against the aggregate maintenance requirement it must be able to absorb.
+///
+/// A thin fund should raise the penalty **before** the stress arrives, not
+/// after; a fund above target should stop hoarding and let the overflow
+/// return to the buyback pool (the Hyperliquid-validated pattern).
+///
+/// `coverage_ratio_permille` = fund balance / aggregate maintenance
+/// requirement, in permille (1000 = 1.0x).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveragePolicy {
+    /// Coverage (permille) at/below which the base penalty applies
+    /// un-boosted — the well-funded regime.
+    pub comfortable_permille: u64,
+    /// Coverage below which the maximum penalty boost applies.
+    pub thin_permille: u64,
+    /// Maximum total penalty multiplier, in bps (15_000 = 1.5x penalty).
+    pub max_boost_bps: u64,
+    /// Coverage (permille) at/bove which the fund is "above target":
+    /// new revenue share routes to the buyback pool instead of the fund.
+    pub target_permille: u64,
+}
+
+impl Default for CoveragePolicy {
+    fn default() -> Self {
+        Self {
+            comfortable_permille: 1_500, // >= 1.5x maintenance covered
+            thin_permille: 500,          // <= 0.5x covered
+            max_boost_bps: 15_000,       // up to 1.5x the base penalty
+            target_permille: 2_000,      // >= 2x covered -> overflow to buyback
+        }
+    }
+}
+
+impl CoveragePolicy {
+    /// The effective liquidation penalty, in bps of notional, given the
+    /// base penalty and the current coverage ratio (permille).
+    ///
+    /// Linear interpolation between the thin and comfortable anchors: at or
+    /// below `thin_permille` the penalty is `base × max_boost`; at or above
+    /// `comfortable_permille` it is the base; in between it slides. Integer,
+    /// rounding the boost down (the trader is the one charged).
+    #[must_use]
+    pub fn penalty_bps(&self, base_bps: u64, coverage_ratio_permille: u64) -> u64 {
+        if coverage_ratio_permille >= self.comfortable_permille {
+            return base_bps;
+        }
+        // Boost increment over the base, in bps of base (5000 = +50%).
+        let increment = self.max_boost_bps.saturating_sub(10_000);
+        if increment == 0 || self.comfortable_permille <= self.thin_permille {
+            return base_bps; // boost disabled or misconfigured anchors
+        }
+        // Full boost magnitude: base x increment/10000, floored.
+        let full_boost =
+            mul_div_floor(u128::from(base_bps), u128::from(increment), 10_000).unwrap_or(0);
+        if coverage_ratio_permille <= self.thin_permille {
+            return u64::try_from(u128::from(base_bps).saturating_add(full_boost))
+                .unwrap_or(base_bps);
+        }
+        // Between the anchors: weight the boost by distance from thin.
+        let span = self.comfortable_permille - self.thin_permille;
+        let above = coverage_ratio_permille.saturating_sub(self.thin_permille);
+        let boost =
+            mul_div_floor(full_boost, u128::from(span - above), u128::from(span)).unwrap_or(0);
+        u64::try_from(u128::from(base_bps).saturating_add(boost)).unwrap_or(base_bps)
+    }
+
+    /// Whether the fund is above target: `true` when new insurance revenue
+    /// share should overflow to the buyback pool instead of accumulating.
+    #[must_use]
+    pub fn above_target(&self, coverage_ratio_permille: u64) -> bool {
+        coverage_ratio_permille >= self.target_permille
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage_penalty_ladder() {
+        let p = CoveragePolicy::default();
+        // Comfortable: base penalty.
+        assert_eq!(p.penalty_bps(125, 2_000), 125);
+        assert_eq!(p.penalty_bps(125, 1_500), 125);
+        // Thin: 1.5x boost.
+        assert_eq!(p.penalty_bps(125, 500), 187);
+        assert_eq!(p.penalty_bps(125, 0), 187);
+        // Midway between thin and comfortable: half the boost.
+        assert_eq!(p.penalty_bps(125, 1_000), 156);
+        // Target routing.
+        assert!(!p.above_target(1_999));
+        assert!(p.above_target(2_000));
+    }
 
     #[test]
     fn default_split_sums_to_one() {
