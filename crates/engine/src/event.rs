@@ -6,6 +6,53 @@ use poc_risk::Rejection;
 
 use crate::command::OrderRequest;
 
+/// An in-place order amendment that keeps queue priority (G-09).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderAmended {
+    /// The amended order id.
+    pub order_id: OrderId,
+    /// Owner.
+    pub subaccount: SubaccountId,
+    /// Instrument.
+    pub symbol: Symbol,
+    /// New total open quantity in lots (≤ the old open quantity).
+    pub new_open_lots: u64,
+    /// Engine wall-clock.
+    pub ts: TimestampMs,
+}
+
+/// A collateral movement (G-17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollateralMoved {
+    /// The account.
+    pub subaccount: SubaccountId,
+    /// Collateral currency code (`"USD"` = quote cash).
+    pub currency: String,
+    /// Signed amount in the currency's minor units (positive = credited).
+    pub amount_minor: i128,
+    /// Engine wall-clock.
+    pub ts: TimestampMs,
+}
+
+/// A currency conversion settled at oracle prices (G-17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollateralConverted {
+    /// The converting account.
+    pub subaccount: SubaccountId,
+    /// Source currency code.
+    pub from: String,
+    /// Destination currency code.
+    pub to: String,
+    /// Amount spent, source minor units.
+    pub from_amount_minor: u128,
+    /// Amount received, destination minor units.
+    pub to_amount_minor: u128,
+    /// Conversion rate applied: quote minor per `1.0` of source.
+    pub rate_quote_minor_per_unit: u128,
+    /// Engine wall-clock.
+    pub ts: TimestampMs,
+}
+
 /// A trade (fill) event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trade {
@@ -194,6 +241,9 @@ pub enum Event {
     MarketListed {
         /// The registered instrument.
         instrument: poc_core::Instrument,
+        /// Surface anchor IV override for auto-listed markets (G-34):
+        /// bps; `None` falls back to `option_ivs` / the 55% default.
+        anchor_iv_bps: Option<u64>,
     },
     /// Engine clock advanced by a tick.
     ClockAdvanced {
@@ -437,6 +487,87 @@ pub enum Event {
         kind: &'static str,
         /// Instrument.
         symbol: Symbol,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// An in-place amendment kept the order's queue priority (G-09).
+    OrderAmended(Box<OrderAmended>),
+    /// A trailing stop's running extreme moved (G-07). Journaled so the
+    /// parked order's trigger state replays exactly.
+    TrailingUpdated {
+        /// The parked order.
+        order_id: OrderId,
+        /// Owner.
+        subaccount: SubaccountId,
+        /// Instrument.
+        symbol: Symbol,
+        /// New running extreme (quote minor per base).
+        extreme_quote_minor: u128,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// An auction opened on one instrument (G-12): orders accumulate
+    /// without matching until `uncross_at`.
+    AuctionOpened {
+        /// Instrument.
+        symbol: Symbol,
+        /// Uncross deadline.
+        uncross_at: TimestampMs,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// An auction uncrossed at a uniform clearing price (G-12). The
+    /// embedded trades are also journaled individually as
+    /// [`Event::TradeExecuted`]; this event additionally reduces the
+    /// resting "takers" and restores continuous matching.
+    AuctionUncrossed {
+        /// Instrument.
+        symbol: Symbol,
+        /// Uniform clearing price in ticks (`None` when the book never
+        /// crossed — the auction simply ends).
+        clearing_price_ticks: Option<u64>,
+        /// Total matched quantity, lots.
+        matched_lots: u64,
+        /// (taker order id, lots) reductions to apply to resting takers.
+        taker_reductions: Vec<(OrderId, u64)>,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// Collateral credited or debited (G-17).
+    CollateralMoved(Box<CollateralMoved>),
+    /// A collateral request was denied (G-17).
+    CollateralRejected {
+        /// The account.
+        subaccount: SubaccountId,
+        /// Currency code.
+        currency: String,
+        /// Requested amount, minor units.
+        requested_minor: u128,
+        /// Why.
+        reason: &'static str,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A currency conversion settled at oracle prices (G-17).
+    CollateralConversion(Box<CollateralConverted>),
+    /// An everlasting option's strike rebased (G-03): every position was
+    /// closed at the old market's mark and reopened at the new strike's
+    /// mark — the Everstrike strike-reset that keeps contracts near the
+    /// money. Resting orders on the old market are cancelled and the old
+    /// market delists.
+    PositionMigrated {
+        /// The migrating account.
+        subaccount: SubaccountId,
+        /// Old instrument.
+        from_symbol: Symbol,
+        /// New instrument.
+        to_symbol: Symbol,
+        /// Signed lots carried over.
+        signed_lots: i64,
+        /// Mark the old position was closed at (quote minor per base).
+        close_price_quote_minor: u128,
+        /// Mark the new position was opened at (quote minor per base).
+        open_price_quote_minor: u128,
         /// Engine wall-clock.
         ts: TimestampMs,
     },

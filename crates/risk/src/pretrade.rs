@@ -74,6 +74,15 @@ pub enum Rejection {
     },
     /// No mark price is available for margining the instrument.
     MissingMark,
+    /// Portfolio greeks cap exceeded (G-41).
+    GreeksLimitExceeded {
+        /// Which cap ("vega" | "gamma").
+        what: &'static str,
+        /// Resulting exposure.
+        would_be: i128,
+        /// The cap.
+        cap: i128,
+    },
 }
 
 impl std::fmt::Display for Rejection {
@@ -99,6 +108,11 @@ impl std::fmt::Display for Rejection {
                 write!(f, "insufficient margin: shortfall {shortfall}")
             }
             Rejection::MissingMark => write!(f, "missing mark for margining"),
+            Rejection::GreeksLimitExceeded {
+                what,
+                would_be,
+                cap,
+            } => write!(f, "portfolio {what} cap exceeded: {would_be} > {cap}"),
         }
     }
 }
@@ -132,6 +146,11 @@ pub struct OrderRiskContext<'a> {
     pub halted: bool,
     /// Worst-case fee for the full fill (signed, positive = paid).
     pub estimated_fee_quote_minor: i128,
+    /// Haircut-adjusted collateral equity the account holds besides its
+    /// positions (G-17): added to the hypothetical summary's equity so the
+    /// pre-trade gate sees the same balance sheet the liquidation engine
+    /// enforces.
+    pub collateral_equity_quote_minor: i128,
 }
 
 /// Run every pre-trade gate. Returns `Ok(())` or the first rejection.
@@ -228,10 +247,13 @@ pub fn check_order(ctx: &OrderRiskContext<'_>) -> Result<MarginSummary, Rejectio
     );
     hypothetical.apply_fee(ctx.estimated_fee_quote_minor);
 
-    let summary = ctx
+    let mut summary = ctx
         .margin_engine
         .margin_summary(&hypothetical, ctx.instruments, ctx.marks)
         .ok_or(Rejection::MissingMark)?;
+    summary.equity_quote_minor = summary
+        .equity_quote_minor
+        .saturating_add(ctx.collateral_equity_quote_minor);
 
     let available = summary.available_quote_minor();
     if available < 0 {
@@ -355,6 +377,8 @@ mod tests {
             post_only,
             reduce_only,
             stp: SelfTradePrevention::CancelNewest,
+            display_lots: None,
+            trailing_extreme_quote_minor: None,
             client_ts: 0,
             engine_ts: 0,
         }
@@ -405,6 +429,7 @@ mod tests {
             limits: f.limits,
             halted: false,
             estimated_fee_quote_minor: 0,
+            collateral_equity_quote_minor: 0,
         }
     }
 

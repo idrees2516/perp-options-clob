@@ -59,6 +59,14 @@ pub struct ProviderPrice {
     pub ts: TimestampMs,
 }
 
+/// A fresh observation tagged with its provider name (cluster unit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Observation {
+    provider: String,
+    value_quote_minor: u128,
+    ts: TimestampMs,
+}
+
 /// Outcome of a provider update.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateOutcome {
@@ -78,6 +86,9 @@ pub struct AssetOracle {
     base_symbol: String,
     config: OracleConfig,
     providers: BTreeMap<String, ProviderPrice>,
+    /// Reporting view of the providers currently outside the authoritative
+    /// consensus cluster (soft quarantine: their latest observations are
+    /// retained in `providers` and they rejoin automatically).
     quarantined: BTreeMap<String, ProviderPrice>,
     /// Accepted mark history for TWAP: `(ts, mark)`.
     marks: std::collections::VecDeque<(TimestampMs, u128)>,
@@ -110,24 +121,146 @@ impl AssetOracle {
         self.last_mark
     }
 
-    /// Healthy (fresh, non-quarantined) provider count.
+    /// Healthy (fresh, authoritative-cluster) provider count.
     #[must_use]
     pub fn healthy_providers(&self, now: TimestampMs) -> usize {
-        self.fresh_prices(now).len()
+        let fresh = self.fresh_sorted(now);
+        self.select_mark(&fresh)
+            .map_or(0, |(_, auth, _)| auth.len())
     }
 
-    fn fresh_prices(&self, now: TimestampMs) -> Vec<u128> {
-        let mut out: Vec<u128> = self
+    /// Fresh provider observations, sorted by value (name as tie-break).
+    fn fresh_sorted(&self, now: TimestampMs) -> Vec<Observation> {
+        let mut out: Vec<Observation> = self
             .providers
-            .values()
-            .filter(|p| now.saturating_sub(p.ts) <= self.config.staleness_ms)
-            .map(|p| p.value_quote_minor)
+            .iter()
+            .filter(|(_, p)| now.saturating_sub(p.ts) <= self.config.staleness_ms)
+            .map(|(name, p)| Observation {
+                provider: name.clone(),
+                value_quote_minor: p.value_quote_minor,
+                ts: p.ts,
+            })
             .collect();
-        out.sort_unstable();
+        out.sort_by(|a, b| {
+            a.value_quote_minor
+                .cmp(&b.value_quote_minor)
+                .then_with(|| a.provider.cmp(&b.provider))
+        });
         out
     }
 
+    /// Split sorted observations into coherence clusters: an adjacent gap
+    /// wider than `max_deviation_bps` (relative to the lower value) breaks
+    /// the cluster.
+    fn cluster(sorted: &[Observation], max_deviation_bps: u64) -> Vec<Vec<Observation>> {
+        let mut out: Vec<Vec<Observation>> = Vec::new();
+        let mut current: Vec<Observation> = Vec::new();
+        for obs in sorted {
+            if let Some(last) = current.last() {
+                let gap = obs.value_quote_minor.saturating_sub(last.value_quote_minor);
+                let exceeds = gap.checked_mul(10_000).is_some_and(|g| {
+                    g > last
+                        .value_quote_minor
+                        .saturating_mul(u128::from(max_deviation_bps))
+                });
+                if exceeds {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            current.push(Observation {
+                provider: obs.provider.clone(),
+                value_quote_minor: obs.value_quote_minor,
+                ts: obs.ts,
+            });
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+        out
+    }
+
+    /// The consensus mark: median of the authoritative cluster.
+    ///
+    /// Authority, in order:
+    /// 1. a single coherent cluster (all fresh providers within the
+    ///    deviation band) with quorum — the common case;
+    /// 2. the cluster nearest the last accepted mark, if it has quorum —
+    ///    a single rogue print cannot drag the mark;
+    /// 3. the largest quorate cluster (ties: newest observation, then the
+    ///    lower median) — every provider moved together, a genuine market
+    ///    jump must be accepted, not suppressed.
+    ///
+    /// Without a quorate cluster the mark is `None`: the venue halts on
+    /// that underlying (fail-safe), which is the correct response to a
+    /// split the oracle cannot resolve.
+    fn select_mark(&self, fresh: &[Observation]) -> Option<(u128, Vec<String>, Vec<String>)> {
+        if fresh.len() < self.config.min_providers {
+            return None;
+        }
+        let clusters = Self::cluster(fresh, self.config.max_deviation_bps);
+        if clusters.len() == 1 {
+            return Some((
+                median(
+                    &fresh
+                        .iter()
+                        .map(|o| o.value_quote_minor)
+                        .collect::<Vec<_>>(),
+                ),
+                fresh.iter().map(|o| o.provider.clone()).collect(),
+                Vec::new(),
+            ));
+        }
+
+        let quorate: Vec<&Vec<Observation>> = clusters
+            .iter()
+            .filter(|c| c.len() >= self.config.min_providers)
+            .collect();
+        if quorate.is_empty() {
+            return None;
+        }
+
+        let cluster_median = |c: &Vec<Observation>| -> u128 {
+            median(&c.iter().map(|o| o.value_quote_minor).collect::<Vec<_>>())
+        };
+
+        // Rule 2: continuity — prefer the cluster nearest the last mark.
+        if let Some(winner) = candidates_of(&quorate, self.last_mark, cluster_median) {
+            let names: Vec<String> = winner.iter().map(|o| o.provider.clone()).collect();
+            let losers: Vec<String> = clusters
+                .iter()
+                .filter(|c| !std::ptr::eq(*c, winner))
+                .flat_map(|c| c.iter().map(|o| o.provider.clone()).collect::<Vec<_>>())
+                .collect();
+            return Some((cluster_median(winner), names, losers));
+        }
+
+        // Rule 3: everyone moved together — largest quorate cluster wins.
+        let mut ranked = quorate.clone();
+        ranked.sort_by(|a, b| {
+            b.len()
+                .cmp(&a.len())
+                .then_with(|| {
+                    let ta = a.iter().map(|o| o.ts).max().unwrap_or(0);
+                    let tb = b.iter().map(|o| o.ts).max().unwrap_or(0);
+                    tb.cmp(&ta)
+                })
+                .then_with(|| cluster_median(a).cmp(&cluster_median(b)))
+        });
+        let winner = ranked.first().copied()?;
+        let names: Vec<String> = winner.iter().map(|o| o.provider.clone()).collect();
+        let losers: Vec<String> = clusters
+            .iter()
+            .filter(|c| !std::ptr::eq(*c, winner))
+            .flat_map(|c| c.iter().map(|o| o.provider.clone()).collect::<Vec<_>>())
+            .collect();
+        Some((cluster_median(winner), names, losers))
+    }
+
     /// Record a provider observation and recompute the mark.
+    ///
+    /// Observations are always retained (soft quarantine): a provider that
+    /// rejoins consensus is reinstated automatically on its next print,
+    /// with no operator action and no liveness cliff.
     pub fn update(
         &mut self,
         provider: &str,
@@ -138,40 +271,31 @@ impl AssetOracle {
             value_quote_minor,
             ts,
         };
-
-        // Deviation quarantine against the last accepted mark.
-        if let Some(mark) = self.last_mark {
-            if mark > 0 {
-                let diff = value_quote_minor.abs_diff(mark);
-                // diff / mark > max_deviation_bps / 10_000, in integers.
-                let exceeds = diff
-                    .checked_mul(10_000)
-                    .is_some_and(|d| d > mark * u128::from(self.config.max_deviation_bps));
-                if exceeds {
-                    self.quarantined.insert(provider.into(), obs);
-                    self.providers.remove(provider);
-                    return UpdateOutcome::Quarantined {
-                        value: value_quote_minor,
-                        last_mark: mark,
-                    };
-                }
-            }
-        }
-
-        self.quarantined.remove(provider);
         self.providers.insert(provider.into(), obs);
 
-        let fresh = self.fresh_prices(ts);
-        if fresh.len() >= self.config.min_providers {
-            let mark = median(&fresh);
-            self.last_mark = Some(mark);
-            self.push_mark(ts, mark);
-        } else if let (Some(last), true) = (self.last_mark, fresh.is_empty()) {
-            // All providers stale: mark ages out.
-            self.last_mark = Some(last);
-            self.push_mark(ts, last);
+        let fresh = self.fresh_sorted(ts);
+        match self.select_mark(&fresh) {
+            Some((mark, authoritative, outliers)) => {
+                self.last_mark = Some(mark);
+                self.push_mark(ts, mark);
+                // Refresh the reporting view of the consensus split.
+                self.quarantined.clear();
+                for name in &outliers {
+                    if let Some(p) = self.providers.get(name) {
+                        self.quarantined.insert(name.clone(), *p);
+                    }
+                }
+                if authoritative.iter().any(|n| n == provider) {
+                    UpdateOutcome::Accepted(Some(mark))
+                } else {
+                    UpdateOutcome::Quarantined {
+                        value: value_quote_minor,
+                        last_mark: mark,
+                    }
+                }
+            }
+            None => UpdateOutcome::Accepted(self.last_mark),
         }
-        UpdateOutcome::Accepted(self.last_mark)
     }
 
     fn push_mark(&mut self, ts: TimestampMs, mark: u128) {
@@ -191,12 +315,8 @@ impl AssetOracle {
     /// Current mark at time `now`, or `None` if quorum is lost.
     #[must_use]
     pub fn mark(&self, now: TimestampMs) -> Option<u128> {
-        let fresh = self.fresh_prices(now);
-        if fresh.len() >= self.config.min_providers {
-            Some(median(&fresh))
-        } else {
-            None
-        }
+        let fresh = self.fresh_sorted(now);
+        self.select_mark(&fresh).map(|(mark, _, _)| mark)
     }
 
     /// Time-weighted average mark over `[now - window, now]`.
@@ -248,6 +368,19 @@ impl AssetOracle {
         }
         Some(weighted / total)
     }
+}
+
+/// Pick the quorate cluster nearest the last accepted mark, if any.
+fn candidates_of<'a>(
+    quorate: &[&'a Vec<Observation>],
+    last_mark: Option<u128>,
+    cluster_median: impl Fn(&Vec<Observation>) -> u128,
+) -> Option<&'a Vec<Observation>> {
+    let mark = last_mark?;
+    quorate
+        .iter()
+        .copied()
+        .min_by_key(|c| cluster_median(c).abs_diff(mark))
 }
 
 /// Median of a non-empty sorted list; even counts average the middle pair
@@ -341,5 +474,61 @@ mod tests {
     fn twap_insufficient_history() {
         let o = oracle();
         assert_eq!(o.twap(1_000, 100), None);
+    }
+
+    #[test]
+    fn genuine_jump_accepted_when_all_providers_move() {
+        let mut o = oracle();
+        o.update("pyth", 100, 8_000_000);
+        o.update("chainlink", 100, 8_000_000);
+        assert_eq!(o.mark(100), Some(8_000_000));
+        // A genuine +15% market jump with every provider agreeing must be
+        // accepted, not suppressed by the deviation band.
+        assert_eq!(
+            o.update("pyth", 200, 9_200_000),
+            UpdateOutcome::Accepted(Some(8_000_000)) // transient: quorum reforming
+        );
+        assert_eq!(
+            o.update("chainlink", 200, 9_200_000),
+            UpdateOutcome::Accepted(Some(9_200_000))
+        );
+        assert_eq!(o.mark(200), Some(9_200_000));
+    }
+
+    #[test]
+    fn split_cluster_keeps_continuity_with_quorate_old_level() {
+        let mut o = oracle();
+        o.update("a", 100, 1_000);
+        o.update("b", 100, 1_000);
+        o.update("c", 100, 1_000);
+        o.update("d", 100, 1_000);
+        // Two providers print 5x: a real split, but the old level still has
+        // a quorum and continuity wins.
+        o.update("c", 110, 5_000);
+        o.update("d", 111, 5_000);
+        assert_eq!(o.mark(111), Some(1_000));
+        // The old level ages out: the moved cluster takes over cleanly.
+        assert_eq!(o.mark(110 + 61_000), None);
+        o.update("c", 61_400, 5_000);
+        o.update("d", 61_400, 5_000);
+        assert_eq!(o.mark(61_400), Some(5_000));
+    }
+
+    #[test]
+    fn two_provider_disagreement_loses_quorum_fail_safe() {
+        let mut o = oracle();
+        o.update("a", 100, 1_000);
+        o.update("b", 100, 1_000);
+        // With only two providers, a split cannot be adjudicated: no
+        // cluster holds quorum, so the mark drops (venue halts that
+        // underlying — fail-safe) and neither side is blamed.
+        assert_eq!(
+            o.update("b", 110, 2_500),
+            UpdateOutcome::Accepted(Some(1_000)) // last known mark reported
+        );
+        assert_eq!(o.mark(110), None);
+        // The rogue returns within range: quorum reforms immediately.
+        o.update("b", 120, 1_010);
+        assert_eq!(o.mark(120), Some(1_005));
     }
 }

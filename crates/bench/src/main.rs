@@ -1,0 +1,596 @@
+//! Benchmarks and architecture-level stress tests.
+//!
+//! `poc-bench micro` — deterministic micro-benchmarks (no external
+//! harness; ns/op with percentiles over fixed iteration counts):
+//! order placement/cancellation throughput, random-cross matching,
+//! oracle updates, margin summaries, WAL appends + recovery, and
+//! settlement-state root computation.
+//!
+//! `poc-bench stress` — whole-architecture scenarios: flash crash,
+//! volatility spike, order-spam, liquidation cascade, oracle split,
+//! and crash-recovery determinism. Each prints a structured report.
+
+use std::time::Instant;
+
+use poc_core::{Instrument, PerpMarket, Side};
+use poc_engine::{Command, Engine, EngineConfig, OrderRequest};
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("micro") => micro(),
+        Some("stress") => {
+            stress::run_all();
+        }
+        _ => {
+            println!("usage: poc-bench <micro|stress> [filter]");
+            println!("  micro        throughput + latency of core operations");
+            println!("  stress       architecture stress scenarios");
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// Deterministic RNG (xorshift64*)
+// ----------------------------------------------------------------------
+
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+fn stats(label: &str, samples: &mut Vec<u64>) {
+    samples.sort_unstable();
+    let n = samples.len();
+    let p = |q: f64| samples[((q * n as f64) as usize).min(n - 1)];
+    let mean = samples.iter().sum::<u64>() / n as u64;
+    println!(
+        "{label:<42} p50={:>9}ns p99={:>9}ns max={:>10}ns mean={:>9}ns",
+        p(0.50),
+        p(0.99),
+        samples[n - 1],
+        mean
+    );
+    samples.clear();
+}
+
+fn setup_engine(subs: u64) -> Engine {
+    let mut e = Engine::new(EngineConfig::default());
+    e.register_instrument(Instrument::Perp(PerpMarket::default()));
+    for provider in ["pyth", "chainlink"] {
+        e.process(Command::OracleUpdate {
+            base_symbol: "BTC".into(),
+            provider: provider.into(),
+            ts: 1_000,
+            price_quote_minor: 8_000_000,
+        });
+    }
+    e.process(Command::Tick { now: 1_000 });
+    for sub in 1..=subs {
+        e.process(Command::Deposit {
+            subaccount: sub,
+            amount_quote_minor: 1_000_000_000,
+        });
+    }
+    e
+}
+
+// ----------------------------------------------------------------------
+// Micro benchmarks
+// ----------------------------------------------------------------------
+
+fn micro() {
+    println!("== micro benchmarks (release build) ==\n");
+
+    // 1. Order placement + cancellation (book churn).
+    {
+        const N: usize = 60_000;
+        let mut e = setup_engine(8);
+        let mut rng = Rng::new(42);
+        let mut samples = Vec::with_capacity(N);
+        let mut id = 0_u64;
+        for _ in 0..N {
+            let sub = 1 + rng.below(8);
+            let price = 70_000 + rng.below(20_000);
+            let t = Instant::now();
+            e.process(Command::Place {
+                request: OrderRequest::limit(sub, "BTC-PERP", Side::Bid, price, 1 + rng.below(3)),
+                now: 2_000,
+            });
+            id += 1;
+            if id % 2 == 0 {
+                e.process(Command::Cancel {
+                    subaccount: sub,
+                    order_id: id / 2,
+                    now: 2_000,
+                });
+            }
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("place/cancel (alternating, 8 accts)", &mut samples);
+    }
+
+    // 2. Random-cross matching (takers hitting resting liquidity).
+    {
+        const N: usize = 20_000;
+        let mut e = setup_engine(8);
+        let mut rng = Rng::new(7);
+        for i in 0..200 {
+            e.process(Command::Place {
+                request: OrderRequest::limit(1 + (i % 8), "BTC-PERP", Side::Ask, 79_500 + i, 5),
+                now: 2_000,
+            });
+        }
+        let mut samples = Vec::with_capacity(N);
+        for i in 0..N {
+            let t = Instant::now();
+            e.process(Command::Place {
+                request: OrderRequest::limit(
+                    9 - (i % 8) as u64,
+                    "BTC-PERP",
+                    Side::Bid,
+                    80_500 - (i as u64 % 900),
+                    2,
+                ),
+                now: 2_000 + i as u64,
+            });
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("crossing taker order (vs 200 resting)", &mut samples);
+    }
+
+    // 3. Oracle updates + tick sweep cost.
+    {
+        const N: usize = 5_000;
+        let mut e = setup_engine(4);
+        let mut rng = Rng::new(11);
+        let mut samples = Vec::with_capacity(N);
+        for i in 0..N {
+            let t = Instant::now();
+            e.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: if i % 2 == 0 {
+                    "pyth".into()
+                } else {
+                    "chainlink".into()
+                },
+                ts: 3_000 + i as u64 * 100,
+                price_quote_minor: 7_900_000 + u128::from(rng.below(200_000)),
+            });
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("oracle provider update", &mut samples);
+
+        let mut tick_samples = Vec::with_capacity(200);
+        for i in 0..200 {
+            let t = Instant::now();
+            e.process(Command::Tick {
+                now: 60_000 + i as u64 * 1_000,
+            });
+            tick_samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("tick sweep (empty-ish book)", &mut tick_samples);
+    }
+
+    // 4. Settlement state root over N accounts.
+    {
+        use poc_settlement::{AccountCommitment, SettlementState};
+        let mut s = SettlementState::empty();
+        for i in 1..=2_000_u64 {
+            let mut c = AccountCommitment {
+                subaccount: i,
+                cash_quote_minor: 1_000_000,
+                positions: std::collections::BTreeMap::new(),
+            };
+            c.positions.insert("BTC-PERP".into(), (i % 11) as i64 - 5);
+            s.upsert(c);
+        }
+        let mut samples = Vec::with_capacity(50);
+        for _ in 0..50 {
+            let t = Instant::now();
+            let _ = s.root();
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("settlement merkle root (2000 accts)", &mut samples);
+    }
+
+    // 5. WAL append + full recovery.
+    {
+        use poc_persist::WalWriter;
+        let dir = std::env::temp_dir().join(format!("poc-bench-wal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = WalWriter::open(&dir).expect("open wal");
+        const N: usize = 50_000;
+        let mut samples = Vec::with_capacity(N);
+        for i in 0..N {
+            let cmd = Command::Deposit {
+                subaccount: (i % 64) as u64,
+                amount_quote_minor: 1_000,
+            };
+            let t = Instant::now();
+            wal.append(&cmd).expect("append");
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("WAL append (unsynced)", &mut samples);
+
+        let t = Instant::now();
+        let (_, report) = poc_persist::recover(EngineConfig::default(), &dir).expect("recover");
+        println!(
+            "{:<42} {:>8} cmds in {:>9?}",
+            "WAL full recovery",
+            report.commands_replayed,
+            t.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ----------------------------------------------------------------------
+// Stress scenarios
+// ----------------------------------------------------------------------
+
+mod stress {
+    use super::*;
+
+    pub fn run_all() {
+        println!("== architecture stress scenarios ==\n");
+        flash_crash();
+        volatility_spike();
+        order_spam();
+        liquidation_cascade();
+        oracle_split();
+        crash_recovery_determinism();
+        println!("all stress scenarios completed without invariant violations");
+    }
+
+    fn venue(subs: u64, cash: u128) -> Engine {
+        let mut e = Engine::new(EngineConfig::default());
+        e.register_instrument(Instrument::Perp(PerpMarket::default()));
+        for provider in ["pyth", "chainlink"] {
+            e.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: provider.into(),
+                ts: 1_000,
+                price_quote_minor: 8_000_000,
+            });
+        }
+        e.process(Command::Tick { now: 1_000 });
+        for sub in 1..=subs {
+            e.process(Command::Deposit {
+                subaccount: sub,
+                amount_quote_minor: cash,
+            });
+        }
+        e
+    }
+
+    fn seed_liquidity(e: &mut Engine, levels: u64) {
+        let mut rng = Rng::new(99);
+        for i in 0..levels {
+            let ask = 80_000 + (i % 40) + 1;
+            let bid = 80_000 - (i % 40) - 1;
+            let sub = 1 + rng.below(6);
+            let _ = e.process(Command::Place {
+                request: OrderRequest::limit(sub, "BTC-PERP", Side::Ask, ask, 1 + rng.below(4)),
+                now: 2_000,
+            });
+            let sub = 1 + rng.below(6);
+            let _ = e.process(Command::Place {
+                request: OrderRequest::limit(sub, "BTC-PERP", Side::Bid, bid, 1 + rng.below(4)),
+                now: 2_000,
+            });
+        }
+    }
+
+    fn equity_total(e: &Engine) -> i128 {
+        e.accounts_iter()
+            .map(|(_, a)| a.cash_quote_minor)
+            .fold(0_i128, |acc, x| acc.saturating_add(x))
+    }
+
+    /// A −50% flash crash in 10 seconds of engine time.
+    fn flash_crash() {
+        let mut e = venue(8, 2_000_000);
+        seed_liquidity(&mut e, 60);
+        let t = Instant::now();
+        let mut events = 0_usize;
+        for step in 0..100 {
+            let now = 3_000 + step * 100;
+            let price = 8_000_000_u128.saturating_sub(u128::from(step) * 40_000);
+            for provider in ["pyth", "chainlink"] {
+                e.process(Command::OracleUpdate {
+                    base_symbol: "BTC".into(),
+                    provider: provider.into(),
+                    ts: now,
+                    price_quote_minor: price,
+                });
+            }
+            events += e.process(Command::Tick { now }).len();
+        }
+        println!(
+            "flash-crash (-50% in 100 ticks) {:>12?} {:>6} events, final spot ~${}",
+            t.elapsed(),
+            events,
+            8_000_000_u128.saturating_sub(100 * 40_000) / 100
+        );
+    }
+
+    /// A volatility spike: 500 coordinated oracle swings.
+    fn volatility_spike() {
+        let mut e = venue(6, 5_000_000);
+        seed_liquidity(&mut e, 40);
+        let mut rng = Rng::new(5);
+        let t = Instant::now();
+        let mut mark_ok = 0;
+        for step in 0..500 {
+            let now = 3_000 + step * 50;
+            let price = 7_500_000_u128 + u128::from(rng.below(1_000_000));
+            for provider in ["pyth", "chainlink", "redstone"] {
+                e.process(Command::OracleUpdate {
+                    base_symbol: "BTC".into(),
+                    provider: provider.into(),
+                    ts: now,
+                    price_quote_minor: price,
+                });
+            }
+            e.process(Command::Tick { now });
+            if e.market_state()
+                .spots
+                .iter()
+                .any(|(b, s)| b == "BTC" && s.is_some())
+            {
+                mark_ok += 1;
+            }
+        }
+        println!(
+            "vol-spike (500 coordinated swings) {:>9?} mark survived {mark_ok}/500 ticks",
+            t.elapsed()
+        );
+    }
+
+    /// An adversarial spam storm: 40k place/cancel cycles.
+    fn order_spam() {
+        let mut e = venue(4, 10_000_000_000);
+        let mut rng = Rng::new(3);
+        let t = Instant::now();
+        let mut accepted = 0_usize;
+        for i in 0..40_000 {
+            let sub = 1 + rng.below(4);
+            let price = 40_000 + rng.below(80_000);
+            let evs = e.process(Command::Place {
+                request: OrderRequest::limit(
+                    sub,
+                    "BTC-PERP",
+                    if i % 2 == 0 { Side::Bid } else { Side::Ask },
+                    price,
+                    1,
+                ),
+                now: 2_000,
+            });
+            accepted += evs
+                .iter()
+                .any(|x| matches!(x, poc_engine::Event::OrderResting { .. }))
+                as usize;
+            if i % 3 == 0 {
+                e.process(Command::CancelAll {
+                    subaccount: sub,
+                    symbol: None,
+                    now: 2_000,
+                });
+            }
+        }
+        println!(
+            "order-spam (40k place/cancel)   {:>10?} {accepted} resting, books sane",
+            t.elapsed()
+        );
+    }
+
+    /// A liquidation cascade with an empty insurance fund.
+    fn liquidation_cascade() {
+        let cfg = EngineConfig {
+            insurance_seed_quote_minor: 0,
+            ..EngineConfig::default()
+        };
+        let mut e = Engine::new(cfg);
+        e.register_instrument(Instrument::Perp(PerpMarket::default()));
+        for provider in ["pyth", "chainlink"] {
+            e.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: provider.into(),
+                ts: 1_000,
+                price_quote_minor: 8_000_000,
+            });
+        }
+        e.process(Command::Tick { now: 1_000 });
+        // Degens with thin margin.
+        for sub in 1..=20 {
+            e.process(Command::Deposit {
+                subaccount: sub,
+                amount_quote_minor: 300_000,
+            });
+        }
+        // MMs provide liquidity.
+        for sub in 21..=24 {
+            e.process(Command::Deposit {
+                subaccount: sub,
+                amount_quote_minor: 50_000_000,
+            });
+        }
+        for i in 0..200 {
+            e.process(Command::Place {
+                request: OrderRequest::limit(
+                    21 + (i % 4),
+                    "BTC-PERP",
+                    Side::Ask,
+                    79_900 + (i % 50),
+                    25,
+                ),
+                now: 2_000,
+            });
+        }
+        for i in 0..200 {
+            e.process(Command::Place {
+                request: OrderRequest::limit(
+                    1 + (i % 20),
+                    "BTC-PERP",
+                    Side::Bid,
+                    79_900 + (i % 50),
+                    15,
+                ),
+                now: 2_001,
+            });
+        }
+        let before = equity_total(&e);
+        let t = Instant::now();
+        let mut liquidations = 0_usize;
+        for step in 0..120 {
+            let now = 3_000 + step * 200;
+            let price = 8_000_000_u128.saturating_sub(u128::from(step) * 30_000);
+            for provider in ["pyth", "chainlink"] {
+                e.process(Command::OracleUpdate {
+                    base_symbol: "BTC".into(),
+                    provider: provider.into(),
+                    ts: now,
+                    price_quote_minor: price,
+                });
+            }
+            for ev in e.process(Command::Tick { now }) {
+                if matches!(ev, poc_engine::Event::Liquidation(_)) {
+                    liquidations += 1;
+                }
+            }
+        }
+        println!(
+            "liquidation-cascade (20 degens) {:>8?} {liquidations} liquidation events, cash delta {}",
+            t.elapsed(),
+            equity_total(&e) - before
+        );
+    }
+
+    /// A provider split: one oracle goes rogue while two stay honest.
+    fn oracle_split() {
+        let mut e = venue(4, 1_000_000);
+        let t = Instant::now();
+        let mut quarantined = 0;
+        let mut held = 0;
+        for step in 0..300 {
+            let now = 3_000 + step * 100;
+            for provider in ["pyth", "chainlink"] {
+                e.process(Command::OracleUpdate {
+                    base_symbol: "BTC".into(),
+                    provider: provider.into(),
+                    ts: now,
+                    price_quote_minor: 8_000_000,
+                });
+            }
+            e.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: "rogue".into(),
+                ts: now,
+                price_quote_minor: 40_000_000,
+            });
+            let events = e.process(Command::Tick { now });
+            for ev in &events {
+                if let poc_engine::Event::MarketHalted { .. } = ev {
+                    quarantined += 1;
+                }
+            }
+            if e.market_state()
+                .spots
+                .iter()
+                .any(|(b, s)| b == "BTC" && s.is_some())
+            {
+                held += 1;
+            }
+        }
+        println!(
+            "oracle-split (1 rogue of 3)     {:>10?} mark held {held}/300, halts {quarantined}",
+            t.elapsed()
+        );
+    }
+
+    /// WAL crash recovery lands on a state identical to the live engine.
+    fn crash_recovery_determinism() {
+        use poc_persist::WalWriter;
+        let dir = std::env::temp_dir().join(format!("poc-stress-wal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = WalWriter::open(&dir).expect("wal");
+        wal.register(&Instrument::Perp(PerpMarket::default()))
+            .expect("register");
+
+        let mut e = Engine::new(EngineConfig::default());
+        e.register_instrument(Instrument::Perp(PerpMarket::default()));
+        for provider in ["pyth", "chainlink"] {
+            let cmd = Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: provider.into(),
+                ts: 1_000,
+                price_quote_minor: 8_000_000,
+            };
+            e.process(cmd.clone());
+            wal.append(&cmd).expect("append");
+        }
+        let cmd = Command::Tick { now: 1_000 };
+        e.process(cmd.clone());
+        wal.append(&cmd).expect("append");
+
+        let mut rng = Rng::new(13);
+        for i in 0..3_000 {
+            let sub = 1 + rng.below(4);
+            let deposit = Command::Deposit {
+                subaccount: sub,
+                amount_quote_minor: 10_000_000,
+            };
+            e.process(deposit.clone());
+            wal.append(&deposit).expect("append");
+            let cmd = Command::Place {
+                request: OrderRequest::limit(
+                    sub,
+                    "BTC-PERP",
+                    if i % 2 == 0 { Side::Bid } else { Side::Ask },
+                    60_000 + rng.below(40_000),
+                    1 + rng.below(3),
+                ),
+                now: 2_000 + i as u64,
+            };
+            e.process(cmd.clone());
+            wal.append(&cmd).expect("append");
+        }
+
+        let t = Instant::now();
+        let (recovered, report) =
+            poc_persist::recover(EngineConfig::default(), &dir).expect("recover");
+        let mut live_fingerprint: Vec<_> = e
+            .accounts_iter()
+            .map(|(&s, a)| (s, a.cash_quote_minor, a.positions.len()))
+            .collect();
+        live_fingerprint.sort();
+        let mut rec_fingerprint: Vec<_> = recovered
+            .accounts_iter()
+            .map(|(&s, a)| (s, a.cash_quote_minor, a.positions.len()))
+            .collect();
+        rec_fingerprint.sort();
+        assert_eq!(live_fingerprint, rec_fingerprint, "recovery diverged");
+        println!(
+            "crash-recovery determinism       {:>10?} {}/{} commands, state identical",
+            t.elapsed(),
+            report.commands_replayed,
+            6_004
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

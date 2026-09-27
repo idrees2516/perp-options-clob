@@ -34,9 +34,11 @@
 //! All money is integer quote-minor units; the risk layer never mutates a
 //! ledger itself — it *plans*, the engine executes and journals.
 
+pub mod greeks_limits;
 pub mod liquidation;
 pub mod pretrade;
 
+pub use greeks_limits::{GreeksLimits, GreeksRejection};
 pub use liquidation::{
     AdlCandidate, AdlRanking, InsuranceFund, LiquidationAction, LiquidationCandidate,
     LiquidationParams, LiquidationPlan, LiquidationPlanner, LiquidationQueue,

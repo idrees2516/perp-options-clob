@@ -38,6 +38,19 @@ pub struct RestingOrder {
     pub order: Order,
     /// Resting price in ticks (copied for fast matching).
     pub price_ticks: u64,
+    /// Lots currently *displayed* at the level: the full open quantity for
+    /// plain orders, the visible iceberg slice for hidden-quantity orders
+    /// (G-06). Matching, depth, and touch-size views only ever see this.
+    pub visible_lots: u64,
+}
+
+impl RestingOrder {
+    /// The matching-relevant size of this resting order: its displayed
+    /// slice, never its hidden remainder.
+    #[must_use]
+    pub fn visible_qty(&self) -> u64 {
+        self.visible_lots
+    }
 }
 
 /// A trade produced by matching, priced at the maker's limit.
@@ -84,6 +97,17 @@ pub struct MatchOutcome {
     pub taker_remaining_lots: u64,
 }
 
+/// Result of uncrossing an auction book at a uniform price (G-12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuctionOutcome {
+    /// The uniform clearing price (`None` when the book did not cross).
+    pub clearing_price_ticks: Option<u64>,
+    /// Fills at the clearing price, in price-time priority order.
+    pub fills: Vec<Fill>,
+    /// Total matched quantity in lots.
+    pub matched_lots: u64,
+}
+
 impl MatchOutcome {
     /// Total quantity filled by trades.
     #[must_use]
@@ -107,7 +131,10 @@ pub struct LevelSnapshot {
 ///
 /// Invariant (enforced by the engine's place-then-rest flow): **the book is
 /// never crossed** — `best_bid < best_ask` at all times, because any incoming
-/// order that crosses is matched immediately rather than rested.
+/// order that crosses is matched immediately rather than rested. The one
+/// exception is **auction mode** (G-12): while an opening/periodic auction
+/// accumulates orders, crossing is allowed (nothing matches until the
+/// uncross) and the invariant is re-checked by the uncross itself.
 pub struct LimitOrderBook {
     symbol: Symbol,
     /// Ask levels: price ascending (first = best ask).
@@ -117,6 +144,9 @@ pub struct LimitOrderBook {
     bids_inverted: BTreeMap<u64, VecDeque<OrderId>>,
     /// All resting orders (deterministic iteration by id).
     orders: BTreeMap<OrderId, RestingOrder>,
+    /// Auction mode (G-12): orders accumulate without matching and may
+    /// cross; `uncross` clears them at a uniform price.
+    auction: bool,
 }
 
 const INVERT: u64 = u64::MAX;
@@ -134,6 +164,7 @@ impl LimitOrderBook {
             asks: BTreeMap::new(),
             bids_inverted: BTreeMap::new(),
             orders: BTreeMap::new(),
+            auction: false,
         }
     }
 
@@ -141,6 +172,19 @@ impl LimitOrderBook {
     #[must_use]
     pub fn symbol(&self) -> &str {
         &self.symbol
+    }
+
+    /// Whether the book accumulates auction orders without matching (G-12).
+    #[must_use]
+    pub fn auction_mode(&self) -> bool {
+        self.auction
+    }
+
+    /// Toggle auction mode. Turning it on allows crossing accumulation;
+    /// turning it off restores the continuous no-cross invariant (the
+    /// uncross is expected to have removed any crossing overlap first).
+    pub fn set_auction_mode(&mut self, on: bool) {
+        self.auction = on;
     }
 
     /// Number of resting orders.
@@ -183,7 +227,8 @@ impl LimitOrderBook {
     }
 
     /// Resting size at the best bid and ask (lots) — the surface's
-    /// touch-size gate (`(0, 0)` when a side is empty).
+    /// touch-size gate (`(0, 0)` when a side is empty). Displays the
+    /// *visible* slice only (G-06).
     #[must_use]
     pub fn best_touch_sizes(&self) -> (u64, u64) {
         let bid = self.best_bid();
@@ -192,10 +237,10 @@ impl LimitOrderBook {
         for resting in self.resting_orders() {
             if let Some(p) = resting.order.price_ticks {
                 if Some(p) == bid {
-                    sizes.0 = sizes.0.saturating_add(resting.order.open_qty());
+                    sizes.0 = sizes.0.saturating_add(resting.visible_lots);
                 }
                 if Some(p) == ask {
-                    sizes.1 = sizes.1.saturating_add(resting.order.open_qty());
+                    sizes.1 = sizes.1.saturating_add(resting.visible_lots);
                 }
             }
         }
@@ -211,16 +256,21 @@ impl LimitOrderBook {
     /// Rest a (checked, non-crossing) order on the book.
     ///
     /// The engine calls this only for the unfilled remainder of a limit
-    /// order, after matching. Inserting an order that crosses the book
-    /// breaks the no-cross invariant and is a programming error; callers
-    /// must match first. Returns `false` if the order would cross.
+    /// order, after matching (or when accumulating auction orders — G-12 —
+    /// where crossing is allowed). Inserting a crossing order in continuous
+    /// mode breaks the no-cross invariant and is a programming error;
+    /// callers must match first. Returns `false` if the order would cross.
     pub fn insert_resting(&mut self, order: Order, price_ticks: u64) -> bool {
         if order.open_qty() == 0 || price_ticks == 0 {
             return false;
         }
-        if self.would_cross(order.side, price_ticks) {
+        if !self.auction && self.would_cross(order.side, price_ticks) {
             return false;
         }
+        let visible = match order.display_lots {
+            Some(display) if display > 0 => order.open_qty().min(display),
+            _ => order.open_qty(),
+        };
         let side_levels = match order.side {
             Side::Bid => &mut self.bids_inverted,
             Side::Ask => &mut self.asks,
@@ -230,8 +280,14 @@ impl LimitOrderBook {
             Side::Ask => price_ticks,
         };
         side_levels.entry(key).or_default().push_back(order.id);
-        self.orders
-            .insert(order.id, RestingOrder { order, price_ticks });
+        self.orders.insert(
+            order.id,
+            RestingOrder {
+                order,
+                price_ticks,
+                visible_lots: visible,
+            },
+        );
         true
     }
 
@@ -253,14 +309,55 @@ impl LimitOrderBook {
 
     /// Reduce a resting order by `lots` without canceling it.
     /// Cancels the order if it reaches zero. Returns the order if present.
+    ///
+    /// Iceberg reslicing (G-06): when the reduction consumes the visible
+    /// slice but the order still has hidden quantity, a fresh slice is
+    /// revealed and the order re-queues at the **back** of its price level
+    /// (the Deribit rule: revealing new size is joining the queue anew).
+    /// The reslice is a pure function of the book state and the fill, so
+    /// event replay reproduces queue positions exactly.
     pub fn reduce(&mut self, id: OrderId, lots: u64) -> Option<Order> {
+        let (side, level_key, was_visible, display) = {
+            let resting = self.orders.get(&id)?;
+            (
+                resting.order.side,
+                match resting.order.side {
+                    Side::Bid => invert_bid(resting.price_ticks),
+                    Side::Ask => resting.price_ticks,
+                },
+                resting.visible_lots,
+                resting.order.display_lots,
+            )
+        };
         let resting = self.orders.get_mut(&id)?;
         resting.order.filled_lots = resting.order.filled_lots.saturating_add(lots);
         if !resting.order.is_open() {
-            self.cancel(id)
-        } else {
-            self.orders.get(&id).map(|r| r.order.clone())
+            return self.cancel(id);
         }
+        let open = resting.order.open_qty();
+        match display {
+            Some(display) if display > 0 => {
+                let slice_left = was_visible.saturating_sub(lots);
+                if slice_left == 0 {
+                    // Slice exhausted: reveal the next slice and re-queue.
+                    resting.visible_lots = open.min(display).max(1);
+                    let side_levels = match side {
+                        Side::Bid => &mut self.bids_inverted,
+                        Side::Ask => &mut self.asks,
+                    };
+                    if let Some(queue) = side_levels.get_mut(&level_key) {
+                        queue.retain(|&qid| qid != id);
+                        queue.push_back(id);
+                    }
+                } else {
+                    resting.visible_lots = slice_left;
+                }
+            }
+            _ => {
+                resting.visible_lots = open;
+            }
+        }
+        self.orders.get(&id).map(|r| r.order.clone())
     }
 
     /// Apply one fill: reduce the maker by `fill.qty_lots`.
@@ -281,7 +378,8 @@ impl LimitOrderBook {
         }
     }
 
-    /// Depth snapshot: up to `levels` per side, bids descending, asks ascending.
+    /// Depth snapshot: up to `levels` per side, bids descending, asks
+    /// ascending. Aggregates the *visible* slice only (G-06).
     #[must_use]
     pub fn depth(&self, levels: usize) -> (Vec<LevelSnapshot>, Vec<LevelSnapshot>) {
         let bids = self
@@ -292,7 +390,7 @@ impl LimitOrderBook {
                 let total: u64 = queue
                     .iter()
                     .filter_map(|id| self.orders.get(id))
-                    .map(|r| r.order.open_qty())
+                    .map(|r| r.visible_lots)
                     .sum();
                 LevelSnapshot {
                     price_ticks: INVERT - inv,
@@ -309,7 +407,7 @@ impl LimitOrderBook {
                 let total: u64 = queue
                     .iter()
                     .filter_map(|id| self.orders.get(id))
-                    .map(|r| r.order.open_qty())
+                    .map(|r| r.visible_lots)
                     .sum();
                 LevelSnapshot {
                     price_ticks: price,
@@ -321,8 +419,8 @@ impl LimitOrderBook {
         (bids, asks)
     }
 
-    /// Total resting quantity within `price_limit` on the opposite side of
-    /// `side` (the volume a limit taker could reach).
+    /// Total *visible* quantity within `price_limit` on the opposite side
+    /// of `side` (the volume a limit taker could reach).
     #[must_use]
     pub fn available_within(&self, side: Side, price_limit: Option<u64>) -> u64 {
         let mut total = 0_u64;
@@ -338,7 +436,7 @@ impl LimitOrderBook {
                         queue
                             .iter()
                             .filter_map(|id| self.orders.get(id))
-                            .map(|r| r.order.open_qty())
+                            .map(|r| r.visible_lots)
                             .sum::<u64>(),
                     );
                 }
@@ -355,13 +453,141 @@ impl LimitOrderBook {
                         queue
                             .iter()
                             .filter_map(|id| self.orders.get(id))
-                            .map(|r| r.order.open_qty())
+                            .map(|r| r.visible_lots)
                             .sum::<u64>(),
                     );
                 }
             }
         }
         total
+    }
+
+    /// Uncross an auction book at a uniform clearing price (G-12).
+    ///
+    /// The algorithm is the classic uniform-price call auction (NYSE /
+    /// Deutsche Börse opening-auction shape, the one Derive V3 opens new
+    /// markets with):
+    ///
+    /// 1. Candidate prices are every resting bid and ask level.
+    /// 2. At each candidate `P`, the executable volume is
+    ///    `min(cum_bids_at_or_above(P), cum_asks_at_or_below(P))` —
+    ///    the full open quantity participates, including iceberg
+    ///    remainder (display hiding is a continuous-trading concern;
+    ///    auctions print everything at one fair price).
+    /// 3. The clearing price maximizes executable volume; ties are
+    ///    broken toward the indicative band midpoint
+    ///    `(best_bid + best_ask) / 2`, then toward the lower price.
+    /// 4. Fills pair price-time-priority bids (descending) with asks
+    ///    (ascending) until the clearing volume is exhausted; every fill
+    ///    prints at the clearing price. The later-arriving order is the
+    ///    reported taker (it joined after the price was already improving).
+    ///
+    /// Pure: returns the outcome; the engine applies the fills.
+    #[must_use]
+    pub fn uncross(&self) -> AuctionOutcome {
+        let mut outcome = AuctionOutcome {
+            clearing_price_ticks: None,
+            fills: Vec::new(),
+            matched_lots: 0,
+        };
+        let (Some(best_bid), Some(best_ask)) = self.bbo() else {
+            return outcome;
+        };
+        if best_bid < best_ask {
+            return outcome; // nothing crosses: no auction print
+        }
+
+        // Eligible queues in price-time order (full open quantity).
+        let mut bids: Vec<(OrderId, SubaccountId, u64, u64)> = Vec::new();
+        for (&inv, queue) in self.bids_inverted.iter() {
+            for &id in queue {
+                if let Some(r) = self.orders.get(&id) {
+                    bids.push((id, r.order.subaccount, INVERT - inv, r.order.open_qty()));
+                }
+            }
+        }
+        let mut asks: Vec<(OrderId, SubaccountId, u64, u64)> = Vec::new();
+        for (&price, queue) in &self.asks {
+            for &id in queue {
+                if let Some(r) = self.orders.get(&id) {
+                    asks.push((id, r.order.subaccount, price, r.order.open_qty()));
+                }
+            }
+        }
+
+        // Volume-maximizing clearing price over candidate levels.
+        let mut candidates: Vec<u64> = bids.iter().map(|b| b.2).collect();
+        candidates.extend(asks.iter().map(|a| a.2));
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mid = (best_bid + best_ask) / 2;
+        let mut best_price = 0_u64;
+        let mut best_volume = 0_u64;
+        for &p in &candidates {
+            let bid_qty: u64 = bids.iter().filter(|b| b.2 >= p).map(|b| b.3).sum();
+            let ask_qty: u64 = asks.iter().filter(|a| a.2 <= p).map(|a| a.3).sum();
+            let volume = bid_qty.min(ask_qty);
+            let better = volume > best_volume
+                || (volume == best_volume
+                    && volume > 0
+                    && (p.abs_diff(mid), p) < (best_price.abs_diff(mid), best_price));
+            if better {
+                best_price = p;
+                best_volume = volume;
+            }
+        }
+        if best_volume == 0 {
+            return outcome;
+        }
+
+        // Pair price-time priority at the uniform price, tracking each
+        // order's unmatched remainder.
+        let mut bid_rem: Vec<(OrderId, SubaccountId, u64)> = bids
+            .iter()
+            .map(|&(id, sub, _px, qty)| (id, sub, qty))
+            .collect();
+        let mut ask_rem: Vec<(OrderId, SubaccountId, u64)> = asks
+            .iter()
+            .map(|&(id, sub, _px, qty)| (id, sub, qty))
+            .collect();
+        let mut bi = 0_usize;
+        let mut ai = 0_usize;
+        let mut matched = 0_u64;
+        while bi < bid_rem.len() && ai < ask_rem.len() && matched < best_volume {
+            let (bid_id, bid_sub, bq) = bid_rem[bi];
+            let (ask_id, ask_sub, aq) = ask_rem[ai];
+            let qty = bq.min(aq).min(best_volume - matched);
+            if qty == 0 {
+                break;
+            }
+            // Later-arriving order reports as the taker.
+            let (taker_id, taker_sub, maker_id, maker_sub, maker_side) = if ask_id > bid_id {
+                (ask_id, ask_sub, bid_id, bid_sub, Side::Bid)
+            } else {
+                (bid_id, bid_sub, ask_id, ask_sub, Side::Ask)
+            };
+            outcome.fills.push(Fill {
+                taker_order_id: taker_id,
+                maker_order_id: maker_id,
+                taker_subaccount: taker_sub,
+                maker_subaccount: maker_sub,
+                maker_side,
+                price_ticks: best_price,
+                qty_lots: qty,
+            });
+            matched = matched.saturating_add(qty);
+            bid_rem[bi].2 = bq - qty;
+            ask_rem[ai].2 = aq - qty;
+            if bid_rem[bi].2 == 0 {
+                bi += 1;
+            }
+            if ask_rem[ai].2 == 0 {
+                ai += 1;
+            }
+        }
+        outcome.clearing_price_ticks = Some(best_price);
+        outcome.matched_lots = matched;
+        outcome
     }
 
     /// Match an incoming taker order against the book. **Pure** — no state
@@ -395,7 +621,7 @@ impl LimitOrderBook {
             let reachable: u64 = candidates
                 .iter()
                 .filter_map(|&(id, _)| self.orders.get(&id))
-                .map(|r| r.order.open_qty())
+                .map(|r| r.visible_lots)
                 .sum();
             if reachable < taker.open_qty() {
                 return outcome; // nothing fills, taker cancels with full remainder
@@ -411,7 +637,7 @@ impl LimitOrderBook {
             // this same match — `candidates` ids are unique per resting order
             // so at most one STP action applies per id.
             let (maker_open, maker_price) = match self.orders.get(&maker_id) {
-                Some(r) => (r.order.open_qty(), r.price_ticks),
+                Some(r) => (r.visible_lots, r.price_ticks),
                 None => continue,
             };
 
@@ -497,13 +723,14 @@ impl LimitOrderBook {
 
     /// Assert structural invariants (used in tests and debug builds).
     ///
-    /// * no crossed book;
+    /// * no crossed book (unless auction mode is accumulating, G-12);
     /// * no empty level buckets;
     /// * every queued id exists in `orders` and sits at its level price;
-    /// * resting orders have positive open quantity.
+    /// * resting orders have positive open quantity and a visible slice
+    ///   that never exceeds the open quantity (G-06).
     pub fn invariants_hold(&self) -> Result<(), String> {
         if let (Some(bid), Some(ask)) = (self.best_bid(), self.best_ask()) {
-            if bid >= ask {
+            if bid >= ask && !self.auction {
                 return Err(format!("crossed book: bid {bid} >= ask {ask}"));
             }
         }
@@ -528,6 +755,9 @@ impl LimitOrderBook {
                             }
                             if r.order.open_qty() == 0 {
                                 return Err(format!("zero-qty resting order {id}"));
+                            }
+                            if r.visible_lots == 0 || r.visible_lots > r.order.open_qty() {
+                                return Err(format!("bad visible slice for order {id}"));
                             }
                         }
                     }
@@ -557,6 +787,8 @@ mod tests {
             post_only: false,
             reduce_only: false,
             stp: SelfTradePrevention::CancelNewest,
+            display_lots: None,
+            trailing_extreme_quote_minor: None,
             client_ts: 0,
             engine_ts: 0,
         }
@@ -822,5 +1054,139 @@ mod tests {
             }
             assert!(b.invariants_hold().is_ok(), "round {round}");
         }
+    }
+
+    #[test]
+    fn iceberg_hides_and_reslices() {
+        let mut b = LimitOrderBook::new("X".into());
+        let mut iceberg = order(1, 10, Side::Ask, 100, 10);
+        iceberg.display_lots = Some(3);
+        b.insert_resting(iceberg, 100);
+        // Depth shows the slice, not the total.
+        let (_, asks) = b.depth(5);
+        assert_eq!(asks[0].total_qty_lots, 3);
+        assert_eq!(b.best_touch_sizes(), (0, 3));
+        assert_eq!(b.get(1).map(|r| r.visible_lots), Some(3));
+        // Matching sees only the visible slice.
+        let taker = order(9, 99, Side::Bid, 100, 10);
+        let out = b.match_taker(&taker, Some(100), false, SelfTradePrevention::CancelNewest);
+        assert_eq!(out.filled_lots(), 3);
+        assert_eq!(out.taker_remaining_lots, 7);
+        for f in &out.fills {
+            b.apply_fill(f);
+        }
+        // Order still rests with 7 open; a fresh slice of 3 is visible.
+        assert_eq!(b.get(1).map(|r| r.order.open_qty()), Some(7));
+        assert_eq!(b.get(1).map(|r| r.visible_lots), Some(3));
+        assert!(b.invariants_hold().is_ok());
+        // Second slice...
+        let out = b.match_taker(&taker, Some(100), false, SelfTradePrevention::CancelNewest);
+        assert_eq!(out.filled_lots(), 3);
+        for f in &out.fills {
+            b.apply_fill(f);
+        }
+        assert_eq!(b.get(1).map(|r| r.order.open_qty()), Some(4));
+        // Third match consumes another slice of 3 (one slice per taker —
+        // the pure-match design never trades hidden quantity by surprise).
+        let out = b.match_taker(&taker, Some(100), false, SelfTradePrevention::CancelNewest);
+        assert_eq!(out.filled_lots(), 3);
+        for f in &out.fills {
+            b.apply_fill(f);
+        }
+        assert_eq!(b.get(1).map(|r| r.order.open_qty()), Some(1));
+        // ...and the final revealed 1 prints in full.
+        let out = b.match_taker(&taker, Some(100), false, SelfTradePrevention::CancelNewest);
+        assert_eq!(out.filled_lots(), 1);
+        for f in &out.fills {
+            b.apply_fill(f);
+        }
+        assert!(b.get(1).is_none(), "fully consumed iceberg leaves");
+        assert!(b.invariants_hold().is_ok());
+    }
+
+    #[test]
+    fn iceberg_reslice_requeues_at_back() {
+        let mut b = LimitOrderBook::new("X".into());
+        let mut front = order(1, 10, Side::Ask, 100, 5);
+        front.display_lots = Some(2);
+        let behind = order(2, 11, Side::Ask, 100, 5);
+        b.insert_resting(front, 100);
+        b.insert_resting(behind, 100);
+        // Fill the front order's first slice fully.
+        let taker = order(9, 99, Side::Bid, 100, 2);
+        let out = b.match_taker(&taker, Some(100), false, SelfTradePrevention::CancelNewest);
+        for f in &out.fills {
+            b.apply_fill(f);
+        }
+        // Order 1 re-queued behind order 2 at the same level.
+        let (_, asks) = b.depth(1);
+        assert_eq!(asks[0].order_count, 2);
+        assert_eq!(asks[0].total_qty_lots, 2 + 5, "1's fresh slice + 2's size");
+        // The next taker now hits order 2 first (queue priority lost).
+        let out = b.match_taker(&taker, Some(100), false, SelfTradePrevention::CancelNewest);
+        assert_eq!(out.fills[0].maker_order_id, 2);
+        assert!(b.invariants_hold().is_ok());
+    }
+
+    #[test]
+    fn uncross_uniform_price_and_volume_max() {
+        let mut b = LimitOrderBook::new("X".into());
+        b.set_auction_mode(true);
+        b.insert_resting(order(1, 10, Side::Bid, 105, 10), 105); // crossed!
+        b.insert_resting(order(2, 11, Side::Bid, 101, 5), 101);
+        b.insert_resting(order(3, 12, Side::Ask, 100, 6), 100);
+        b.insert_resting(order(4, 13, Side::Ask, 104, 2), 104);
+        b.insert_resting(order(5, 14, Side::Ask, 108, 5), 108);
+        assert!(
+            b.invariants_hold().is_ok(),
+            "auction mode tolerates crossing"
+        );
+        let out = b.uncross();
+        // Max volume: min(bids>=104 = 10, asks<=104 = 8) = 8 at P in
+        // {104, 105}; midpoint of (105, 100) = 102 ties toward 104.
+        assert_eq!(out.clearing_price_ticks, Some(104));
+        assert_eq!(out.matched_lots, 8);
+        assert!(out.fills.iter().all(|f| f.price_ticks == 104));
+        // Price-time: the 105x10 bid pairs against 100x6 then 104x2.
+        let qtys: Vec<u64> = out.fills.iter().map(|f| f.qty_lots).collect();
+        assert_eq!(qtys, vec![6, 2]);
+        assert_eq!(out.fills[0].maker_order_id, 1); // bid arrived first
+        assert_eq!(out.fills[0].taker_order_id, 3); // later ask is taker
+    }
+
+    #[test]
+    fn uncross_partial_fills_pair_across_sizes() {
+        let mut b = LimitOrderBook::new("X".into());
+        b.set_auction_mode(true);
+        b.insert_resting(order(1, 10, Side::Bid, 100, 4), 100);
+        b.insert_resting(order(2, 11, Side::Bid, 100, 6), 100);
+        b.insert_resting(order(3, 12, Side::Ask, 100, 5), 100);
+        b.insert_resting(order(4, 13, Side::Ask, 100, 5), 100);
+        let out = b.uncross();
+        assert_eq!(out.clearing_price_ticks, Some(100));
+        assert_eq!(out.matched_lots, 10);
+        let qtys: Vec<u64> = out.fills.iter().map(|f| f.qty_lots).collect();
+        assert_eq!(qtys, vec![4, 1, 5]);
+    }
+
+    #[test]
+    fn uncross_no_cross_no_print() {
+        let mut b = LimitOrderBook::new("X".into());
+        b.set_auction_mode(true);
+        b.insert_resting(order(1, 10, Side::Bid, 99, 5), 99);
+        b.insert_resting(order(2, 11, Side::Ask, 101, 5), 101);
+        let out = b.uncross();
+        assert_eq!(out.clearing_price_ticks, None);
+        assert_eq!(out.matched_lots, 0);
+        assert!(out.fills.is_empty());
+    }
+
+    #[test]
+    fn continuous_mode_still_rejects_crossing() {
+        let mut b = LimitOrderBook::new("X".into());
+        b.insert_resting(order(1, 10, Side::Ask, 101, 5), 101);
+        assert!(!b.insert_resting(order(2, 11, Side::Bid, 101, 5), 101));
+        b.set_auction_mode(true);
+        assert!(b.insert_resting(order(3, 12, Side::Bid, 102, 5), 102));
     }
 }

@@ -1,0 +1,23 @@
+[package]
+name = "poc-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Benchmarks and architecture stress tests for the perp-options-clob"
+
+[[bin]]
+name = "poc-bench"
+path = "src/main.rs"
+
+[dependencies]
+poc-core = { path = "../core" }
+poc-engine = { path = "../engine" }
+poc-oracle = { path = "../oracle" }
+poc-margin = { path = "../margin" }
+poc-persist = { path = "../persist" }
+poc-settlement = { path = "../settlement" }
+
+[lints]
+workspace = true

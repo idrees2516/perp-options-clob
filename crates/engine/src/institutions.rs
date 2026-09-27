@@ -126,7 +126,7 @@ pub struct PlannedExecution {
 /// Read-only resolution of (rfq, quote) into an executable package.
 /// Mirrors `RfqBook::execute`'s validation without mutating anything —
 /// the plan/apply discipline for the RFQ state machine too.
-#[must_use]
+#[must_use = "the quote total is needed for the caller's accounting"]
 pub fn resolve_execution(
     engine: &Engine,
     taker: SubaccountId,
@@ -252,7 +252,7 @@ pub fn rfq_taker_fees(
     }
     poc_rfq::apply_group_discounts(&classified)
         .into_iter()
-        .map(|f| to_i128(f))
+        .map(to_i128)
         .collect()
 }
 

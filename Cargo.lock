@@ -3,6 +3,26 @@
 version = 3
 
 [[package]]
+name = "poc-api"
+version = "0.1.0"
+dependencies = [
+ "poc-core",
+ "poc-engine",
+]
+
+[[package]]
+name = "poc-bench"
+version = "0.1.0"
+dependencies = [
+ "poc-core",
+ "poc-engine",
+ "poc-margin",
+ "poc-oracle",
+ "poc-persist",
+ "poc-settlement",
+]
+
+[[package]]
 name = "poc-core"
 version = "0.1.0"
 
@@ -41,6 +61,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "poc-governance"
+version = "0.1.0"
+dependencies = [
+ "poc-core",
+]
+
+[[package]]
 name = "poc-margin"
 version = "0.1.0"
 dependencies = [
@@ -62,6 +89,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "poc-persist"
+version = "0.1.0"
+dependencies = [
+ "poc-core",
+ "poc-engine",
+]
+
+[[package]]
 name = "poc-rfq"
 version = "0.1.0"
 dependencies = [
@@ -74,6 +109,14 @@ version = "0.1.0"
 dependencies = [
  "poc-core",
  "poc-margin",
+]
+
+[[package]]
+name = "poc-settlement"
+version = "0.1.0"
+dependencies = [
+ "poc-core",
+ "poc-engine",
 ]
 
 [[package]]

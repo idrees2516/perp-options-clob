@@ -17,7 +17,11 @@ of patterns proven at scale, not invention for its own sake.
 8. [Funding](#funding)
 9. [Fees, revenue, incentives](#fees-revenue-incentives)
 10. [Oracle defense](#oracle-defense)
-11. [Known simplifications](#known-simplifications)
+11. [Settlement layer (on-chain)](#settlement-layer-on-chain)
+12. [Persistence (WAL + checkpoints)](#persistence-wal--checkpoints)
+13. [Gateway (API, sessions, withdrawals)](#gateway-api-sessions-withdrawals)
+14. [Governance](#governance)
+15. [Known simplifications](#known-simplifications)
 
 ## Design sources
 
@@ -240,6 +244,81 @@ Layered (Chainlink-style), in `poc-oracle`:
 
 TWAP windows are ring-buffered step functions — manipulation requires
 sustained capital across the whole window, not one print.
+
+## Settlement layer (on-chain)
+
+**Crate:** `poc-settlement` (G-30). The Lighter.xyz / dYdX v4 pattern:
+settle *state diffs*, not trades.
+
+Every settlement window the operator captures the venue state before
+and after (`StateCapture`), derives the per-account mutation list
+(`diff_to` — O(changed accounts)), and publishes a
+`SettlementBatch { prev_root, new_root, ops_root, hash }` where the
+header hash chains the batch to its predecessor.
+
+* **Commitments** — one merkle leaf per account (cash + positions +
+  collateral), domain-separated SHA-256 hashing (`POC-LEAF`,
+  `POC-NODE`, `POC-OP`, `POC-BATCH` tags), duplicate-last rule for odd
+  levels. Users verify their leaf with an inclusion proof against the
+  committed root.
+* **Conservation audit** — `validate_batch` replays mutations against a
+  pre-state and rejects `UnexplainedFlow`: tracked value may move only
+  by the declared custodial residual (deposits - withdrawals). This is
+  the check that caught the buyback fee-routing leak.
+* **Escape hatch** — `ExitQueue`: withdrawal intents with merkle
+  proofs, a force-settlement window, replay-protected nonces, and a
+  `neglected()` report when the operator stalls (proof-of-neglect).
+
+See `docs/EFFICIENCY.md` for the Lighter lineage and the deliberate
+divergences (escape-hatch trust model rather than ZK validity proofs
+at this stage).
+
+## Persistence (WAL + checkpoints)
+
+**Crate:** `poc-persist` (G-24). Because the engine is deterministic,
+durability is a *command log*, not a state snapshot:
+
+```text
+frame: magic(2) | chain(8) | len(4) | record | crc32(4)
+record: 0x01 Command | 0x02 Instrument (genesis frame)
+```
+
+* **Codec** — varint (LEB128), length-prefixed strings/vectors, tagged
+  enums; a command costs ~20-60 bytes. Total: every byte string decodes
+  to exactly one command or fails.
+* **Crash model** — a torn final frame is dropped cleanly (reported);
+  mid-segment corruption (CRC, chain, magic) refuses recovery. Tested
+  by truncating the log at *every* byte offset.
+* **Checkpoints** — atomic manifest (write-temp, fsync, rename) plus
+  segment pruning bounds restart replay; recovery measured at
+  ~7.7M commands/s.
+
+## Gateway (API, sessions, withdrawals)
+
+**Crate:** `poc-api` (G-25/G-27/G-32) — the protocol layer a
+tokio/axum host embeds:
+
+* **JSON codec** (`json.rs`) — deterministic key order, integers never
+  round-trip through floats, NaN serializes to `null`.
+* **Market data** (`session.rs`) — the snapshot + sequenced-delta
+  protocol: gaps desync the session (never silently continue) and
+  require an explicit resync.
+* **Auth** (`auth.rs`) — API keys with per-key monotonic nonces (replay
+  protection), a pluggable `Signer` (HMAC-SHA256 in production), and
+  deterministic token-bucket rate limits.
+* **Withdrawals** (`withdrawal.rs`) — request validation (balance,
+  in-flight caps, daily quota), a settlement time-lock, manual-approval
+  tiers for large amounts, cancellation refunds, and a `CustodyAdapter`
+  trait for the treasury.
+
+## Governance
+
+**Crate:** `poc-governance` (G-33). The Aave/dYdX parameter-governance
+pattern: weighted-multisig approvals queue a proposal, a public
+timelock (default 24h) gives users time to react, a grace window
+expires unexecuted proposals, and a guardian can veto anything
+instantly. Every transition emits a `GovernanceEvent` so the host
+journals governance with the same discipline as the engine journal.
 
 ## Known simplifications
 

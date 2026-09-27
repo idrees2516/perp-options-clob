@@ -131,7 +131,7 @@ fn splitmix64(mut x: u64) -> u64 {
 #[must_use]
 pub fn sample_delay(sample_counter: u64, params: &IncentiveParams) -> u64 {
     let span = params.sample_delay_span_ms.max(1);
-    let r = splitmix64(sample_counter.wrapping_add(0x5DEE_CE66_D000_0001)) % u64::from(span);
+    let r = splitmix64(sample_counter.wrapping_add(0x5DEE_CE66_D000_0001)) % span;
     params.sample_delay_min_ms + r
 }
 
@@ -189,7 +189,7 @@ impl LiquidityIncentives {
     pub fn ratio_penalty_bps(&self, subaccount: SubaccountId) -> u64 {
         let placed = u128::from(self.quotes_placed.get(&subaccount).copied().unwrap_or(0));
         let cancelled = u128::from(self.quotes_cancelled.get(&subaccount).copied().unwrap_or(0));
-        let total = placed.checked_add(cancelled).unwrap_or(u128::MAX);
+        let total = placed.saturating_add(cancelled);
         if total == 0 {
             return 10_000;
         }
@@ -510,7 +510,7 @@ mod tests {
         assert_eq!(a, b, "deterministic");
         assert!(a >= params.sample_delay_min_ms);
         assert!(a < params.sample_delay_min_ms + params.sample_delay_span_ms);
-        let c = sample_delay(8, &params);
+        let _c = sample_delay(8, &params);
         // No guarantee of difference, but across 100 counters at least a few
         // distinct values must appear (statistical sanity on the PRNG).
         let distinct: std::collections::HashSet<_> =

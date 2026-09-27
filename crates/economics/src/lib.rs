@@ -32,6 +32,7 @@
 pub mod fees;
 pub mod funding;
 pub mod incentives;
+pub mod referral;
 pub mod revenue;
 
 pub use fees::{FeeCalculator, FeeQuote, FeeSchedule, FeeTier, OptionFeeCaps};

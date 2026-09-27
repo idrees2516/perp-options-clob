@@ -65,6 +65,22 @@ pub enum OrderType {
         /// Limit price used once triggered.
         limit_price: u64,
     },
+    /// Trailing stop-market (G-07): the trigger follows the running mark
+    /// extreme by `offset_ticks`. A sell trails the *high* (triggers when
+    /// the mark falls `offset` below the high); a buy trails the *low`.
+    /// Activation is a market order.
+    TrailingStopMarket {
+        /// Trigger distance from the running extreme, in ticks.
+        offset_ticks: u64,
+    },
+    /// Trailing stop-limit (G-07): as [`OrderType::TrailingStopMarket`]
+    /// but activation rests a limit order at `limit_ticks`.
+    TrailingStopLimit {
+        /// Trigger distance from the running extreme, in ticks.
+        offset_ticks: u64,
+        /// Limit price used once triggered.
+        limit_ticks: u64,
+    },
 }
 
 impl OrderType {
@@ -73,8 +89,25 @@ impl OrderType {
     pub fn resting_price(&self) -> Option<u64> {
         match self {
             OrderType::Limit => None,
-            OrderType::Market | OrderType::StopMarket { .. } | OrderType::StopLimit { .. } => None,
+            OrderType::Market
+            | OrderType::StopMarket { .. }
+            | OrderType::StopLimit { .. }
+            | OrderType::TrailingStopMarket { .. }
+            | OrderType::TrailingStopLimit { .. } => None,
         }
+    }
+
+    /// Whether this order parks off-book until a trigger crosses
+    /// (stop and trailing-stop families).
+    #[must_use]
+    pub fn is_parked(&self) -> bool {
+        matches!(
+            self,
+            OrderType::StopMarket { .. }
+                | OrderType::StopLimit { .. }
+                | OrderType::TrailingStopMarket { .. }
+                | OrderType::TrailingStopLimit { .. }
+        )
     }
 }
 
@@ -140,6 +173,16 @@ pub struct Order {
     pub reduce_only: bool,
     /// Self-trade prevention policy.
     pub stp: SelfTradePrevention,
+    /// Iceberg display slice (G-06): when set, only this many lots are
+    /// visible on the book at a time; each consumed slice re-queues the
+    /// remainder at the back of its price level (Deribit shape). `None` =
+    /// fully displayed order.
+    pub display_lots: Option<u64>,
+    /// Trailing-stop running extreme (G-07): the best mark seen since
+    /// placement — the highest for buy-side trailers, the lowest for
+    /// sell-side. Updated only by journaled `TrailingUpdated` events so
+    /// replay is exact. `None` for non-trailing orders.
+    pub trailing_extreme_quote_minor: Option<u128>,
     /// Client-assigned epoch-ms for report matching.
     pub client_ts: TimestampMs,
     /// Engine-assigned epoch-ms.

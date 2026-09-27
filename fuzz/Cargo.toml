@@ -1,0 +1,52 @@
+[package]
+name = "poc-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+poc-core = { path = "../crates/core" }
+poc-engine = { path = "../crates/engine" }
+poc-oracle = { path = "../crates/oracle" }
+poc-margin = { path = "../crates/margin" }
+poc-economics = { path = "../crates/economics" }
+poc-settlement = { path = "../crates/settlement" }
+
+[[bin]]
+name = "fuzz_matching"
+path = "targets/fuzz_matching.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_oracle"
+path = "targets/fuzz_oracle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wal"
+path = "targets/fuzz_wal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_merkle"
+path = "targets/fuzz_merkle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_fees"
+path = "targets/fuzz_fees.rs"
+test = false
+doc = false
+bench = false

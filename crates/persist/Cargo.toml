@@ -1,0 +1,15 @@
+[package]
+name = "poc-persist"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Durable command WAL for the perp-options-clob engine: framed append-only segments, checksummed frames, crash-safe recovery (G-24)"
+
+[dependencies]
+poc-core = { path = "../core" }
+poc-engine = { path = "../engine" }
+
+[lints]
+workspace = true

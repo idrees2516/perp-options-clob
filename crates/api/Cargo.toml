@@ -1,0 +1,15 @@
+[package]
+name = "poc-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Gateway protocol library for the perp-options-clob: JSON codec, sequenced market-data sessions, auth nonces, token-bucket rate limits, and the withdrawal pipeline (G-25/G-27/G-32)"
+
+[dependencies]
+poc-core = { path = "../core" }
+poc-engine = { path = "../engine" }
+
+[lints]
+workspace = true

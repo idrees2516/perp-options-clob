@@ -11,6 +11,11 @@ members = [
     "crates/rfq",
     "crates/engine",
     "crates/demo",
+    "crates/settlement",
+    "crates/persist",
+    "crates/api",
+    "crates/governance",
+    "crates/bench",
 ]
 
 [workspace.package]

@@ -30,11 +30,20 @@ use poc_risk::{InsuranceFund, LiquidationPlanner, OrderRiskContext, Rejection, R
 use poc_volsurface::{SurfaceConfig, VolSurface};
 
 use crate::institutions::{self, MmpState};
+use crate::listing::UnderlyingListing;
 
 use crate::command::{Command, OrderRequest};
 use crate::event::{
     BookView, Event, InstrumentKindView, MarketStateView, OrderCloseReason, OrderRejected, Trade,
 };
+
+/// Auto-listing policy (G-34): which underlyings the sweep manages strike
+/// grids for. Empty by default (no auto-listing).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListingPolicy {
+    /// Managed underlyings.
+    pub underlyings: Vec<UnderlyingListing>,
+}
 
 /// Implied-volatility and margin configuration knobs.
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +79,21 @@ pub struct EngineConfig {
     pub coverage_policy: poc_economics::CoveragePolicy,
     /// Circuit-breaker parameters (G-21: price dislocation + cascade velocity).
     pub breaker: BreakerParams,
+    /// Marginable collateral currencies (G-17). Empty = quote-only.
+    pub collateral: Vec<crate::collateral::CollateralCurrency>,
+    /// Impact-notional for funding premium sampling (G-39): the bid/ask
+    /// walk depth in quote minor. 0 disables (BBO mid is used instead).
+    pub impact_notional_quote_minor: u128,
+    /// Strike auto-listing policy (G-34).
+    pub listing: ListingPolicy,
+    /// Iterative ADL (G-19): max rounds per liquidation sweep and the
+    /// fraction of each counterparty's position one round may close
+    /// (bps). 0 rounds = legacy single-shot ADL.
+    pub adl_max_rounds: u32,
+    pub adl_round_bps: u64,
+    /// Portfolio greeks limits (G-41): vega/gamma caps enforced
+    /// pre-trade on option orders. Default: disabled.
+    pub greeks_limits: poc_risk::GreeksLimits,
 }
 
 /// Circuit-breaker parameters (G-21).
@@ -118,6 +142,12 @@ impl Default for EngineConfig {
             option_fee_caps: poc_economics::OptionFeeCaps::default(),
             coverage_policy: poc_economics::CoveragePolicy::default(),
             breaker: BreakerParams::default(),
+            collateral: Vec::new(),
+            impact_notional_quote_minor: 1_000_000, // $10k walk (2dp quote)
+            listing: ListingPolicy::default(),
+            adl_max_rounds: 4,
+            adl_round_bps: 5_000, // 50% of each counterparty per round
+            greeks_limits: poc_risk::GreeksLimits::default(),
         }
     }
 }
@@ -197,6 +227,12 @@ pub struct Engine {
     pub(crate) cascade_suspended_until: TimestampMs,
     /// Liquidation closures inside the velocity window: (ts, lots).
     pub(crate) liq_window: std::collections::VecDeque<(TimestampMs, u64)>,
+    /// Open auctions per symbol: uncross deadline (G-12). Presence = the
+    /// book accumulates without matching.
+    pub(crate) auctions: BTreeMap<Symbol, TimestampMs>,
+    /// Non-quote collateral balances per subaccount (G-17):
+    /// currency code → minor units.
+    pub(crate) collateral: BTreeMap<SubaccountId, BTreeMap<String, u128>>,
 
     // statistics
     pub(crate) trades: u64,
@@ -226,7 +262,7 @@ impl Engine {
         let insurance = InsuranceFund::new(config.insurance_seed_quote_minor);
         let next_reward_ts = config.reward_interval_ms;
         // Built before the struct literal (the literal moves `config`).
-        let vol_surface = VolSurface::new(config.surface_config.clone())
+        let vol_surface = VolSurface::new(config.surface_config)
             .or_else(|_| VolSurface::new(SurfaceConfig::default()))
             .expect("default surface config is valid");
         Self {
@@ -262,6 +298,8 @@ impl Engine {
             price_breaker_until: BTreeMap::new(),
             cascade_suspended_until: 0,
             liq_window: std::collections::VecDeque::new(),
+            auctions: BTreeMap::new(),
+            collateral: BTreeMap::new(),
             trades: 0,
             lots_traded: 0,
             notional_traded: 0,
@@ -282,7 +320,10 @@ impl Engine {
     /// underlying oracle. The listing is journaled, so replays reconstruct
     /// the registry exactly.
     pub fn register_instrument(&mut self, instrument: Instrument) {
-        let event = Event::MarketListed { instrument };
+        let event = Event::MarketListed {
+            instrument,
+            anchor_iv_bps: None,
+        };
         self.apply_event(&event);
         self.journal.push(event);
     }
@@ -303,6 +344,26 @@ impl Engine {
     #[must_use]
     pub fn account(&self, subaccount: SubaccountId) -> Option<&MarginAccount> {
         self.accounts.get(&subaccount)
+    }
+
+    /// Every margin account, ascending subaccount id (deterministic).
+    #[must_use = "the iterator borrows the engine; use it or drop it"]
+    pub fn accounts_iter(&self) -> impl Iterator<Item = (&SubaccountId, &MarginAccount)> {
+        self.accounts.iter()
+    }
+
+    /// The venue's internal pools (settlement-layer conservation inputs):
+    /// `(insurance balance, reward pool available, cumulative fee revenue
+    /// routed to the house, buyback pool balance)`, quote minor.
+    #[must_use = "pool state is for settlement-conservation checks"]
+    pub fn venue_pools(&self) -> (i128, u128, u128, u128) {
+        let allocation = self.revenue_router.cumulative();
+        (
+            self.insurance.balance(),
+            self.reward_pool.available(),
+            allocation.house,
+            self.buyback_pool_quote_minor,
+        )
     }
 
     /// The full journal since genesis.
@@ -461,6 +522,59 @@ impl Engine {
                 });
                 events
             }
+            Command::PlaceBatch { requests, now } => self.plan_place_batch(requests, *now),
+            Command::CancelBatch {
+                subaccount,
+                order_ids,
+                ..
+            } => self.plan_cancel_batch(*subaccount, order_ids),
+            Command::Amend {
+                subaccount,
+                order_id,
+                new_price_ticks,
+                new_open_lots,
+                now,
+            } => self.plan_amend(
+                *subaccount,
+                *order_id,
+                *new_price_ticks,
+                *new_open_lots,
+                *now,
+            ),
+            Command::BeginAuction {
+                symbol,
+                uncross_at,
+                now,
+            } => {
+                if self.instruments.contains_key(symbol) && *uncross_at > *now {
+                    vec![Event::AuctionOpened {
+                        symbol: symbol.clone(),
+                        uncross_at: *uncross_at,
+                        ts: *now,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            Command::DepositCollateral {
+                subaccount,
+                currency,
+                amount_minor,
+                now,
+            } => self.plan_collateral_deposit(*subaccount, currency, *amount_minor, *now),
+            Command::WithdrawCollateral {
+                subaccount,
+                currency,
+                amount_minor,
+                now,
+            } => self.plan_collateral_withdraw(*subaccount, currency, *amount_minor, *now),
+            Command::ConvertCollateral {
+                subaccount,
+                from,
+                to,
+                from_amount_minor,
+                now,
+            } => self.plan_collateral_convert(*subaccount, from, to, *from_amount_minor, *now),
         }
     }
 
@@ -549,7 +663,7 @@ impl Engine {
                 ts: now,
             }];
         }
-        if leg_prices.len() != rfq.legs.len() || leg_prices.iter().any(|&p| p == 0) || ttl_ms == 0 {
+        if leg_prices.len() != rfq.legs.len() || leg_prices.contains(&0) || ttl_ms == 0 {
             return vec![Event::RfqRejected {
                 subaccount: maker,
                 reason: "invalid quote parameters",
@@ -577,7 +691,7 @@ impl Engine {
             let owned = self
                 .rfq_book
                 .rfq(rfq_id)
-                .map_or(false, |r| r.taker == subaccount);
+                .is_some_and(|r| r.taker == subaccount);
             if owned {
                 events.push(Event::RfqClosed {
                     rfq_id,
@@ -590,7 +704,7 @@ impl Engine {
             let owned = self
                 .rfq_book
                 .quote(quote_id)
-                .map_or(false, |q| q.maker == subaccount);
+                .is_some_and(|q| q.maker == subaccount);
             if owned {
                 events.push(Event::RfqClosed {
                     rfq_id: 0,
@@ -689,10 +803,8 @@ impl Engine {
         let Some(account) = self.accounts.get(&from) else {
             return reject("unknown source account");
         };
-        if to == from || !self.accounts.contains_key(&to) {
-            if !self.accounts.contains_key(&to) {
-                return reject("unknown destination account");
-            }
+        if (to == from || !self.accounts.contains_key(&to)) && !self.accounts.contains_key(&to) {
+            return reject("unknown destination account");
         }
         let _ = account;
         if let Some(summary) = self.margin_summary_of(from) {
@@ -742,7 +854,7 @@ impl Engine {
         }]
     }
 
-    fn plan_place(&self, request: &OrderRequest, now: TimestampMs) -> Vec<Event> {
+    pub(crate) fn plan_place(&self, request: &OrderRequest, now: TimestampMs) -> Vec<Event> {
         let order_id = self.next_order_id;
         let rejection = |reason: Rejection| {
             vec![Event::OrderRejection(Box::new(OrderRejected {
@@ -760,6 +872,15 @@ impl Engine {
         };
         if let Err(why) = instrument.validate_qty(request.qty_lots) {
             return rejection(Rejection::InvalidOrder(why.to_string()));
+        }
+        // G-41: portfolio greeks caps on option orders (worst-case
+        // increment at the current mark; disabled caps skip the math).
+        if let Instrument::Option(m) = instrument {
+            if !self.config.greeks_limits.disabled() {
+                if let Some(rej) = self.check_greeks_limit(request, m) {
+                    return rejection(rej);
+                }
+            }
         }
         if let Some(ticks) = request.price_ticks {
             if instrument.price_quote_minor(ticks).is_none() {
@@ -780,6 +901,8 @@ impl Engine {
             post_only: request.post_only,
             reduce_only: request.reduce_only,
             stp: request.stp,
+            display_lots: request.display_lots,
+            trailing_extreme_quote_minor: None,
             client_ts: request.client_ts,
             engine_ts: now,
         };
@@ -804,6 +927,17 @@ impl Engine {
             (Some(m), Some(p)) => (m, p),
             _ => return rejection(Rejection::MissingMark),
         };
+
+        // Trailing stops anchor their running extreme at the current mark
+        // (G-07); every later tick can only tighten the trigger from here.
+        if order.order_type.is_parked()
+            && matches!(
+                order.order_type,
+                OrderType::TrailingStopMarket { .. } | OrderType::TrailingStopLimit { .. }
+            )
+        {
+            order.trailing_extreme_quote_minor = Some(mark_price);
+        }
 
         let Some(book) = self.books.get(&request.symbol) else {
             return rejection(Rejection::UnknownInstrument);
@@ -838,19 +972,44 @@ impl Engine {
                 .copied()
                 .unwrap_or(false),
             estimated_fee_quote_minor: estimated_fee,
+            collateral_equity_quote_minor: to_i128(
+                self.collateral_value_of(request.subaccount, now),
+            ),
         };
         if let Err(reason) = poc_risk::check_order(&risk_ctx) {
             return rejection(reason);
         }
 
-        // Stop orders park off-book until the mark crosses their trigger.
-        if matches!(
-            order.order_type,
-            OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
-        ) {
+        // Stop orders (and trailing stops) park off-book until the mark
+        // crosses their trigger.
+        if order.order_type.is_parked() {
             return vec![Event::OrderResting {
                 order,
                 margin_reserved_quote_minor: 0,
+            }];
+        }
+
+        // Auctions (G-12): limit orders rest without matching until the
+        // uncross; anything that would sweep is refused.
+        if self
+            .books
+            .get(&order.symbol)
+            .is_some_and(|b| b.auction_mode())
+        {
+            if !matches!(order.order_type, OrderType::Limit) {
+                return rejection(Rejection::InvalidOrder(
+                    "only limit orders rest in an auction".into(),
+                ));
+            }
+            if order.price_ticks.is_none() {
+                return rejection(Rejection::InvalidOrder(
+                    "auction orders carry a price".into(),
+                ));
+            }
+            let auction_reservation = poc_risk::order_margin_increment(&risk_ctx);
+            return vec![Event::OrderResting {
+                order,
+                margin_reserved_quote_minor: auction_reservation,
             }];
         }
 
@@ -994,10 +1153,10 @@ impl Engine {
                     ] {
                         if let Some(mmp) = self.mmp.get(&(sub, base.clone())) {
                             let mut sim = mmp.clone();
-                            if sim.record_fill(now, fill.qty_lots, delta, now) {
-                                if !trips.contains(&(sub, base.clone())) {
-                                    trips.push((sub, base.clone()));
-                                }
+                            if sim.record_fill(now, fill.qty_lots, delta, now)
+                                && !trips.contains(&(sub, base.clone()))
+                            {
+                                trips.push((sub, base.clone()));
                             }
                         }
                     }
@@ -1061,7 +1220,7 @@ impl Engine {
         events
     }
 
-    fn plan_cancel(&self, subaccount: SubaccountId, order_id: OrderId) -> Vec<Event> {
+    pub(crate) fn plan_cancel(&self, subaccount: SubaccountId, order_id: OrderId) -> Vec<Event> {
         if let Some(order) = self.stop_orders.get(&order_id) {
             if order.subaccount != subaccount {
                 return Vec::new();
@@ -1175,19 +1334,25 @@ impl Engine {
                 }
             }
             Event::WithdrawRejected { .. } => {}
-            Event::MarketListed { instrument } => {
+            Event::MarketListed {
+                instrument,
+                anchor_iv_bps,
+            } => {
                 let symbol = instrument.symbol().to_owned();
                 let base = instrument.base_symbol().to_owned();
                 if let Instrument::Option(m) = &instrument {
                     // Every option market registers on the surface at its
                     // configured anchor IV (G-04 stage 1); the book then
                     // blends and the sweep governs.
-                    let anchor_bps = self
-                        .config
-                        .option_ivs
-                        .get(&m.symbol)
-                        .copied()
-                        .map_or(5_500, |iv| (iv * 10_000.0) as u64);
+                    let anchor_bps = anchor_iv_bps
+                        .or_else(|| {
+                            self.config
+                                .option_ivs
+                                .get(&m.symbol)
+                                .copied()
+                                .map(|iv| (iv * 10_000.0) as u64)
+                        })
+                        .unwrap_or(5_500);
                     self.vol_surface.register(&m.symbol, anchor_bps);
                     if m.variant == poc_core::OptionVariant::Everlasting {
                         // The roll's first interval starts at listing.
@@ -1240,10 +1405,7 @@ impl Engine {
                 // Activated stop orders leave the parking lot when they
                 // rest as real limit orders; fresh stops re-insert below.
                 self.stop_orders.remove(&order.id);
-                if matches!(
-                    order.order_type,
-                    OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
-                ) {
+                if order.order_type.is_parked() {
                     self.stop_orders.insert(order.id, order.clone());
                     return;
                 }
@@ -1530,6 +1692,13 @@ impl Engine {
                                         .credit_penalty(allocation.insurance, *broadcast_ts);
                                 }
                             }
+                            // The routed buyback share is credited to the
+                            // buyback pool (conservation).
+                            if allocation.buyback > 0 {
+                                self.buyback_pool_quote_minor = self
+                                    .buyback_pool_quote_minor
+                                    .saturating_add(allocation.buyback);
+                            }
                         }
                     }
                     self.trades += 1;
@@ -1638,6 +1807,128 @@ impl Engine {
             Event::SurfaceSwept { now } => {
                 self.vol_surface.sweep(*now);
             }
+            Event::OrderAmended(amended) => {
+                // In-place size reduction (queue priority kept, G-09).
+                let old_open = self
+                    .books
+                    .get(&amended.symbol)
+                    .and_then(|b| b.get(amended.order_id))
+                    .map(|r| r.order.open_qty());
+                if let Some(old_open) = old_open {
+                    let cut = old_open.saturating_sub(amended.new_open_lots);
+                    if cut > 0 {
+                        if let Some(book) = self.books.get_mut(&amended.symbol) {
+                            book.reduce(amended.order_id, cut);
+                        }
+                    }
+                    if let Some(account) = self.accounts.get_mut(&amended.subaccount) {
+                        if let Some(info) = account.open_orders.get_mut(&amended.order_id) {
+                            info.open_lots = amended.new_open_lots;
+                        }
+                        // Rescale the order-margin reservation to the new size.
+                        if let Some(&reserved) = self.reservations.get(&amended.order_id) {
+                            let scaled = mul_div(
+                                reserved,
+                                u128::from(amended.new_open_lots),
+                                u128::from(old_open.max(1)),
+                                poc_core::Rounding::Floor,
+                            )
+                            .unwrap_or(0);
+                            let delta = reserved.saturating_sub(scaled);
+                            account.order_margin_quote_minor =
+                                account.order_margin_quote_minor.saturating_sub(delta);
+                            self.reservations.insert(amended.order_id, scaled);
+                        }
+                    }
+                }
+            }
+            Event::TrailingUpdated {
+                order_id,
+                extreme_quote_minor,
+                ..
+            } => {
+                if let Some(order) = self.stop_orders.get_mut(order_id) {
+                    order.trailing_extreme_quote_minor = Some(*extreme_quote_minor);
+                }
+            }
+            Event::AuctionOpened {
+                symbol, uncross_at, ..
+            } => {
+                self.auctions.insert(symbol.clone(), *uncross_at);
+                if let Some(book) = self.books.get_mut(symbol) {
+                    book.set_auction_mode(true);
+                }
+            }
+            Event::AuctionUncrossed {
+                symbol,
+                taker_reductions,
+                ..
+            } => {
+                // Reduce every resting "taker" the trades did not.
+                if let Some(book) = self.books.get_mut(symbol) {
+                    for (id, lots) in taker_reductions {
+                        book.reduce(*id, *lots);
+                    }
+                    book.set_auction_mode(false);
+                }
+                self.auctions.remove(symbol);
+            }
+            Event::CollateralMoved(moved) => {
+                self.apply_collateral_move(moved.subaccount, &moved.currency, moved.amount_minor);
+            }
+            Event::CollateralRejected { .. } => {}
+            Event::CollateralConversion(converted) => {
+                self.apply_collateral_move(
+                    converted.subaccount,
+                    &converted.from,
+                    -i128::try_from(converted.from_amount_minor).unwrap_or(i128::MAX),
+                );
+                self.apply_collateral_move(
+                    converted.subaccount,
+                    &converted.to,
+                    i128::try_from(converted.to_amount_minor).unwrap_or(i128::MAX),
+                );
+            }
+            Event::PositionMigrated {
+                subaccount,
+                from_symbol,
+                to_symbol,
+                signed_lots,
+                close_price_quote_minor,
+                open_price_quote_minor,
+                ts,
+            } => {
+                let _ = ts;
+                let (Some(from_inst), Some(to_inst)) = (
+                    self.instruments.get(from_symbol),
+                    self.instruments.get(to_symbol),
+                ) else {
+                    return;
+                };
+                let (from_inst, to_inst) = (from_inst.clone(), to_inst.clone());
+                let closing_side = if *signed_lots > 0 {
+                    Side::Ask
+                } else {
+                    Side::Bid
+                };
+                let lots = signed_lots.unsigned_abs();
+                if let Some(account) = self.accounts.get_mut(subaccount) {
+                    account.apply_fill(
+                        &from_inst,
+                        from_symbol,
+                        closing_side,
+                        lots,
+                        *close_price_quote_minor,
+                    );
+                    account.apply_fill(
+                        &to_inst,
+                        to_symbol,
+                        closing_side.opposite(),
+                        lots,
+                        *open_price_quote_minor,
+                    );
+                }
+            }
         }
     }
 
@@ -1682,6 +1973,13 @@ impl Engine {
                         self.insurance
                             .credit_penalty(allocation.insurance, trade.ts);
                     }
+                }
+                // The routed buyback share is credited to the buyback pool
+                // (conservation: every debited fee unit lands in a pool).
+                if allocation.buyback > 0 {
+                    self.buyback_pool_quote_minor = self
+                        .buyback_pool_quote_minor
+                        .saturating_add(allocation.buyback);
                 }
             }
         }
@@ -1820,6 +2118,13 @@ impl Engine {
                         self.insurance
                             .credit_penalty(allocation.insurance, trade.ts);
                     }
+                }
+                // The routed buyback share is credited to the buyback pool
+                // (conservation: every debited fee unit lands in a pool).
+                if allocation.buyback > 0 {
+                    self.buyback_pool_quote_minor = self
+                        .buyback_pool_quote_minor
+                        .saturating_add(allocation.buyback);
                 }
             }
         }
@@ -2006,7 +2311,7 @@ impl Engine {
     }
 
     /// Mark price of one instrument (quote minor per base).
-    fn instrument_mark(
+    pub(crate) fn instrument_mark(
         &self,
         instrument: &Instrument,
         marks: &BTreeMap<String, MarkSet>,
@@ -2024,16 +2329,85 @@ impl Engine {
         }
     }
 
-    /// The funding mark of a perp: BBO mid if two-sided, else last trade,
-    /// else the oracle spot (fallback by callers).
+    /// The funding mark of a perp: the impact-mid when the book has
+    /// depth, else BBO mid, else last trade, else the oracle spot.
+    ///
+    /// G-39: the impact mid comes from walking a fixed impact notional
+    /// into both sides (the Derive INA / BitMEX impact-price pattern) — a
+    /// thin top-of-book cannot move the funding mark, and depth beyond
+    /// the touch participates in premium discovery.
     fn perp_mark_for_funding(&self, symbol: &str) -> Option<u128> {
         let book = self.books.get(symbol)?;
         let instrument = self.instruments.get(symbol)?;
+        if let Some((ibp, iap)) = self.impact_prices(symbol) {
+            return Some((ibp + iap) / 2);
+        }
         if let (Some(b), Some(a)) = book.bbo() {
             let mid = (b + a) / 2;
             return instrument.price_quote_minor(mid);
         }
         self.last_trade_price.get(symbol).copied()
+    }
+
+    /// Impact bid/ask prices (G-39): volume-weighted prices paid to
+    /// absorb `impact_notional_quote_minor` of flow into each side.
+    /// Falls back to the best touch when a side's visible depth cannot
+    /// cover the notional (the Derive convention of dropping thin sides,
+    /// resolved as "use the touch" — never a zero price).
+    fn impact_prices(&self, symbol: &str) -> Option<(u128, u128)> {
+        if self.config.impact_notional_quote_minor == 0 {
+            return None;
+        }
+        let book = self.books.get(symbol)?;
+        let instrument = self.instruments.get(symbol)?;
+        let (bid_levels, ask_levels) = book.depth(64);
+        let price_of = |ticks: u64| instrument.price_quote_minor(ticks);
+        let value_per_lot = |price: u128| -> Option<u128> {
+            let base_unit = 10_u128.checked_pow(instrument.base_decimals())?;
+            mul_div(
+                price,
+                instrument.lot_size(),
+                base_unit,
+                poc_core::Rounding::Floor,
+            )
+        };
+        let walk = |levels: &[poc_orderbook::LevelSnapshot]| -> Option<u128> {
+            let mut spent = 0_u128;
+            let mut cost = 0_u128;
+            let mut lots = 0_u128;
+            for level in levels {
+                let Some(price) = price_of(level.price_ticks) else {
+                    continue;
+                };
+                let Some(vpl) = value_per_lot(price) else {
+                    continue;
+                };
+                for _ in 0..level.total_qty_lots {
+                    if spent >= self.config.impact_notional_quote_minor {
+                        break;
+                    }
+                    spent = spent.saturating_add(vpl);
+                    cost = cost.saturating_add(price);
+                    lots += 1;
+                }
+                if spent >= self.config.impact_notional_quote_minor {
+                    break;
+                }
+            }
+            if lots > 0 && spent >= self.config.impact_notional_quote_minor {
+                Some(cost / lots)
+            } else {
+                // Insufficient depth: the best touch stands in (documented
+                // fail-safe — never a zero price, never a stale mid).
+                levels.first().and_then(|l| price_of(l.price_ticks))
+            }
+        };
+        let ibp = walk(&bid_levels);
+        let iap = walk(&ask_levels);
+        match (ibp, iap) {
+            (Some(b), Some(a)) if b > 0 && a > 0 => Some((b, a)),
+            _ => None,
+        }
     }
 
     fn push_mark_sample(&mut self, symbol: &str, ts: TimestampMs, price: u128) {
@@ -2107,13 +2481,12 @@ impl Engine {
     // Views and stats
     // ------------------------------------------------------------------
 
-    /// Margin summary of one account (requires live marks).
+    /// Margin summary of one account (requires live marks), with
+    /// haircut-adjusted collateral equity included (G-17).
     #[must_use]
     pub fn margin_summary_of(&self, subaccount: SubaccountId) -> Option<MarginSummary> {
         let account = self.accounts.get(&subaccount)?;
-        let marks = self.build_marks(self.now)?;
-        self.margin_engine
-            .margin_summary(account, &self.instruments, &marks)
+        self.effective_margin_summary(account)
     }
 
     /// Health classification of one account.
@@ -2243,7 +2616,100 @@ impl Engine {
     pub fn is_breaker_blocked(&self, symbol: &str, now: TimestampMs) -> bool {
         self.price_breaker_until
             .get(symbol)
-            .map_or(false, |until| *until > now)
+            .is_some_and(|until| *until > now)
+    }
+
+    /// Pre-trade portfolio greeks check (G-41): the account's current
+    /// vega/gamma plus this order's worst-case increment (a full fill
+    /// at the current mark), against the configured caps.
+    fn check_greeks_limit(
+        &self,
+        request: &OrderRequest,
+        market: &poc_core::OptionMarket,
+    ) -> Option<Rejection> {
+        let marks = self.build_marks(self.now)?;
+        let set = marks.get(&market.base_symbol)?;
+        let spot = set.spot_quote_minor_per_base as f64;
+        let strike = market.strike_quote_minor as f64;
+        let rate = self.config.risk_free_rate;
+        let lot_base = market.lot_size_base_minor as f64 / 10_f64.powi(market.base_decimals as i32);
+        let signed_qty = request.side.sign() as f64 * request.qty_lots as f64;
+
+        // Portfolio totals over the account's option positions.
+        let mut vega_now = 0_i128;
+        let mut gamma_now = 0_i128;
+        let account = self.accounts.get(&request.subaccount)?;
+        for (symbol, position) in &account.positions {
+            let Some(inst) = self.instruments.get(symbol) else {
+                continue;
+            };
+            let Instrument::Option(m) = inst else {
+                continue;
+            };
+            let Some(set) = marks.get(&m.base_symbol) else {
+                continue;
+            };
+            let Some(poc_margin::Mark::Option {
+                iv, tau_years: tau, ..
+            }) = set.marks.get(symbol)
+            else {
+                continue;
+            };
+            let spot = set.spot_quote_minor_per_base as f64;
+            let strike = m.strike_quote_minor as f64;
+            let lot_base = m.lot_size_base_minor as f64 / 10_f64.powi(m.base_decimals as i32);
+            let qty = position.signed_lots as f64;
+            let vega =
+                (poc_margin::OptionAnalytics::vega(spot, strike, *tau, *iv, rate) * qty * lot_base)
+                    .round()
+                    .clamp(-1e15, 1e15) as i128;
+            let gamma = (poc_margin::OptionAnalytics::gamma(spot, strike, *tau, *iv, rate)
+                * qty
+                * lot_base)
+                .round()
+                .clamp(-1e15, 1e15) as i128;
+            vega_now = vega_now.saturating_add(vega);
+            gamma_now = gamma_now.saturating_add(gamma);
+        }
+
+        // Gamma increment of the new order (same mark inputs).
+        let Some(poc_margin::Mark::Option { iv, tau_years, .. }) = set.marks.get(&market.symbol)
+        else {
+            return None;
+        };
+        let (iv, tau) = (*iv, *tau_years);
+        let vega_inc = (poc_margin::OptionAnalytics::vega(spot, strike, tau, iv, rate)
+            * signed_qty
+            * lot_base)
+            .round()
+            .clamp(-1e15, 1e15) as i128;
+        let gamma_inc = (poc_margin::OptionAnalytics::gamma(spot, strike, tau, iv, rate)
+            * signed_qty
+            * lot_base)
+            .round()
+            .clamp(-1e15, 1e15) as i128;
+
+        match self
+            .config
+            .greeks_limits
+            .check(vega_now, gamma_now, vega_inc, gamma_inc)
+        {
+            Ok(()) => None,
+            Err(poc_risk::GreeksRejection::VegaCap { would_be, cap }) => {
+                Some(Rejection::GreeksLimitExceeded {
+                    what: "vega",
+                    would_be,
+                    cap,
+                })
+            }
+            Err(poc_risk::GreeksRejection::GammaCap { would_be, cap }) => {
+                Some(Rejection::GreeksLimitExceeded {
+                    what: "gamma",
+                    would_be,
+                    cap,
+                })
+            }
+        }
     }
 
     /// Position Greeks at the current marks (G-28: the desk's eye on risk).
@@ -2337,7 +2803,7 @@ impl Engine {
     }
 
     /// Fee estimator for the risk gate (worst-case taker fee).
-    fn estimate_fee(&self, instrument: &Instrument, order: &Order, mark: u128) -> i128 {
+    pub(crate) fn estimate_fee(&self, instrument: &Instrument, order: &Order, mark: u128) -> i128 {
         let price_ticks = order
             .price_ticks
             .unwrap_or_else(|| instrument.ticks_from_quote_minor(mark).unwrap_or(0));
@@ -2390,6 +2856,14 @@ fn event_ts(event: &Event) -> TimestampMs {
         Event::SurfaceSwept { now } => *now,
         Event::SurfaceObserved(obs) => obs.ts,
         Event::RfqSettled { trades, .. } => trades.first().map_or(0, |t| t.ts),
+        Event::OrderAmended(a) => a.ts,
+        Event::TrailingUpdated { ts, .. } => *ts,
+        Event::AuctionOpened { ts, .. } => *ts,
+        Event::AuctionUncrossed { ts, .. } => *ts,
+        Event::CollateralMoved(m) => m.ts,
+        Event::CollateralRejected { ts, .. } => *ts,
+        Event::CollateralConversion(c) => c.ts,
+        Event::PositionMigrated { ts, .. } => *ts,
         Event::RfqClosed { .. }
         | Event::BlockRegistered { .. }
         | Event::BlockPrinted { .. }

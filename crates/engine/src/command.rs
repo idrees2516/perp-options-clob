@@ -27,6 +27,8 @@ pub struct OrderRequest {
     pub reduce_only: bool,
     /// Self-trade prevention policy.
     pub stp: SelfTradePrevention,
+    /// Iceberg display slice (G-06): visible lots per slice.
+    pub display_lots: Option<u64>,
     /// Client timestamp (reporting).
     pub client_ts: TimestampMs,
 }
@@ -52,6 +54,7 @@ impl OrderRequest {
             post_only: false,
             reduce_only: false,
             stp: SelfTradePrevention::CancelNewest,
+            display_lots: None,
             client_ts: 0,
         }
     }
@@ -75,6 +78,7 @@ impl OrderRequest {
             post_only: false,
             reduce_only: false,
             stp: SelfTradePrevention::CancelNewest,
+            display_lots: None,
             client_ts: 0,
         }
     }
@@ -245,6 +249,91 @@ pub enum Command {
     SessionDropped {
         /// The disconnected subaccount.
         subaccount: SubaccountId,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Place a batch of orders atomically (G-09). Every request is
+    /// validated against the pre-batch snapshot; one failure rejects the
+    /// whole batch. Intra-batch price-time interaction does not occur —
+    /// the batch is a transport and margin-atomicity primitive, not a
+    /// matching primitive.
+    PlaceBatch {
+        /// The requests, in submission order.
+        requests: Vec<OrderRequest>,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Cancel a set of orders in one atomic command (G-09).
+    CancelBatch {
+        /// Owning subaccount.
+        subaccount: SubaccountId,
+        /// Order ids to cancel.
+        order_ids: Vec<u64>,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Amend a resting order in place or by re-placement (G-09).
+    ///
+    /// Queue rules (the Derive/Paradex ladder, resolved for our pure-match
+    /// engine): a price change or a size increase loses queue priority via
+    /// cancel-and-replace (new order id, back of the level); a pure size
+    /// reduction at the same price keeps priority and is applied in place.
+    Amend {
+        /// Owning subaccount.
+        subaccount: SubaccountId,
+        /// The order to amend.
+        order_id: u64,
+        /// New limit price in ticks (`None` = unchanged).
+        new_price_ticks: Option<u64>,
+        /// New *total open* quantity in lots (`None` = unchanged).
+        new_open_lots: Option<u64>,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Open a pre-open auction on one instrument (G-12). Orders rest
+    /// without matching until the uncross time, then print at one uniform
+    /// clearing price and continuous trading resumes.
+    BeginAuction {
+        /// Instrument symbol.
+        symbol: Symbol,
+        /// When the sweep uncrosses the book.
+        uncross_at: TimestampMs,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Credit a subaccount's *non-quote* collateral balance (G-17).
+    DepositCollateral {
+        /// Target subaccount.
+        subaccount: SubaccountId,
+        /// Collateral currency code (must be configured).
+        currency: String,
+        /// Amount in the currency's minor units.
+        amount_minor: u128,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Debit a subaccount's non-quote collateral (margin-gated, G-17).
+    WithdrawCollateral {
+        /// Source subaccount.
+        subaccount: SubaccountId,
+        /// Collateral currency code.
+        currency: String,
+        /// Amount in the currency's minor units.
+        amount_minor: u128,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Convert between collateral currencies (and to/from quote cash) at
+    /// oracle prices, zero fee, margin-gated (G-17).
+    ConvertCollateral {
+        /// Converting subaccount.
+        subaccount: SubaccountId,
+        /// Source currency code ("USD" = quote cash).
+        from: String,
+        /// Destination currency code ("USD" = quote cash).
+        to: String,
+        /// Amount in the source currency's minor units.
+        from_amount_minor: u128,
         /// Engine wall-clock.
         now: TimestampMs,
     },

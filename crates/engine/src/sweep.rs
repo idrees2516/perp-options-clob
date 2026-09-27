@@ -5,16 +5,24 @@
 //! exact even when stages interact):
 //!
 //! 1. **Halt detection** — oracle quorum lost/resumed per underlying.
-//! 2. **Stop triggers** — parked stop orders whose trigger the mark
-//!    crossed are activated through the standard match path.
-//! 3. **GTD expiry** — resting orders past their date leave the book.
-//! 4. **Funding** — perp intervals settle from mark/index TWAPs.
-//! 5. **Option expiry** — 30-minute TWAP settlement, positions cash out,
+//! 2. **Auction uncross** (G-12) — due auctions print at a uniform price
+//!    and resume continuous trading.
+//! 3. **Stop & trailing triggers** — parked orders whose trigger the mark
+//!    crossed are activated through the standard match path; trailing
+//!    extremes tighten first (G-07).
+//! 4. **GTD expiry** — resting orders past their date leave the book.
+//! 5. **Funding** — perp intervals settle from mark/index TWAPs (impact-
+//!    notional sampled marks, G-39); everlasting rolls settle the
+//!    premium TWAP (G-01).
+//! 6. **Option expiry** — 30-minute TWAP settlement, positions cash out,
 //!    instruments delist.
-//! 6. **Liquidity scoring & rewards** — maker observations accumulate;
+//! 7. **Auto-listing & rebase** (G-34/G-03) — strike grids roll, far
+//!    empty strikes delist, out-of-band everlasting strikes migrate.
+//! 8. **Liquidity scoring & rewards** — maker observations accumulate;
 //!    reward intervals close pro-rata from the pool.
-//! 7. **Liquidation cascade** — under-margined accounts are closed:
-//!    book first, insurance second, ADL last.
+//! 9. **Liquidation cascade** — under-margined accounts are closed:
+//!    collateral converted, book first, fund second, iterative ADL last
+//!    (G-19).
 
 use std::collections::BTreeMap;
 
@@ -57,21 +65,28 @@ pub(crate) fn plan_tick(engine: &Engine, now: TimestampMs) -> Vec<Event> {
 
     let marks = engine.build_marks(now);
 
-    // 2. Stop triggers.
+    // 2. Auction uncross (G-12).
+    events.extend(crate::auction::plan_auction_uncross(engine, now));
+
+    // 3. Stop & trailing triggers (G-07: extremes tighten first).
     if let Some(marks) = &marks {
+        events.extend(plan_trailing_updates(engine, now, marks));
         events.extend(plan_stop_triggers(engine, now, marks));
     }
 
-    // 3. GTD expiry.
+    // 4. GTD expiry.
     events.extend(plan_gtd_expiry(engine, now));
 
-    // 4. Funding intervals.
+    // 5. Funding intervals.
     events.extend(plan_funding(engine, now, &marks));
 
-    // 5. Option expiry.
+    // 6. Option expiry.
     events.extend(plan_option_expiry(engine, now, &marks));
 
-    // 6. Liquidity scoring and rewards.
+    // 6b. Auto-listing + everlasting rebase (G-34/G-03).
+    events.extend(crate::listing::plan_auto_listing(engine, now));
+
+    // 7. Liquidity scoring and rewards.
     events.extend(plan_liquidity(engine, now, &marks));
 
     // 7. Volatility surface: observe book touches, govern the marks (G-04).
@@ -209,7 +224,7 @@ fn plan_price_breaker(engine: &Engine, now: TimestampMs) -> Vec<Event> {
         let diff = mid.abs_diff(set);
         let dislocated = mid > 0
             && poc_core::mul_div(diff, 10_000, mid, poc_core::Rounding::Floor)
-                .map_or(false, |bps| bps > u128::from(params.dislocation_bps));
+                .is_some_and(|bps| bps > u128::from(params.dislocation_bps));
         let blocked = engine.is_breaker_blocked(symbol, now);
         if dislocated && !blocked {
             events.push(Event::BreakerTripped {
@@ -229,8 +244,67 @@ fn plan_price_breaker(engine: &Engine, now: TimestampMs) -> Vec<Event> {
 }
 
 // ----------------------------------------------------------------------
-// Stop triggers
+// Stop & trailing triggers
 // ----------------------------------------------------------------------
+
+/// Update parked trailing stops' running extremes (G-07).
+///
+/// A buy trailer tracks the running LOW; a sell trailer tracks the
+/// running HIGH. Every improvement is journaled as a `TrailingUpdated`
+/// event, so replay reconstructs the trigger state exactly. Applied
+/// before [`plan_stop_triggers`] in the same tick — the extreme tightens
+/// with the mark that crosses it.
+fn plan_trailing_updates(
+    engine: &Engine,
+    now: TimestampMs,
+    marks: &BTreeMap<String, MarkSet>,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    for stop in engine.stop_orders.values() {
+        let (offset_ticks, _limit_ticks) = match stop.order_type {
+            OrderType::TrailingStopMarket { offset_ticks } => (offset_ticks, None),
+            OrderType::TrailingStopLimit {
+                offset_ticks,
+                limit_ticks,
+            } => (offset_ticks, Some(limit_ticks)),
+            _ => continue,
+        };
+        let _ = offset_ticks;
+        let Some(instrument) = engine.instruments.get(&stop.symbol) else {
+            continue;
+        };
+        let Some(set) = marks.get(instrument.base_symbol()) else {
+            continue;
+        };
+        let mark = match instrument {
+            Instrument::Perp(_) => set.spot_quote_minor_per_base,
+            Instrument::Option(m) => match set.marks.get(&m.symbol) {
+                Some(poc_margin::Mark::Option {
+                    premium_quote_minor_per_base,
+                    ..
+                }) => *premium_quote_minor_per_base,
+                _ => continue,
+            },
+        };
+        let Some(current) = stop.trailing_extreme_quote_minor else {
+            continue;
+        };
+        let improved = match stop.side {
+            Side::Bid => mark < current, // buy trailer: track the low
+            Side::Ask => mark > current, // sell trailer: track the high
+        };
+        if improved {
+            events.push(Event::TrailingUpdated {
+                order_id: stop.id,
+                subaccount: stop.subaccount,
+                symbol: stop.symbol.clone(),
+                extreme_quote_minor: mark,
+                ts: now,
+            });
+        }
+    }
+    events
+}
 
 fn plan_stop_triggers(
     engine: &Engine,
@@ -255,12 +329,56 @@ fn plan_stop_triggers(
                 _ => continue,
             },
         };
+        // The trigger in quote minor: stops carry a fixed trigger price
+        // (ticks); trailing stops derive it from their running extreme
+        // and offset (G-07).
         let (trigger, limit_price) = match stop.order_type {
             OrderType::StopMarket { trigger_price } => (trigger_price, None),
             OrderType::StopLimit {
                 trigger_price,
                 limit_price,
             } => (trigger_price, Some(limit_price)),
+            OrderType::TrailingStopMarket { offset_ticks } => {
+                let Some(extreme) = stop.trailing_extreme_quote_minor else {
+                    continue;
+                };
+                let Some(offset_quote) =
+                    instrument.tick_size().checked_mul(u128::from(offset_ticks))
+                else {
+                    continue;
+                };
+                let trigger = match stop.side {
+                    // Buy trailer: fires `offset` above the running low.
+                    Side::Bid => extreme.saturating_add(offset_quote),
+                    // Sell trailer: fires `offset` below the running high.
+                    Side::Ask => extreme.saturating_sub(offset_quote).max(1),
+                };
+                let Some(trigger_ticks) = instrument.ticks_from_quote_minor(trigger) else {
+                    continue;
+                };
+                (trigger_ticks, None)
+            }
+            OrderType::TrailingStopLimit {
+                offset_ticks,
+                limit_ticks,
+            } => {
+                let Some(extreme) = stop.trailing_extreme_quote_minor else {
+                    continue;
+                };
+                let Some(offset_quote) =
+                    instrument.tick_size().checked_mul(u128::from(offset_ticks))
+                else {
+                    continue;
+                };
+                let trigger = match stop.side {
+                    Side::Bid => extreme.saturating_add(offset_quote),
+                    Side::Ask => extreme.saturating_sub(offset_quote).max(1),
+                };
+                let Some(trigger_ticks) = instrument.ticks_from_quote_minor(trigger) else {
+                    continue;
+                };
+                (trigger_ticks, Some(limit_ticks))
+            }
             _ => continue,
         };
         // Convert the trigger (ticks) to quote-minor for comparison.
@@ -573,7 +691,7 @@ fn plan_liquidity(
                 });
                 observations.push(LiquidityObservation {
                     subaccount: resting.order.subaccount,
-                    size_lots: resting.order.open_qty(),
+                    size_lots: resting.visible_qty(),
                     spread_bps,
                     two_sided: has_other_side,
                 });
@@ -624,11 +742,7 @@ fn plan_liquidations(
     // Candidates, most severe deficit first (deterministic order).
     let mut candidates: Vec<LiquidationCandidate> = Vec::new();
     for (sub, account) in &engine.accounts {
-        if let Some(summary) =
-            engine
-                .margin_engine
-                .margin_summary(account, &engine.instruments, marks)
-        {
+        if let Some(summary) = engine.effective_margin_summary_at(account, marks, now) {
             if summary.equity_quote_minor < to_i128(summary.maintenance_quote_minor) {
                 candidates.push(LiquidationCandidate {
                     subaccount: *sub,
@@ -669,9 +783,45 @@ fn plan_liquidations(
 
         // Track this candidate's executions to simulate the final equity.
         let mut sim = account.clone();
-        let mut deficit_estimate = 0_u128;
-        if plan.bankrupt {
-            deficit_estimate = (-plan.projected_equity_after).unsigned_abs();
+
+        // Liquidate the account's non-quote collateral into spendable
+        // quote first (G-17): every unit it holds reduces what the fund
+        // or the counterparties must pay for its bankruptcy.
+        if let Some(balances) = engine.collateral.get(&candidate.subaccount) {
+            for (code, &amount) in balances {
+                if amount == 0 {
+                    continue;
+                }
+                let (Some(price), Some(cfg)) = (
+                    engine.collateral_price(code, now),
+                    engine.collateral_config(code),
+                ) else {
+                    continue;
+                };
+                let Some(unit) = 10_u128.checked_pow(cfg.decimals) else {
+                    continue;
+                };
+                let Some(to_quote) =
+                    poc_core::mul_div(amount, price, unit, poc_core::Rounding::Floor)
+                else {
+                    continue;
+                };
+                if to_quote == 0 {
+                    continue;
+                }
+                events.push(Event::CollateralConversion(Box::new(
+                    crate::event::CollateralConverted {
+                        subaccount: candidate.subaccount,
+                        from: code.clone(),
+                        to: "USD".into(),
+                        from_amount_minor: amount,
+                        to_amount_minor: to_quote,
+                        rate_quote_minor_per_unit: price,
+                        ts: now,
+                    },
+                )));
+                sim.cash_quote_minor = sim.cash_quote_minor.saturating_add(to_i128(to_quote));
+            }
         }
 
         for action in &plan.actions {
@@ -714,6 +864,8 @@ fn plan_liquidations(
                     post_only: false,
                     reduce_only: true,
                     stp: poc_core::SelfTradePrevention::CancelOldest,
+                    display_lots: None,
+                    trailing_extreme_quote_minor: None,
                     client_ts: now,
                     engine_ts: now,
                 };
@@ -731,75 +883,32 @@ fn plan_liquidations(
             }
             let remainder = action.lots.saturating_sub(filled_on_book);
 
-            // Phase B: the uninsurable (bankrupt + exhausted fund) path
-            // routes the remainder through ADL at the bankruptcy price;
-            // otherwise the insurance fund is the buyer of last resort at
-            // the penalized price.
-            let uninsurable =
-                deficit_estimate > 0 && !engine.insurance.can_absorb(deficit_estimate);
-
+            // Phase B (G-19): fund-first, then *iterative* ADL. The
+            // post-book remainder routes to the insurance fund while it
+            // can absorb the account's live deficit; when it cannot, ADL
+            // closes counterparties in capped rounds — a fraction of each
+            // position per round, the round price recomputed from the
+            // remaining deficit — so no single counterparty eats an entire
+            // bankruptcy at once (the BitMEX staged-deleveraging shape).
             if remainder == 0 {
                 continue;
             }
-
-            if uninsurable {
-                let base_per_lot = lot_base(&instrument);
-                let adl_price = bankruptcy_price(
-                    action.penalized_price_quote_minor,
-                    deficit_estimate,
-                    remainder,
-                    base_per_lot,
-                    action.closing_side,
-                );
-                let mut remaining = remainder;
-                let opposite_holders: Vec<AdlCandidate> = engine
-                    .accounts
-                    .iter()
-                    .filter(|(&sub, _)| sub != candidate.subaccount && !touched.contains(&sub))
-                    .filter_map(|(&sub, acct)| {
-                        let lots = acct.lots_of(&action.symbol);
-                        if lots == 0 || lots.signum() == action.closing_side.sign() {
-                            return None;
-                        }
-                        let entry = acct
-                            .position(&action.symbol)
-                            .map(|p| p.avg_entry_quote_minor)
-                            .unwrap_or(0);
-                        Some(AdlCandidate {
-                            subaccount: sub,
-                            symbol: action.symbol.clone(),
-                            signed_lots: lots,
-                            entry_quote_minor: entry,
-                            mark_quote_minor: mark_price,
-                        })
-                    })
-                    .collect();
-                for c in AdlRanking::rank(opposite_holders) {
-                    if remaining == 0 {
-                        break;
-                    }
-                    let lots = c.signed_lots.unsigned_abs().min(remaining);
-                    events.push(Event::Adl(Box::new(crate::event::AdlExecuted {
-                        liquidated_subaccount: candidate.subaccount,
-                        counterparty_subaccount: c.subaccount,
-                        symbol: action.symbol.clone(),
-                        lots,
-                        price_quote_minor: adl_price,
-                        closing_side_is_ask: action.closing_side == Side::Ask,
-                    })));
-                    sim.apply_fill(
-                        &instrument,
-                        &action.symbol,
-                        action.closing_side,
-                        lots,
-                        adl_price,
-                    );
-                    remaining -= lots;
-                    touched.push(c.subaccount);
-                }
-                // Anything left after ADL falls to the insurance fund
-                // (possibly driving it negative — explicit venue debt).
-                if remaining > 0 {
+            let mut remaining = remainder;
+            let mut closed_by: BTreeMap<SubaccountId, u64> = BTreeMap::new();
+            let mut round = 0_u32;
+            let max_rounds = engine.config.adl_max_rounds.max(1);
+            while remaining > 0 {
+                // Live deficit of the running simulation.
+                let deficit_now =
+                    match engine
+                        .margin_engine
+                        .margin_summary(&sim, &engine.instruments, marks)
+                    {
+                        Some(s) if s.equity_quote_minor < 0 => (-s.equity_quote_minor) as u128,
+                        _ => 0,
+                    };
+                // Fund-first: the buyer of last resort while it can pay.
+                if deficit_now == 0 || engine.insurance.can_absorb(deficit_now) {
                     events.push(Event::Liquidation(Box::new(
                         crate::event::LiquidationExecuted {
                             subaccount: candidate.subaccount,
@@ -824,19 +933,118 @@ fn plan_liquidations(
                         remaining,
                         action.penalized_price_quote_minor,
                     );
+                    remaining = 0;
+                    break;
                 }
-            } else {
+                if round >= max_rounds {
+                    break;
+                }
+                round += 1;
+                // This round's counterparties: opposite holders, each
+                // capped at `adl_round_bps` of what they still hold.
+                let fraction_bps = engine.config.adl_round_bps.clamp(1, 10_000);
+                let mut round_take: u64 = 0;
+                let mut chunked: Vec<(SubaccountId, u64)> = Vec::new();
+                let mut holders: Vec<AdlCandidate> = Vec::new();
+                for (&sub, acct) in &engine.accounts {
+                    if sub == candidate.subaccount {
+                        continue;
+                    }
+                    let lots = acct.lots_of(&action.symbol);
+                    // Counterparties hold the side the closing order
+                    // fills against: closing a bankrupt long (Ask) takes
+                    // the shorts (their buy-back reduces them).
+                    if lots == 0 || lots.signum() != action.closing_side.sign() {
+                        continue;
+                    }
+                    let already = closed_by.get(&sub).copied().unwrap_or(0);
+                    let left = lots.unsigned_abs().saturating_sub(already);
+                    if left == 0 {
+                        continue;
+                    }
+                    let chunk = poc_core::mul_div(
+                        u128::from(left),
+                        u128::from(fraction_bps),
+                        10_000,
+                        poc_core::Rounding::Ceil,
+                    )
+                    .unwrap_or(u128::from(left))
+                    .max(1);
+                    let chunk = u64::try_from(chunk).unwrap_or(left).min(left);
+                    chunked.push((sub, chunk));
+                    round_take = round_take.saturating_add(chunk);
+                    let entry = acct
+                        .position(&action.symbol)
+                        .map(|p| p.avg_entry_quote_minor)
+                        .unwrap_or(0);
+                    holders.push(AdlCandidate {
+                        subaccount: sub,
+                        symbol: action.symbol.clone(),
+                        signed_lots: lots,
+                        entry_quote_minor: entry,
+                        mark_quote_minor: mark_price,
+                    });
+                }
+                if round_take == 0 {
+                    break;
+                }
+                round_take = round_take.min(remaining);
+                // The round's price covers the live deficit over the
+                // round's size (the bankruptcy-price trick, per round).
+                let base_per_lot = lot_base(&instrument);
+                let adl_price = bankruptcy_price(
+                    mark_price,
+                    deficit_now,
+                    round_take,
+                    base_per_lot,
+                    action.closing_side,
+                );
+                for c in AdlRanking::rank(holders) {
+                    if round_take == 0 {
+                        break;
+                    }
+                    let allowed = chunked
+                        .iter()
+                        .find(|(s, _)| *s == c.subaccount)
+                        .map_or(0, |&(_, ch)| ch);
+                    if allowed == 0 {
+                        continue;
+                    }
+                    let lots = allowed.min(round_take);
+                    events.push(Event::Adl(Box::new(crate::event::AdlExecuted {
+                        liquidated_subaccount: candidate.subaccount,
+                        counterparty_subaccount: c.subaccount,
+                        symbol: action.symbol.clone(),
+                        lots,
+                        price_quote_minor: adl_price,
+                        closing_side_is_ask: action.closing_side == Side::Ask,
+                    })));
+                    sim.apply_fill(
+                        &instrument,
+                        &action.symbol,
+                        action.closing_side,
+                        lots,
+                        adl_price,
+                    );
+                    round_take -= lots;
+                    remaining = remaining.saturating_sub(lots);
+                    *closed_by.entry(c.subaccount).or_insert(0) += lots;
+                }
+            }
+            // Still open after the rounds: the insurance fund takes the
+            // tail (possibly driving it negative — explicit venue debt).
+            if remaining > 0 {
                 events.push(Event::Liquidation(Box::new(
                     crate::event::LiquidationExecuted {
                         subaccount: candidate.subaccount,
                         symbol: action.symbol.clone(),
-                        lots: remainder,
+                        lots: remaining,
                         price_quote_minor: action.penalized_price_quote_minor,
                         to_insurance: true,
                         penalty_quote_minor: penalty_of(
                             mark_price,
                             action.penalized_price_quote_minor,
-                            remainder,
+                            remaining,
                             &instrument,
                         ),
                         absorbed_quote_minor: 0,
@@ -847,7 +1055,7 @@ fn plan_liquidations(
                     &instrument,
                     &action.symbol,
                     action.closing_side,
-                    remainder,
+                    remaining,
                     action.penalized_price_quote_minor,
                 );
             }

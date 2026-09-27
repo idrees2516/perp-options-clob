@@ -38,19 +38,117 @@
 //! * Every arithmetic path is checked/saturating; the engine cannot panic
 //!   on degraded input.
 
+pub mod amend;
+pub mod auction;
+pub mod collateral;
 pub mod command;
 pub mod engine;
 pub mod event;
 pub mod institutions;
+pub mod listing;
 pub mod sweep;
 
-pub use command::{Command, OrderRequest};
-pub use engine::{Engine, EngineConfig, EngineStats};
+pub use collateral::{CollateralCurrency, PriceSource, QUOTE_CODE};
+pub use command::{Command, OrderRequest, RfqLegCommand};
+pub use engine::{Engine, EngineConfig, EngineStats, ListingPolicy};
 pub use event::{
     AccountView, AdlExecuted, BookView, Event, FundingPaid, FundingSettled, LiquidationExecuted,
     LiquidityObservation, MarketStateView, OptionSettled, OrderCloseReason, OrderRejected,
     RewardPaid, Trade,
 };
+pub use listing::{default_btc_template, OptionTemplate, UnderlyingListing};
+
+#[cfg(test)]
+mod greeks_limit_tests {
+    use crate::{Command, Engine, EngineConfig, Event, OrderRequest};
+    use poc_core::{Instrument, OptionMarket, Side, TimestampMs};
+    use poc_risk::{GreeksLimits, Rejection};
+
+    const T0: TimestampMs = 1_000_000;
+
+    /// G-41: an option order that would push the portfolio vega over
+    /// the configured cap is rejected pre-trade.
+    #[test]
+    fn vega_cap_rejects_option_order() {
+        let mut cfg = EngineConfig {
+            greeks_limits: GreeksLimits {
+                max_abs_vega_quote_minor_per_pct: 1,
+                max_abs_gamma_quote_minor_per_pct: 0,
+            },
+            ..EngineConfig::default()
+        };
+        // ATM 30d BTC call at 55% IV: vega per lot is ~
+        let mut e = Engine::new(cfg);
+        let opt = OptionMarket {
+            expiry_ts_ms: T0 + 30 * 86_400_000,
+            ..OptionMarket::default()
+        };
+        e.register_instrument(Instrument::Option(opt));
+        for provider in ["pyth", "chainlink"] {
+            e.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: provider.into(),
+                ts: T0,
+                price_quote_minor: 8_000_000,
+            });
+        }
+        e.process(Command::Tick { now: T0 });
+        e.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 100_000_000,
+        });
+
+        let ev = e.process(Command::Place {
+            request: OrderRequest::limit(1, "BTC-19800-80000-C", Side::Bid, 10_000, 1),
+            now: T0 + 1,
+        });
+        assert!(
+            ev.iter().any(|x| matches!(
+                x,
+                Event::OrderRejection(r) if matches!(
+                    r.reason,
+                    Rejection::GreeksLimitExceeded { what: "vega", .. }
+                )
+            )),
+            "expected a vega-cap rejection, got {ev:?}"
+        );
+
+        // Raising the cap to effectively-unbounded lets the order rest.
+        let mut cfg2 = EngineConfig {
+            greeks_limits: GreeksLimits {
+                max_abs_vega_quote_minor_per_pct: 1_000_000_000,
+                max_abs_gamma_quote_minor_per_pct: 0,
+            },
+            ..EngineConfig::default()
+        };
+        let mut e2 = Engine::new(cfg2);
+        e2.register_instrument(Instrument::Option(OptionMarket {
+            expiry_ts_ms: T0 + 30 * 86_400_000,
+            ..OptionMarket::default()
+        }));
+        for provider in ["pyth", "chainlink"] {
+            e2.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: provider.into(),
+                ts: T0,
+                price_quote_minor: 8_000_000,
+            });
+        }
+        e2.process(Command::Tick { now: T0 });
+        e2.process(Command::Deposit {
+            subaccount: 1,
+            amount_quote_minor: 100_000_000,
+        });
+        let ev2 = e2.process(Command::Place {
+            request: OrderRequest::limit(1, "BTC-19800-80000-C", Side::Bid, 10_000, 1),
+            now: T0 + 1,
+        });
+        assert!(!ev2.iter().any(|x| matches!(
+            x,
+            Event::OrderRejection(r) if matches!(r.reason, Rejection::GreeksLimitExceeded { .. })
+        )));
+    }
+}
 
 #[cfg(test)]
 mod tests {
