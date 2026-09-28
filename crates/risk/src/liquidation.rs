@@ -228,6 +228,18 @@ impl InsuranceFund {
         self.balance_quote_minor >= 0 && to_i128(shortfall_quote_minor) <= self.balance_quote_minor
     }
 
+    /// Apply inventory mark-to-market PnL (G-23): marking the fund's
+    /// carried positions to the current marks flows gains and losses
+    /// straight into the balance. A loss may push the fund negative —
+    /// exactly the condition that arms ADL on the next cascade.
+    pub fn apply_mark_pnl(&mut self, pnl_quote_minor: i128, ts: TimestampMs) {
+        if pnl_quote_minor == 0 {
+            return;
+        }
+        self.balance_quote_minor = self.balance_quote_minor.saturating_add(pnl_quote_minor);
+        self.history.push((ts, self.balance_quote_minor));
+    }
+
     /// Lifetime statistics.
     #[must_use]
     pub fn stats(&self) -> (u128, u128, u64) {

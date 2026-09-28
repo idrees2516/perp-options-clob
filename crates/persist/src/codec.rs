@@ -518,6 +518,7 @@ fn encode_request(e: &mut Encoder, r: &OrderRequest) {
     e.bool(r.reduce_only);
     encode_stp(e, r.stp);
     e.opt_varint(r.display_lots);
+    e.opt_varint(r.oco_group);
     e.varint(u128::from(r.client_ts));
 }
 
@@ -533,6 +534,7 @@ fn decode_request(d: &mut Decoder<'_>) -> Result<OrderRequest, DecodeError> {
     let reduce_only = d.bool()?;
     let stp = decode_stp(d)?;
     let display_lots = d.opt_u64()?;
+    let oco_group = d.opt_u64()?;
     let client_ts = d.u64()?;
     Ok(OrderRequest {
         subaccount,
@@ -546,6 +548,7 @@ fn decode_request(d: &mut Decoder<'_>) -> Result<OrderRequest, DecodeError> {
         reduce_only,
         stp,
         display_lots,
+        oco_group,
         client_ts,
     })
 }
@@ -843,6 +846,74 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
             e.varint(*from_amount_minor);
             e.varint(u128::from(*now));
         }
+        Command::PlaceOco { first, second, now } => {
+            e.varint(24);
+            encode_request(&mut e, first);
+            encode_request(&mut e, second);
+            e.varint(u128::from(*now));
+        }
+        Command::PlaceTwap {
+            subaccount,
+            symbol,
+            side,
+            total_lots,
+            slices,
+            slice_interval_ms,
+            limit_ticks,
+            now,
+        } => {
+            e.varint(25);
+            e.varint(u128::from(*subaccount));
+            e.str(symbol);
+            encode_side(&mut e, *side);
+            e.varint(u128::from(*total_lots));
+            e.varint(u128::from(*slices));
+            e.varint(u128::from(*slice_interval_ms));
+            e.opt_varint(*limit_ticks);
+            e.varint(u128::from(*now));
+        }
+        Command::CancelTwap {
+            subaccount,
+            parent_id,
+            now,
+        } => {
+            e.varint(26);
+            e.varint(u128::from(*subaccount));
+            e.varint(u128::from(*parent_id));
+            e.varint(u128::from(*now));
+        }
+        Command::VaultCreate {
+            revenue_share_bps,
+            now,
+        } => {
+            e.varint(27);
+            e.varint(u128::from(*revenue_share_bps));
+            e.varint(u128::from(*now));
+        }
+        Command::VaultSubscribe {
+            vault_id,
+            subaccount,
+            amount_quote_minor,
+            now,
+        } => {
+            e.varint(28);
+            e.varint(u128::from(*vault_id));
+            e.varint(u128::from(*subaccount));
+            e.varint(*amount_quote_minor);
+            e.varint(u128::from(*now));
+        }
+        Command::VaultRedeem {
+            vault_id,
+            subaccount,
+            shares,
+            now,
+        } => {
+            e.varint(29);
+            e.varint(u128::from(*vault_id));
+            e.varint(u128::from(*subaccount));
+            e.varint(*shares);
+            e.varint(u128::from(*now));
+        }
     }
     e.into_vec()
 }
@@ -1014,6 +1085,74 @@ pub fn decode_command(data: &[u8]) -> Result<Command, DecodeError> {
             amount_minor: d.varint()?,
             now: d.u64()?,
         },
+        24 => {
+            let first = decode_request(&mut d)?;
+            let second = decode_request(&mut d)?;
+            let now = d.u64()?;
+            Command::PlaceOco { first, second, now }
+        }
+        25 => {
+            let subaccount = d.u64()?;
+            let symbol = d.str()?;
+            let side = decode_side(&mut d)?;
+            let total_lots = d.u64()?;
+            let slices = d.u64()?;
+            let slice_interval_ms = d.u64()?;
+            let limit_ticks = d.opt_u64()?;
+            let now = d.u64()?;
+            Command::PlaceTwap {
+                subaccount,
+                symbol,
+                side,
+                total_lots,
+                slices,
+                slice_interval_ms,
+                limit_ticks,
+                now,
+            }
+        }
+        26 => {
+            let subaccount = d.u64()?;
+            let parent_id = d.u64()?;
+            let now = d.u64()?;
+            Command::CancelTwap {
+                subaccount,
+                parent_id,
+                now,
+            }
+        }
+        27 => {
+            let revenue_share_bps = d.u64()?;
+            let now = d.u64()?;
+            Command::VaultCreate {
+                revenue_share_bps,
+                now,
+            }
+        }
+        28 => {
+            let vault_id = d.u64()?;
+            let subaccount = d.u64()?;
+            let amount_quote_minor = d.varint()?;
+            let now = d.u64()?;
+            Command::VaultSubscribe {
+                vault_id,
+                subaccount,
+                amount_quote_minor,
+                now,
+            }
+        }
+        29 => {
+            let vault_id = d.u64()?;
+            let subaccount = d.u64()?;
+            let shares = d.varint()?;
+            let now = d.u64()?;
+            Command::VaultRedeem {
+                vault_id,
+                subaccount,
+                shares,
+                now,
+            }
+        }
         23 => Command::ConvertCollateral {
             subaccount: d.u64()?,
             from: d.str()?,
@@ -1075,6 +1214,7 @@ mod tests {
             reduce_only: false,
             stp: SelfTradePrevention::DecrementAndCancel,
             display_lots: Some(4),
+            oco_group: Some(9),
             client_ts: 123_456,
         };
         let commands = vec![

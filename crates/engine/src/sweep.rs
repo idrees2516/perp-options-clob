@@ -26,7 +26,9 @@
 
 use std::collections::BTreeMap;
 
-use poc_core::{to_i128, Instrument, Order, OrderType, Side, SubaccountId, Symbol, TimestampMs};
+use poc_core::{
+    mul_div, to_i128, Instrument, Order, OrderType, Side, SubaccountId, Symbol, TimestampMs,
+};
 use poc_economics::FundingCalculator;
 use poc_margin::{MarginAccount, MarkSet};
 use poc_risk::{AdlCandidate, AdlRanking, LiquidationCandidate};
@@ -36,6 +38,7 @@ use crate::event::{
     Event, FundingPaid, FundingSettled, LiquidityObservation, OptionSettled, OrderCloseReason,
     RewardPaid,
 };
+use crate::vaults::plan_vault_epochs;
 
 /// Plan the entire tick. Pure over the pre-tick snapshot.
 pub(crate) fn plan_tick(engine: &Engine, now: TimestampMs) -> Vec<Event> {
@@ -93,6 +96,23 @@ pub(crate) fn plan_tick(engine: &Engine, now: TimestampMs) -> Vec<Event> {
     if let Some(marks) = &marks {
         events.extend(plan_vol_surface(engine, now, marks));
     }
+
+    // 7b. TWAP slicing (G-10): at most one child per parent per tick.
+    events.extend(plan_twap_slices(engine, now));
+
+    // 7c. Volatility index publication (G-05, DVOL-shaped).
+    events.extend(plan_vol_index(engine, now));
+
+    // 7d. Collateral interest accrual (G-18, daily boundaries).
+    events.extend(plan_collateral_interest(engine, now));
+
+    // 7e. Insurance inventory: mark to market, rebalance drips (G-23).
+    if let Some(marks) = &marks {
+        events.extend(plan_insurance_inventory(engine, now, marks));
+    }
+
+    // 7f. LP vault epochs (G-16).
+    events.extend(plan_vault_epochs(engine, now));
 
     // 8. RFQ + block sweeps: expiries and delayed broadcasts (G-11/G-13).
     events.extend(plan_rfq_sweep(engine, now));
@@ -866,6 +886,7 @@ fn plan_liquidations(
                     stp: poc_core::SelfTradePrevention::CancelOldest,
                     display_lots: None,
                     trailing_extreme_quote_minor: None,
+                    oco_group: None,
                     client_ts: now,
                     engine_ts: now,
                 };
@@ -1145,3 +1166,350 @@ fn penalty_of(mark: u128, price: u128, lots: u64, instrument: &Instrument) -> u1
     )
     .unwrap_or(0)
 }
+
+// ----------------------------------------------------------------------
+// TWAP slicing (G-10)
+// ----------------------------------------------------------------------
+
+/// Emit at most one child placement per parent per tick. The child is a
+/// full [`crate::command::OrderRequest`] journaled inside the marker
+/// event; the engine runs it through the ordinary place path after the
+/// tick's other effects are applied.
+fn plan_twap_slices(engine: &Engine, now: TimestampMs) -> Vec<Event> {
+    let mut events = Vec::new();
+    for parent in engine.twap_parents.values() {
+        if parent.complete() || now < parent.next_slice_ts {
+            continue;
+        }
+        let index = parent.slices_placed;
+        let lots = parent.slice_lots(index);
+        if lots == 0 {
+            continue;
+        }
+        let request = crate::command::OrderRequest {
+            subaccount: parent.subaccount,
+            symbol: parent.symbol.clone(),
+            side: parent.side,
+            order_type: poc_core::OrderType::Limit,
+            price_ticks: parent.limit_ticks,
+            qty_lots: lots,
+            tif: poc_core::TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: false,
+            stp: poc_core::SelfTradePrevention::CancelNewest,
+            display_lots: None,
+            oco_group: None,
+            client_ts: now,
+        };
+        let slice_index = index;
+        events.push(Event::TwapSliced {
+            parent_id: parent.parent_id,
+            request,
+            slice_index,
+            ts: now,
+        });
+        if slice_index + 1 == parent.slices {
+            events.push(Event::TwapClosed {
+                parent_id: parent.parent_id,
+                subaccount: parent.subaccount,
+                reason: "completed",
+                placed_lots: parent.lots_placed.saturating_add(lots),
+                ts: now,
+            });
+        }
+    }
+    events
+}
+
+// ----------------------------------------------------------------------
+// Volatility index (G-05, DVOL-shaped)
+// ----------------------------------------------------------------------
+
+/// Integer square root (deterministic; no f64 in the publication path).
+fn isqrt(x: u128) -> u128 {
+    if x == 0 {
+        return 0;
+    }
+    let mut r = x;
+    let mut q = (x >> 1) + 1;
+    while q < r {
+        r = q;
+        q = (x / r + r) / 2;
+    }
+    r
+}
+
+/// Publish a 30-day-shaped volatility index per underlying: a
+/// moneyness-weighted variance of the governed mark IVs of the
+/// underlying's option markets, expressed in permille (index x 1000).
+///
+/// This is the honest DVOL simplification: a full variance-strip
+/// replication needs a liquid strip across strikes and tenors; a young
+/// surface publishes noise, not an index. The weighting is linear in
+/// moneyness distance inside the configured band, options contribute
+/// their squared IV, and the square root lands in index points
+/// (55% vol prints 55_000 permille).
+fn plan_vol_index(engine: &Engine, now: TimestampMs) -> Vec<Event> {
+    let band = engine.config.vol_index_band_bps.max(1);
+    let mut events = Vec::new();
+    let bases: Vec<String> = engine
+        .oracles
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for base in bases {
+        let Some(spot) = engine.oracles.get(&base).and_then(|o| o.mark(now)) else {
+            continue;
+        };
+        let mut weight_variance_sum: u128 = 0;
+        let mut weight_sum: u128 = 0;
+        for (symbol, instrument) in &engine.instruments {
+            let poc_core::Instrument::Option(m) = instrument else {
+                continue;
+            };
+            if m.base_symbol != base {
+                continue;
+            }
+            let Some(mark_iv_bps) = engine.vol_surface.mark_iv_bps(symbol) else {
+                continue;
+            };
+            // Moneyness distance in bps of spot (integer, floored).
+            let strike = m.strike_quote_minor;
+            let distance_bps = if spot > 0 {
+                let diff = strike.abs_diff(spot);
+                mul_div(diff, 10_000, spot, poc_core::Rounding::Floor).unwrap_or(0)
+            } else {
+                continue;
+            };
+            if distance_bps >= u128::from(band) {
+                continue;
+            }
+            let weight = u128::from(band - u64::try_from(distance_bps).unwrap_or(band)); // linear kernel
+            weight_sum = weight_sum.saturating_add(weight);
+            weight_variance_sum =
+                weight_variance_sum.saturating_add(weight.saturating_mul(
+                    u128::from(mark_iv_bps).saturating_mul(u128::from(mark_iv_bps)),
+                ));
+        }
+        if weight_sum == 0 {
+            continue;
+        }
+        let variance_bps2 = weight_variance_sum / weight_sum;
+        // Index points: iv in bps -> index in permille is bps * 10.
+        let index_permille =
+            u64::try_from(isqrt(variance_bps2).saturating_mul(10)).unwrap_or(u64::MAX);
+        events.push(Event::VolIndexPublished {
+            base_symbol: base,
+            index_permille,
+            ts: now,
+        });
+    }
+    events
+}
+
+// ----------------------------------------------------------------------
+// Collateral interest (G-18)
+// ----------------------------------------------------------------------
+
+/// Accrue daily interest on *utilized* non-quote collateral at UTC day
+/// boundaries: the in-kind charge for margin capacity borrowed in a
+/// foreign currency. Utilization is the haircut value the account
+/// actually deploys (min of haircut value and maintenance requirement),
+/// so idle collateral pays nothing.
+fn plan_collateral_interest(engine: &Engine, now: TimestampMs) -> Vec<Event> {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    if engine.config.collateral_interest_bps_per_day.is_empty() {
+        return Vec::new();
+    }
+    let day = now / DAY_MS;
+    if day <= engine.last_collateral_interest_day {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    for (subaccount, balances) in &engine.collateral {
+        // The account's maintenance usage bounds what its collateral
+        // is doing for it.
+        let usage = engine
+            .accounts
+            .get(subaccount)
+            .and_then(|a| engine.effective_margin_summary(a))
+            .map(|s| s.maintenance_quote_minor)
+            .unwrap_or(0);
+        if usage == 0 {
+            continue;
+        }
+        for (code, balance) in balances {
+            let rate = engine
+                .config
+                .collateral_interest_bps_per_day
+                .get(code)
+                .copied()
+                .unwrap_or(0);
+            if rate == 0 || *balance == 0 {
+                continue;
+            }
+            let Some(cfg) = engine.collateral_config(code) else {
+                continue;
+            };
+            let Some(price) = engine.collateral_price(code, now) else {
+                continue;
+            };
+            let Some(unit) = 10_u128.checked_pow(cfg.decimals) else {
+                continue;
+            };
+            // Haircut value of the whole balance.
+            let gross = mul_div(*balance, price, unit, poc_core::Rounding::Floor).unwrap_or(0);
+            let net = mul_div(
+                gross,
+                10_000_u128.saturating_sub(u128::from(cfg.haircut_bps)),
+                10_000,
+                poc_core::Rounding::Floor,
+            )
+            .unwrap_or(0);
+            let utilized = net.min(usage);
+            // Interest in quote, rounded up (owed).
+            let interest_quote =
+                mul_div(utilized, u128::from(rate), 10_000, poc_core::Rounding::Ceil).unwrap_or(0);
+            if interest_quote == 0 {
+                continue;
+            }
+            // In-kind charge: minor units of the currency covering the
+            // quote interest, rounded up against the holder.
+            let amount_minor = mul_div(interest_quote, unit, price, poc_core::Rounding::Ceil)
+                .unwrap_or(0)
+                .min(*balance);
+            if amount_minor == 0 {
+                continue;
+            }
+            events.push(Event::CollateralInterestAccrued {
+                subaccount: *subaccount,
+                currency: code.clone(),
+                amount_minor,
+                quote_value_minor: interest_quote,
+                ts: now,
+            });
+        }
+    }
+    events
+}
+
+// ----------------------------------------------------------------------
+// Insurance inventory (G-23)
+// ----------------------------------------------------------------------
+
+/// Mark the fund's carried positions to the current marks and drip
+/// inventory back into the book when the market pays an edge over the
+/// carrying mark.
+fn plan_insurance_inventory(
+    engine: &Engine,
+    now: TimestampMs,
+    marks: &BTreeMap<String, MarkSet>,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    for (symbol, (signed_lots, last_mark)) in &engine.insurance_inventory {
+        if *signed_lots == 0 {
+            continue;
+        }
+        let Some(instrument) = engine.instruments.get(symbol) else {
+            continue;
+        };
+        let Some(mark) = engine.instrument_mark(instrument, marks) else {
+            continue;
+        };
+        // 1. Mark to market.
+        let per_lot = |price: u128| -> i128 {
+            let base = instrument
+                .position_notional_minor(price, *signed_lots)
+                .unwrap_or(0);
+            to_i128(base)
+        };
+        let pnl = per_lot(mark).saturating_sub(per_lot(*last_mark));
+        if pnl != 0 {
+            events.push(Event::InsuranceMarked {
+                symbol: symbol.clone(),
+                signed_lots: *signed_lots,
+                mark_quote_minor: mark,
+                pnl_quote_minor: pnl,
+                ts: now,
+            });
+        }
+        // 2. Rebalance drip: only long inventory (the fund buys bankrupt
+        //    longs' positions), only when the book bids an edge over the
+        //    new mark. The drip crosses the book as a synthetic IOC
+        //    taker owned by the reserved insurance subaccount (no real
+        //    account record — fills journal, makers settle, the fund
+        //    books the proceeds), exactly the liquidation phase-A pattern.
+        if *signed_lots > 0 {
+            let lots_available = u64::try_from(*signed_lots).unwrap_or(0);
+            let drip = lots_available.min(engine.config.insurance_rebalance_max_lots);
+            if drip > 0 {
+                if let Some(book) = engine.books.get(symbol) {
+                    if let Some(bid_ticks) = book.best_bid() {
+                        let Some(bid_quote) = instrument.price_quote_minor(bid_ticks) else {
+                            continue;
+                        };
+                        let edge = mul_div(
+                            bid_quote.saturating_sub(mark),
+                            10_000,
+                            mark.max(1),
+                            poc_core::Rounding::Floor,
+                        )
+                        .unwrap_or(0);
+                        if edge >= u128::from(engine.config.insurance_rebalance_edge_bps) {
+                            let taker = Order {
+                                id: engine.next_order_id,
+                                subaccount: INSURANCE_SUBACCOUNT,
+                                symbol: symbol.clone(),
+                                side: Side::Ask,
+                                order_type: OrderType::Limit,
+                                price_ticks: Some(bid_ticks),
+                                qty_lots: drip,
+                                filled_lots: 0,
+                                tif: poc_core::TimeInForce::Ioc,
+                                post_only: false,
+                                reduce_only: false,
+                                stp: poc_core::SelfTradePrevention::CancelOldest,
+                                display_lots: None,
+                                trailing_extreme_quote_minor: None,
+                                oco_group: None,
+                                client_ts: now,
+                                engine_ts: now,
+                            };
+                            let start = events.len();
+                            events.extend(engine.plan_match(&taker, now, 0));
+                            // Proceeds = the notional actually printed.
+                            let mut proceeds = 0_u128;
+                            let mut lots_sold = 0_u64;
+                            for event in &events[start..] {
+                                if let Event::TradeExecuted(trade) = event {
+                                    proceeds = proceeds.saturating_add(trade.notional_quote_minor);
+                                    lots_sold = lots_sold.saturating_add(trade.qty_lots);
+                                }
+                            }
+                            if lots_sold > 0 {
+                                events.push(Event::InsuranceRebalanced {
+                                    symbol: symbol.clone(),
+                                    lots: lots_sold,
+                                    proceeds_quote_minor: proceeds,
+                                    ts: now,
+                                });
+                            } else {
+                                // No liquidity actually crossed: drop the
+                                // empty plan.
+                                events.truncate(start);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    events
+}
+
+/// The reserved subaccount id the insurance fund trades synthetic
+/// inventory through (no account record — fills journal, makers settle,
+/// the fund books proceeds).
+pub(crate) const INSURANCE_SUBACCOUNT: SubaccountId = u64::MAX - 1;

@@ -27,6 +27,23 @@ its results reproducible on any machine; numbers below are from the
 | WAL append (unsynced) | 432 ns | 0.6 µs | framed + chained + CRC |
 | WAL full recovery (50k commands) | 6.5 ms total | — | ~7.7M commands/s replay |
 
+## Second closure wave (G-05/08/09/10)
+
+Added with the OCO/TWAP/batch/vol-index closure wave, same container:
+
+| Benchmark | p50 | p99 | Interpretation |
+|---|---|---|---|
+| OCO bracket place (incl. double gate) | 7.0 µs | 158 µs | pair validity + cumulative margin + link + cascade scan |
+| TWAP open + one slice tick | 1.5 µs | 6.2 µs | parent creation + marker + child placement |
+| batch of 3 (gate + sequential commit) | 0.67 µs | 2.2 µs | atomic gate + per-member commit |
+| tick (incl. vol index + collateral interest) | 1.2 µs | 3.3 µs | the two new sweep stages are ~100 ns of the tick |
+
+The OCO premium over a plain place (~7 µs vs ~0.6 µs) is the *correct*
+cost of atomicity: the pair runs the full hypothetical-fill margin gate
+twice plus the cumulative-reservation simulation before either leg is
+committed. Brackets are a retail-flow feature at human frequency; the
+venue charges the microseconds where it buys a guarantee.
+
 ## Reading the numbers
 
 * **Matching throughput.** ~1M place/cancel ops/s and sub-microsecond

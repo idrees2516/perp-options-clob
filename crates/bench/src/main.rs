@@ -128,7 +128,7 @@ fn micro() {
     {
         const N: usize = 20_000;
         let mut e = setup_engine(8);
-        let mut rng = Rng::new(7);
+        let _rng = Rng::new(7);
         for i in 0..200 {
             e.process(Command::Place {
                 request: OrderRequest::limit(1 + (i % 8), "BTC-PERP", Side::Ask, 79_500 + i, 5),
@@ -236,6 +236,105 @@ fn micro() {
             t.elapsed()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 7. Second closure wave: OCO brackets, TWAP slicing, batch + vol
+    // index (G-05/08/10/09).
+    {
+        const N: usize = 10_000;
+        let mut e = setup_engine(8);
+        let mut rng = Rng::new(99);
+        let mut samples = Vec::with_capacity(N);
+        for i in 0..N {
+            let sub = 1 + rng.below(8);
+            let price = 70_000 + rng.below(20_000);
+            let t = Instant::now();
+            e.process(Command::PlaceOco {
+                first: OrderRequest::limit(sub, "BTC-PERP", Side::Bid, price, 1 + rng.below(3)),
+                second: OrderRequest {
+                    order_type: poc_core::OrderType::StopMarket {
+                        trigger_price: price.saturating_sub(500),
+                    },
+                    ..OrderRequest::limit(
+                        sub,
+                        "BTC-PERP",
+                        Side::Bid,
+                        price.saturating_sub(600),
+                        1 + rng.below(3),
+                    )
+                },
+                now: 2_000,
+            });
+            // Sweep the brackets periodically so the OCO cascade runs.
+            if i % 50 == 49 {
+                e.process(Command::Tick { now: 3_000 });
+                e.process(Command::CancelAll {
+                    subaccount: sub,
+                    symbol: None,
+                    now: 3_000,
+                });
+            }
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("OCO bracket place (incl. gate)", &mut samples);
+
+        // TWAP slicing throughput: parents + slice ticks.
+        let mut samples = Vec::with_capacity(N);
+        for i in 0..N {
+            let t = Instant::now();
+            e.process(Command::PlaceTwap {
+                subaccount: 1 + rng.below(8),
+                symbol: "BTC-PERP".into(),
+                side: Side::Bid,
+                total_lots: 10,
+                slices: 5,
+                slice_interval_ms: 1_000,
+                limit_ticks: Some(75_000),
+                now: 4_000 + (i as u64) * 1_000,
+            });
+            e.process(Command::Tick {
+                now: 4_001 + (i as u64) * 1_000,
+            });
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("TWAP open + one slice tick", &mut samples);
+
+        // Batch placement (atomic gate + sequential commit).
+        let mut samples = Vec::with_capacity(N);
+        for _ in 0..N {
+            let sub = 1 + rng.below(8);
+            let t = Instant::now();
+            e.process(Command::PlaceBatch {
+                requests: (0..3)
+                    .map(|k| {
+                        OrderRequest::limit(
+                            sub,
+                            "BTC-PERP",
+                            Side::Bid,
+                            70_000 + rng.below(20_000) + k,
+                            1,
+                        )
+                    })
+                    .collect(),
+                now: 5_000,
+            });
+            e.process(Command::CancelAll {
+                subaccount: sub,
+                symbol: None,
+                now: 5_000,
+            });
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("batch of 3 (gate + commit)", &mut samples);
+
+        // Vol index publication over the (optionless) book: cheap.
+        let mut samples = Vec::with_capacity(1_000);
+        for i in 0..1_000 {
+            let t = Instant::now();
+            e.process(Command::Tick { now: 6_000 + i });
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("tick (incl. vol index + interest)", &mut samples);
     }
 }
 

@@ -789,6 +789,7 @@ mod tests {
             stp: SelfTradePrevention::CancelNewest,
             display_lots: None,
             trailing_extreme_quote_minor: None,
+            oco_group: None,
             client_ts: 0,
             engine_ts: 0,
         }

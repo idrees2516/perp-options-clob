@@ -7,7 +7,7 @@ event-sourced library.
 
 ```
 cargo run -p poc-demo               # watch a full session: quoting → trading → funding → crash → liquidation → expiry
-cargo test --workspace              # 268 unit + integration + property tests, journal-replay determinism included
+cargo test --workspace              # 290 unit + integration + property tests, journal-replay determinism included
 cargo run --release -p poc-bench -- micro    # benchmarks (docs/BENCHMARKS.md)
 cargo run --release -p poc-bench -- stress    # architecture stress scenarios (docs/STRESS_TESTING.md)
 ```
@@ -29,15 +29,15 @@ reasons for each — documented where they are made.
 | [`poc-core`](crates/core) | Domain primitives | **Money is exact**: every amount is a `u128` minor unit through checked `mul_div` with an explicit rounding direction; `f64` never touches a ledger |
 | [`poc-orderbook`](crates/orderbook) | CLOB matching | **Pure match, separate apply** — [`match_taker`](crates/orderbook/src/lib.rs) is side-effect-free, so live trading and event replay provably execute the same fills (flood-rs / dYdX v4 model) |
 | [`poc-oracle`](crates/oracle) | Price defense | **Median + staleness + deviation quarantine + quorum halt**: one compromised feed cannot move a mark, and no mark at all beats a wrong mark |
-| [`poc-economics`](crates/economics) | The business model | Volume-tiered fees with maker **rebates**, BitMEX-style **premium + interest** funding, a **60/30/10 revenue router** (house / insurance / buyback) with exact conservation, and a **budgeted liquidity-reward pool** scored on two-sided, tight quoting |
-| [`poc-margin`](crates/margin) | Capital efficiency | **SFPM portfolio margin** (Derive V3 / CME SPAN): worst-case loss of the *whole book* under a standardized scenario grid — hedges net out; short options pay a **SOMC** tail floor |
+| [`poc-economics`](crates/economics) | The business model | Volume-tiered fees with maker **rebates**, BitMEX-style **premium + interest** funding, a **60/30/10 revenue router** (house / insurance / buyback) with exact conservation, and a **budgeted liquidity-reward pool** scored on two-sided, tight quoting, and **LP underwriter vaults** with epoch-settled subscriptions and NAV-exact share accounting (G-16) |
+| [`poc-margin`](crates/margin) | Capital efficiency | **SFPM portfolio margin** (Derive V3 / CME SPAN): worst-case loss of the *whole book* under a standardized scenario grid — hedges net out (including **held collateral as a spot-hedge leg**, G-20); short options pay a **SOMC** tail floor |
 | [`poc-risk`](crates/risk) | The safety net | Pre-trade gates that **simulate the worst-case fill before accepting it**; liquidation that is **partial first**, penalized into the **insurance fund**, with **ADL** as the last resort |
-| [`poc-engine`](crates/engine) | The sequencer | **Commands in → events out → state applied**: one `apply_event` mutator, so the journal *is* the state machine — replay is bit-exact (verified in tests) |
+| [`poc-engine`](crates/engine) | The sequencer | **Commands in → events out → state applied**: one `apply_event` mutator, so the journal *is* the state machine — replay is bit-exact (verified in tests). Adds **OCO brackets**, **TWAP parents**, batch/amend, Dutch auctions, auto-listing + everlasting rebase, multi-collateral, insurance inventory with rebalancing, collateral interest, and the DVOL-shaped vol index (G-03/05/08/09/10/12/17/18/23/34) |
 | [`poc-volsurface`](crates/volsurface) | Option marks | **Anchor → blend → govern**: configured IV anchors the mark, the book's own quotes blend in inside a sanity band, and per-sweep clamps + staleness fallback keep it honest (G-04) |
 | [`poc-rfq`](crates/rfq) | Dealer liquidity | Multi-leg **RFQ packages** with competitive quotes, atomic execution through the venue's margin/fee path, block trades with delayed broadcast, Derive's grouped multi-leg fee discounts (G-11/13/14/38) |
 | [`poc-settlement`](crates/settlement) | On-chain layer | **State-diff settlement** (Lighter/dYdX pattern): merkleized account commitments, hash-chained batches, a conservation validator, and the withdrawal escape hatch (G-30) |
 | [`poc-persist`](crates/persist) | Durability | A **framed, CRC'd, chain-hashed command WAL** with segment rotation, atomic checkpoints, and torn-tail-safe crash recovery (G-24) |
-| [`poc-api`](crates/api) | Gateway protocol | Snapshot+delta market-data sessions with gap detection, **per-key monotonic nonces**, token-bucket rate limits, and the time-locked withdrawal pipeline (G-25/27/32) |
+| [`poc-api`](crates/api) | Gateway protocol | Snapshot+delta market-data sessions with gap detection, **per-key monotonic nonces**, token-bucket rate limits, the time-locked withdrawal pipeline (G-25/27/32), and a **FIX 4.4 session codec** with the typed order-gateway subset (G-26) |
 | [`poc-governance`](crates/governance) | Parameter safety | **Weighted multisig → timelock → grace** with an instant guardian veto; every transition is a journalable event (G-33) |
 | [`poc-bench`](crates/bench) | Evidence | Deterministic benchmarks + whole-architecture stress scenarios (flash crash, vol spike, spam, cascade, oracle split, crash recovery) |
 | [`poc-demo`](crates/demo) | Proof of life | A scripted session exercising every subsystem, ending with a journal-replay audit |

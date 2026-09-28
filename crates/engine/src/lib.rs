@@ -38,6 +38,7 @@
 //! * Every arithmetic path is checked/saturating; the engine cannot panic
 //!   on degraded input.
 
+pub mod algorithms;
 pub mod amend;
 pub mod auction;
 pub mod collateral;
@@ -47,6 +48,7 @@ pub mod event;
 pub mod institutions;
 pub mod listing;
 pub mod sweep;
+pub mod vaults;
 
 pub use collateral::{CollateralCurrency, PriceSource, QUOTE_CODE};
 pub use command::{Command, OrderRequest, RfqLegCommand};
@@ -54,7 +56,7 @@ pub use engine::{Engine, EngineConfig, EngineStats, ListingPolicy};
 pub use event::{
     AccountView, AdlExecuted, BookView, Event, FundingPaid, FundingSettled, LiquidationExecuted,
     LiquidityObservation, MarketStateView, OptionSettled, OrderCloseReason, OrderRejected,
-    RewardPaid, Trade,
+    RewardPaid, Trade, TwapParent, VaultEpoch,
 };
 pub use listing::{default_btc_template, OptionTemplate, UnderlyingListing};
 
@@ -70,7 +72,7 @@ mod greeks_limit_tests {
     /// the configured cap is rejected pre-trade.
     #[test]
     fn vega_cap_rejects_option_order() {
-        let mut cfg = EngineConfig {
+        let cfg = EngineConfig {
             greeks_limits: GreeksLimits {
                 max_abs_vega_quote_minor_per_pct: 1,
                 max_abs_gamma_quote_minor_per_pct: 0,
@@ -114,7 +116,7 @@ mod greeks_limit_tests {
         );
 
         // Raising the cap to effectively-unbounded lets the order rest.
-        let mut cfg2 = EngineConfig {
+        let cfg2 = EngineConfig {
             greeks_limits: GreeksLimits {
                 max_abs_vega_quote_minor_per_pct: 1_000_000_000,
                 max_abs_gamma_quote_minor_per_pct: 0,

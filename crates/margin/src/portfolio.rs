@@ -151,6 +151,27 @@ impl PortfolioMarginEngine {
         instruments: &BTreeMap<Symbol, Instrument>,
         marks: &BTreeMap<String, MarkSet>,
     ) -> Option<MarginSummary> {
+        self.margin_summary_ex(account, instruments, marks, &BTreeMap::new())
+    }
+
+    /// [`Self::margin_summary`] with spot-hedge-aware collateral (G-20):
+    /// `spot_exposures` maps underlying → signed base units of
+    /// oracle-priced collateral held by the account. Each exposure enters
+    /// the scenario scan as a linear spot leg, so BTC held against a short
+    /// BTC call nets the call's scenario gain instead of sitting outside
+    /// the grid as an unshocked credit — the Derive V3
+    /// hedge-with-collateral pattern.
+    ///
+    /// Equity still credits the *haircut* value (the engine's addition);
+    /// the scanner shocks the *full* balance — the haircut stays
+    /// conservative on both sides of the grid.
+    pub fn margin_summary_ex(
+        &self,
+        account: &MarginAccount,
+        instruments: &BTreeMap<Symbol, Instrument>,
+        marks: &BTreeMap<String, MarkSet>,
+        spot_exposures: &BTreeMap<String, f64>,
+    ) -> Option<MarginSummary> {
         // Equity: cash + unrealized PnL of every position.
         let mut equity = account.cash_quote_minor;
         for (symbol, position) in &account.positions {
@@ -175,7 +196,11 @@ impl PortfolioMarginEngine {
         let mut maintenance: u128 = 0;
         let mut initial: u128 = 0;
         for mark_set in marks.values() {
-            if let Some(m) = self.scan_underlying(account, instruments, mark_set) {
+            let exposure = spot_exposures
+                .get(&mark_set.base_symbol)
+                .copied()
+                .unwrap_or(0.0);
+            if let Some(m) = self.scan_underlying_ex(account, instruments, mark_set, exposure) {
                 maintenance = maintenance.saturating_add(m.maintenance_quote_minor);
                 initial = initial.saturating_add(m.initial_quote_minor);
             }
@@ -200,11 +225,29 @@ impl PortfolioMarginEngine {
         instruments: &BTreeMap<Symbol, Instrument>,
         mark_set: &MarkSet,
     ) -> Option<UnderlyingMargin> {
+        self.scan_underlying_ex(account, instruments, mark_set, 0.0)
+    }
+
+    /// [] with an extra signed spot exposure (G-20):
+    /// oracle-priced collateral in this underlying, in base units. It
+    /// becomes a linear perp-equivalent leg in every scenario.
+    pub fn scan_underlying_ex(
+        &self,
+        account: &MarginAccount,
+        instruments: &BTreeMap<Symbol, Instrument>,
+        mark_set: &MarkSet,
+        spot_exposure_base: f64,
+    ) -> Option<UnderlyingMargin> {
         let params = self.params_for(&mark_set.base_symbol);
         let spot = mark_set.spot_quote_minor_per_base as f64;
 
         // Flatten positions into analytics legs.
         let mut legs: Vec<Leg> = Vec::new();
+        if spot_exposure_base != 0.0 {
+            legs.push(Leg::Perp {
+                signed_base: spot_exposure_base,
+            });
+        }
         for (symbol, position) in &account.positions {
             if position.signed_lots == 0 {
                 continue;
@@ -419,6 +462,84 @@ mod tests {
         m.insert(p, pi);
         m.insert(o, oi);
         m
+    }
+
+    #[test]
+    fn spot_collateral_nets_short_call_risk_inside_the_grid() {
+        // G-20: a short call hedged with held BTC must scan cheaper than
+        // the same naked short — the collateral's scenario gain nets the
+        // option's delta loss leg by leg. The scan range is widened past
+        // the SOMC so the scenario component dominates the floor and the
+        // hedge is observable in maintenance.
+        let mut engine = PortfolioMarginEngine::new();
+        engine.set_params(
+            "BTC",
+            UnderlyingMarginParams {
+                scan_range_bps: 1_000, // 10% — scenario dominates SOMC
+                ..UnderlyingMarginParams::default()
+            },
+        );
+
+        let mut naked = MarginAccount::new(1, 10_000_000);
+        *naked.position_mut("BTC-80000-C") = Position {
+            symbol: "BTC-80000-C".into(),
+            signed_lots: -1, // short 1 lot (0.01 base)
+            avg_entry_quote_minor: 2_000_000,
+            realized_pnl_quote_minor: 0,
+        };
+        let hedged = naked.clone();
+        let mut marks = marks_btc(8_000_000, 0.55, 0.25);
+        // A realistic ATM premium (BS at 55% vol, 0.25y): the
+        // placeholder in  is for equity math only.
+        if let Some(set) = marks.get_mut("BTC") {
+            set.marks.insert(
+                "BTC-80000-C".into(),
+                Mark::Option {
+                    premium_quote_minor_per_base: 880_000,
+                    iv: 0.55,
+                    tau_years: 0.25,
+                },
+            );
+        }
+
+        let naked_summary = engine
+            .margin_summary(&naked, &instruments(), &marks)
+            .unwrap();
+
+        // Delta hedge: 0.005 BTC held as collateral (long spot against
+        // the short call's +0.5 delta).
+        let mut exposures = BTreeMap::new();
+        exposures.insert("BTC".to_string(), 0.005_f64);
+        let hedged_summary = engine
+            .margin_summary_ex(&hedged, &instruments(), &marks, &exposures)
+            .unwrap();
+
+        assert!(
+            hedged_summary.maintenance_quote_minor < naked_summary.maintenance_quote_minor,
+            "hedged scan {} must beat naked scan {}",
+            hedged_summary.maintenance_quote_minor,
+            naked_summary.maintenance_quote_minor
+        );
+
+        // The same exposure on a long perp INCREASES risk (same-side
+        // stacking, no free lunch): sanity that the leg is not inverted.
+        let mut long_perp = MarginAccount::new(2, 10_000_000);
+        *long_perp.position_mut("BTC-PERP") = Position {
+            symbol: "BTC-PERP".into(),
+            signed_lots: 1,
+            avg_entry_quote_minor: 8_000_000,
+            realized_pnl_quote_minor: 0,
+        };
+        let base = engine
+            .margin_summary(&long_perp, &instruments(), &marks)
+            .unwrap();
+        let stacked = engine
+            .margin_summary_ex(&long_perp, &instruments(), &marks, &exposures)
+            .unwrap();
+        assert!(
+            stacked.maintenance_quote_minor > base.maintenance_quote_minor,
+            "same-side exposure must increase the requirement"
+        );
     }
 
     #[test]

@@ -89,11 +89,30 @@ pub struct EngineConfig {
     /// Iterative ADL (G-19): max rounds per liquidation sweep and the
     /// fraction of each counterparty's position one round may close
     /// (bps). 0 rounds = legacy single-shot ADL.
+    /// Iterative ADL (G-19): max rounds per liquidation sweep.
     pub adl_max_rounds: u32,
+    /// Iterative ADL (G-19): fraction of each counterparty's position
+    /// one round may close, bps.
     pub adl_round_bps: u64,
     /// Portfolio greeks limits (G-41): vega/gamma caps enforced
     /// pre-trade on option orders. Default: disabled.
     pub greeks_limits: poc_risk::GreeksLimits,
+    /// Volatility-index publication (G-05): moneyness weighting band in
+    /// bps of spot (options within the band weight the index).
+    pub vol_index_band_bps: u64,
+    /// Collateral interest (G-18): per-currency daily rate on the
+    /// *utilized* portion of haircut collateral, bps per day.
+    pub collateral_interest_bps_per_day: BTreeMap<String, u64>,
+    /// LP vault epoch interval (G-16), ms. 0 disables epoch settlement.
+    pub vault_epoch_interval_ms: u64,
+    /// Insurance rebalancing (G-23): max lots dripped back into the book
+    /// per sweep, and the minimum edge over the inventory's mark before a
+    /// drip is worth the market impact (bps).
+    /// Insurance rebalancing (G-23): max lots per drip.
+    pub insurance_rebalance_max_lots: u64,
+    /// Insurance rebalancing (G-23): minimum bid edge over the carrying
+    /// mark before a drip is worth the market impact, bps.
+    pub insurance_rebalance_edge_bps: u64,
 }
 
 /// Circuit-breaker parameters (G-21).
@@ -148,6 +167,11 @@ impl Default for EngineConfig {
             adl_max_rounds: 4,
             adl_round_bps: 5_000, // 50% of each counterparty per round
             greeks_limits: poc_risk::GreeksLimits::default(),
+            vol_index_band_bps: 1_000,
+            collateral_interest_bps_per_day: BTreeMap::new(),
+            vault_epoch_interval_ms: 24 * 60 * 60 * 1000,
+            insurance_rebalance_max_lots: 10,
+            insurance_rebalance_edge_bps: 50,
         }
     }
 }
@@ -226,6 +250,8 @@ pub struct Engine {
     /// Cascade-velocity breaker: liquidation sweeps suspended until.
     pub(crate) cascade_suspended_until: TimestampMs,
     /// Liquidation closures inside the velocity window: (ts, lots).
+    /// Read by the velocity breaker and by
+    /// (published coverage telemetry, G-21/G-23).
     pub(crate) liq_window: std::collections::VecDeque<(TimestampMs, u64)>,
     /// Open auctions per symbol: uncross deadline (G-12). Presence = the
     /// book accumulates without matching.
@@ -233,6 +259,26 @@ pub struct Engine {
     /// Non-quote collateral balances per subaccount (G-17):
     /// currency code → minor units.
     pub(crate) collateral: BTreeMap<SubaccountId, BTreeMap<String, u128>>,
+    /// OCO groups (G-08): group id → the two sibling order ids.
+    pub(crate) oco_groups: BTreeMap<u64, (OrderId, OrderId)>,
+    /// Next OCO group id.
+    pub(crate) next_oco_id: u64,
+    /// TWAP parents (G-10): parent id → slicer state.
+    pub(crate) twap_parents: BTreeMap<u64, crate::event::TwapParent>,
+    /// Next TWAP parent id.
+    pub(crate) next_twap_id: u64,
+    /// Last published 30-day volatility index per underlying (G-05),
+    /// permille (index x 1000).
+    pub(crate) vol_index_permille: BTreeMap<String, u64>,
+    /// Day index of the last collateral-interest accrual (G-18).
+    pub(crate) last_collateral_interest_day: u64,
+    /// Insurance fund position inventory (G-23): symbol →
+    /// (signed lots, last mark quote minor per base).
+    pub(crate) insurance_inventory: BTreeMap<Symbol, (i64, u128)>,
+    /// LP underwriter vaults (G-16).
+    pub(crate) vaults: BTreeMap<u64, poc_economics::LpVault>,
+    /// Next vault id.
+    pub(crate) next_vault_id: u64,
 
     // statistics
     pub(crate) trades: u64,
@@ -300,6 +346,15 @@ impl Engine {
             liq_window: std::collections::VecDeque::new(),
             auctions: BTreeMap::new(),
             collateral: BTreeMap::new(),
+            oco_groups: BTreeMap::new(),
+            next_oco_id: 1,
+            twap_parents: BTreeMap::new(),
+            next_twap_id: 1,
+            vol_index_permille: BTreeMap::new(),
+            last_collateral_interest_day: 0,
+            insurance_inventory: BTreeMap::new(),
+            vaults: BTreeMap::new(),
+            next_vault_id: 1,
             trades: 0,
             lots_traded: 0,
             notional_traded: 0,
@@ -352,6 +407,39 @@ impl Engine {
         self.accounts.iter()
     }
 
+    /// The insurance fund's carried position inventory (G-23):
+    /// symbol -> (signed lots, carrying mark quote minor per base).
+    #[must_use]
+    pub fn insurance_inventory(&self) -> &BTreeMap<Symbol, (i64, u128)> {
+        &self.insurance_inventory
+    }
+
+    /// The LP underwriter vaults (G-16), by id.
+    #[must_use]
+    pub fn vaults(&self) -> &BTreeMap<u64, poc_economics::LpVault> {
+        &self.vaults
+    }
+
+    /// Liquidation closures counted inside the cascade-velocity window
+    /// (G-21) — coverage telemetry for the stress dashboards.
+    #[must_use]
+    pub fn cascade_closures_in_window(&self, now: TimestampMs) -> u64 {
+        let window = self.config.breaker.velocity_window_ms;
+        self.liq_window
+            .iter()
+            .filter(|(ts, _)| now.saturating_sub(*ts) <= window)
+            .map(|(_, lots)| *lots)
+            .sum::<u64>()
+            .saturating_add(0)
+    }
+
+    /// The most recently published volatility index per underlying
+    /// (G-05), permille (index x 1000).
+    #[must_use]
+    pub fn vol_index(&self, base: &str) -> Option<u64> {
+        self.vol_index_permille.get(base).copied()
+    }
+
     /// The venue's internal pools (settlement-layer conservation inputs):
     /// `(insurance balance, reward pool available, cumulative fee revenue
     /// routed to the house, buyback pool balance)`, quote minor.
@@ -384,8 +472,65 @@ impl Engine {
 
     /// Process one command; returns the events it produced (also appended
     /// to the journal).
+    ///
+    /// Batches, OCO pairs, and ticks run in *sequential-commit* mode:
+    /// each member is planned and applied before the next is planned, so
+    /// order ids advance and later members see earlier fills (G-08/G-09
+    /// fix for the shared-id collision and phantom double-fills). The
+    /// pre-pass gates in the batch/OCO planners keep the command atomic
+    /// on validity and margin.
     pub fn process(&mut self, cmd: Command) -> Vec<Event> {
-        let events = self.plan(&cmd);
+        match cmd {
+            Command::PlaceBatch { requests, now } => {
+                if let Some(rejection) = self.batch_gate(&requests, now) {
+                    return self.commit(rejection);
+                }
+                let mut events = Vec::new();
+                for request in requests {
+                    events.extend(self.process(Command::Place { request, now }));
+                }
+                events
+            }
+            Command::PlaceOco { first, second, now } => self.process_place_oco(first, second, now),
+            Command::PlaceTwap {
+                subaccount,
+                symbol,
+                side,
+                total_lots,
+                slices,
+                slice_interval_ms,
+                limit_ticks,
+                now,
+            } => self.process_place_twap(
+                subaccount,
+                symbol,
+                side,
+                total_lots,
+                slices,
+                slice_interval_ms,
+                limit_ticks,
+                now,
+            ),
+            Command::CancelTwap {
+                subaccount,
+                parent_id,
+                now,
+            } => self.process_cancel_twap(subaccount, parent_id, now),
+            Command::Tick { now } => self.process_tick(now),
+            cmd => self.process_one(cmd),
+        }
+    }
+
+    /// Plan, cascade OCO siblings, apply, journal — the default path.
+    fn process_one(&mut self, cmd: Command) -> Vec<Event> {
+        let mut events = self.plan(&cmd);
+        let siblings = self.plan_oco_siblings(&events);
+        events.extend(siblings);
+        self.commit(events)
+    }
+
+    /// Apply a planned event batch and journal it.
+    pub(crate) fn commit(&mut self, events: Vec<Event>) -> Vec<Event> {
         for event in &events {
             self.apply_event(event);
         }
@@ -393,7 +538,7 @@ impl Engine {
         events
     }
 
-    fn plan(&self, cmd: &Command) -> Vec<Event> {
+    pub(crate) fn plan(&self, cmd: &Command) -> Vec<Event> {
         match cmd {
             Command::Deposit {
                 subaccount,
@@ -432,6 +577,11 @@ impl Engine {
                 }]
             }
             Command::Tick { now } => crate::sweep::plan_tick(self, *now),
+            // Intercepted in `process` (sequential commit); unreachable here.
+            Command::PlaceBatch { .. } => Vec::new(),
+            Command::PlaceOco { .. } | Command::PlaceTwap { .. } | Command::CancelTwap { .. } => {
+                Vec::new()
+            }
             Command::RfqCreate {
                 taker,
                 legs,
@@ -522,7 +672,6 @@ impl Engine {
                 });
                 events
             }
-            Command::PlaceBatch { requests, now } => self.plan_place_batch(requests, *now),
             Command::CancelBatch {
                 subaccount,
                 order_ids,
@@ -575,6 +724,9 @@ impl Engine {
                 from_amount_minor,
                 now,
             } => self.plan_collateral_convert(*subaccount, from, to, *from_amount_minor, *now),
+            Command::VaultCreate { .. }
+            | Command::VaultSubscribe { .. }
+            | Command::VaultRedeem { .. } => self.plan_vault_command(cmd, self.now),
         }
     }
 
@@ -903,6 +1055,7 @@ impl Engine {
             stp: request.stp,
             display_lots: request.display_lots,
             trailing_extreme_quote_minor: None,
+            oco_group: request.oco_group,
             client_ts: request.client_ts,
             engine_ts: now,
         };
@@ -975,6 +1128,7 @@ impl Engine {
             collateral_equity_quote_minor: to_i128(
                 self.collateral_value_of(request.subaccount, now),
             ),
+            collateral_spot_exposures: self.collateral_spot_exposures_of(request.subaccount),
         };
         if let Err(reason) = poc_risk::check_order(&risk_ctx) {
             return rejection(reason);
@@ -1050,44 +1204,54 @@ impl Engine {
                 .unwrap_or(0);
             let taker_tier = self.fee_schedule.tier_for(fill.taker_subaccount);
             let maker_tier = self.fee_schedule.tier_for(fill.maker_subaccount);
-            let (taker_fee, maker_fee) = match instrument {
-                Instrument::Option(_) => {
-                    // Options: the notional above IS the premium value of
-                    // the fill; the fee is min(rate x underlying notional,
-                    // cap% x premium) — F-2, the Deribit/Derive rule.
-                    let caps = &self.config.option_fee_caps;
-                    let underlying_notional = self
-                        .build_marks(now)
-                        .as_ref()
-                        .and_then(|ms| ms.get(instrument.base_symbol()))
-                        .and_then(|set| {
-                            instrument.position_notional_minor(
-                                set.spot_quote_minor_per_base,
-                                i64::try_from(fill.qty_lots).unwrap_or(i64::MAX),
+            // The insurance fund's inventory drips pay no taker fee: the
+            // synthetic subaccount has no balance to charge, and routing a
+            // fee nobody paid into the pools would mint quote. The venue
+            // does not tax its own backstop for unwinding what it
+            // absorbed (G-23).
+            let fee_exempt = fill.taker_subaccount == crate::sweep::INSURANCE_SUBACCOUNT;
+            let (taker_fee, maker_fee) = if fee_exempt {
+                (0, 0)
+            } else {
+                match instrument {
+                    Instrument::Option(_) => {
+                        // Options: the notional above IS the premium value of
+                        // the fill; the fee is min(rate x underlying notional,
+                        // cap% x premium) — F-2, the Deribit/Derive rule.
+                        let caps = &self.config.option_fee_caps;
+                        let underlying_notional = self
+                            .build_marks(now)
+                            .as_ref()
+                            .and_then(|ms| ms.get(instrument.base_symbol()))
+                            .and_then(|set| {
+                                instrument.position_notional_minor(
+                                    set.spot_quote_minor_per_base,
+                                    i64::try_from(fill.qty_lots).unwrap_or(i64::MAX),
+                                )
+                            })
+                            .unwrap_or(0);
+                        (
+                            FeeCalculator::option_taker_fee(
+                                taker_tier,
+                                caps,
+                                underlying_notional,
+                                notional,
                             )
-                        })
-                        .unwrap_or(0);
-                    (
-                        FeeCalculator::option_taker_fee(
-                            taker_tier,
-                            caps,
-                            underlying_notional,
-                            notional,
+                            .unwrap_or(0),
+                            FeeCalculator::option_maker_fee(
+                                maker_tier,
+                                caps,
+                                underlying_notional,
+                                notional,
+                            )
+                            .unwrap_or(0),
                         )
-                        .unwrap_or(0),
-                        FeeCalculator::option_maker_fee(
-                            maker_tier,
-                            caps,
-                            underlying_notional,
-                            notional,
-                        )
-                        .unwrap_or(0),
-                    )
+                    }
+                    _ => (
+                        FeeCalculator::taker_fee(taker_tier, notional).unwrap_or(0),
+                        FeeCalculator::maker_fee(maker_tier, notional).unwrap_or(0),
+                    ),
                 }
-                _ => (
-                    FeeCalculator::taker_fee(taker_tier, notional).unwrap_or(0),
-                    FeeCalculator::maker_fee(maker_tier, notional).unwrap_or(0),
-                ),
             };
             events.push(Event::TradeExecuted(Box::new(Trade {
                 seq: self.seq + trades_in_batch - 1,
@@ -1434,9 +1598,14 @@ impl Engine {
                 subaccount,
                 symbol,
                 reason,
-                ..
+                order,
             } => {
                 self.stop_orders.remove(order_id);
+                // OCO bookkeeping: a closed member releases its group.
+                if order.oco_group.is_some() {
+                    self.oco_groups
+                        .retain(|_, (a, b)| *a != *order_id && *b != *order_id);
+                }
                 if *reason != OrderCloseReason::Filled
                     && self
                         .books
@@ -1456,6 +1625,10 @@ impl Engine {
             }
             Event::OrderRejection(rejection) => {
                 self.next_order_id = self.next_order_id.max(rejection.order_id + 1);
+                // An OCO leg rejected at the gate releases its group.
+                if let Some(group) = rejection.request.oco_group {
+                    self.oco_groups.remove(&group);
+                }
             }
             Event::TradeExecuted(trade) => self.apply_trade(trade),
             Event::StpCancels { maker_ids, .. } => {
@@ -1929,7 +2102,141 @@ impl Engine {
                     );
                 }
             }
+            Event::OcoLinked {
+                group,
+                first,
+                second,
+                ..
+            } => {
+                self.oco_groups.insert(*group, (*first, *second));
+                self.next_oco_id = self.next_oco_id.max(group + 1);
+            }
+            Event::TwapOpened(parent) => {
+                self.next_twap_id = self.next_twap_id.max(parent.parent_id + 1);
+                self.twap_parents.insert(parent.parent_id, *parent.clone());
+            }
+            Event::TwapSliced {
+                parent_id,
+                request,
+                slice_index,
+                ..
+            } => {
+                if let Some(parent) = self.twap_parents.get_mut(parent_id) {
+                    parent.slices_placed = parent.slices_placed.max(slice_index + 1);
+                    parent.lots_placed = parent.lots_placed.saturating_add(request.qty_lots);
+                    parent.next_slice_ts = parent
+                        .next_slice_ts
+                        .saturating_add(parent.slice_interval_ms);
+                }
+            }
+            Event::TwapClosed { parent_id, .. } => {
+                self.twap_parents.remove(parent_id);
+            }
+            Event::VolIndexPublished {
+                base_symbol,
+                index_permille,
+                ..
+            } => {
+                self.vol_index_permille
+                    .insert(base_symbol.clone(), *index_permille);
+            }
+            Event::CollateralInterestAccrued {
+                subaccount,
+                currency,
+                amount_minor,
+                quote_value_minor,
+                ..
+            } => {
+                if *amount_minor > 0 {
+                    if let Some(balances) = self.collateral.get_mut(subaccount) {
+                        if let Some(balance) = balances.get_mut(currency) {
+                            *balance = balance.saturating_sub(*amount_minor);
+                        }
+                    }
+                    // Interest income routes like fee income: house,
+                    // insurance, buyback.
+                    if let Some(allocation) = self.revenue_router.route(*quote_value_minor) {
+                        self.apply_revenue(allocation);
+                    }
+                }
+            }
+            Event::InsuranceMarked {
+                symbol,
+                signed_lots,
+                mark_quote_minor,
+                pnl_quote_minor,
+                ..
+            } => {
+                if let Some((lots, last_mark)) = self.insurance_inventory.get_mut(symbol) {
+                    let _ = lots;
+                    *last_mark = *mark_quote_minor;
+                }
+                if *pnl_quote_minor != 0 {
+                    self.insurance.apply_mark_pnl(*pnl_quote_minor, self.now);
+                }
+                let _ = signed_lots;
+            }
+            Event::InsuranceRebalanced {
+                symbol,
+                lots,
+                proceeds_quote_minor,
+                ..
+            } => {
+                if let Some((signed, _)) = self.insurance_inventory.get_mut(symbol) {
+                    // Rebalancing only ever sells long inventory back:
+                    // reduce the carried lots, floor at zero.
+                    *signed = (*signed - i64::try_from(*lots).unwrap_or(0)).max(0);
+                }
+                if *proceeds_quote_minor > 0 {
+                    self.insurance
+                        .credit_penalty(*proceeds_quote_minor, self.now);
+                }
+            }
+            Event::VaultEpochSettled(epoch) => {
+                self.apply_vault_epoch(epoch);
+            }
+            Event::VaultOpened {
+                vault_id,
+                revenue_share_bps,
+                ..
+            } => {
+                self.next_vault_id = self.next_vault_id.max(vault_id + 1);
+                self.vaults.insert(
+                    *vault_id,
+                    poc_economics::LpVault::new(*vault_id, *revenue_share_bps),
+                );
+            }
+            Event::VaultQueued {
+                vault_id,
+                subaccount,
+                is_subscribe,
+                amount,
+                ..
+            } => {
+                if let Some(vault) = self.vaults.get_mut(vault_id) {
+                    if *is_subscribe {
+                        vault.subscribe(*subaccount, *amount);
+                    } else {
+                        vault.redeem(*subaccount, *amount);
+                    }
+                }
+            }
         }
+    }
+
+    /// Route an interest charge's quote value through the revenue router
+    /// and apply the allocations.
+    fn apply_revenue(&mut self, allocation: poc_economics::Allocation) {
+        if allocation.insurance > 0 {
+            self.insurance
+                .credit_penalty(allocation.insurance, self.now);
+        }
+        self.buyback_pool_quote_minor = self
+            .buyback_pool_quote_minor
+            .saturating_add(allocation.buyback);
+        // The house share stays outside engine balances (the venue's
+        // own account ledger is out of scope for the reference engine).
+        let _ = allocation.house;
     }
 
     /// Apply one leg of an RFQ settlement (no book interaction).
@@ -2207,6 +2514,22 @@ impl Engine {
         if exec.to_insurance && exec.penalty_quote_minor > 0 {
             self.insurance
                 .credit_penalty(exec.penalty_quote_minor, self.now);
+        }
+        // G-23: as buyer of last resort the fund *carries* the position.
+        // Book it into inventory at the execution price; the sweep marks
+        // it and drips it back when the book pays an edge.
+        if exec.to_insurance {
+            let signed = if exec.closing_side_is_ask {
+                i64::try_from(exec.lots).unwrap_or(i64::MAX)
+            } else {
+                -i64::try_from(exec.lots).unwrap_or(i64::MAX)
+            };
+            let entry = self
+                .insurance_inventory
+                .entry(exec.symbol.clone())
+                .or_insert((0, exec.price_quote_minor));
+            entry.0 = entry.0.saturating_add(signed);
+            entry.1 = exec.price_quote_minor;
         }
         if exec.absorbed_quote_minor > 0 {
             if let Some(account) = self.accounts.get_mut(&exec.subaccount) {
@@ -2864,6 +3187,16 @@ fn event_ts(event: &Event) -> TimestampMs {
         Event::CollateralRejected { ts, .. } => *ts,
         Event::CollateralConversion(c) => c.ts,
         Event::PositionMigrated { ts, .. } => *ts,
+        Event::OcoLinked { ts, .. } => *ts,
+        Event::TwapOpened(p) => p.opened_ts,
+        Event::TwapSliced { ts, .. } => *ts,
+        Event::TwapClosed { ts, .. } => *ts,
+        Event::VolIndexPublished { ts, .. } => *ts,
+        Event::CollateralInterestAccrued { ts, .. } => *ts,
+        Event::InsuranceMarked { ts, .. } => *ts,
+        Event::InsuranceRebalanced { ts, .. } => *ts,
+        Event::VaultEpochSettled(v) => v.ts,
+        Event::VaultOpened { ts, .. } | Event::VaultQueued { ts, .. } => *ts,
         Event::RfqClosed { .. }
         | Event::BlockRegistered { .. }
         | Event::BlockPrinted { .. }

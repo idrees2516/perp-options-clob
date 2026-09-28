@@ -374,3 +374,314 @@ fn oracle_genuine_jumps_always_accepted() {
         }
     }
 }
+
+// ----------------------------------------------------------------------
+// Second closure wave: OCO, TWAP, batch, and vault properties
+// ----------------------------------------------------------------------
+
+/// Tracked total with the insurance fund's inventory entry value
+/// included (G-23): the fund's carried positions enter the conserved
+/// quantity at their carrying mark, exactly like account positions at
+/// their entries.
+fn tracked_total_with_inventory(e: &Engine) -> i128 {
+    let base = tracked_total(e);
+    let vault_collateral: i128 = e
+        .vaults()
+        .values()
+        .map(|v| poc_core::to_i128(v.collateral_quote_minor))
+        .fold(0_i128, |acc, x| acc.saturating_add(x));
+    let mut inventory_term: i128 = 0;
+    for (lots, mark) in e.insurance_inventory().values() {
+        let per_lot =
+            poc_core::mul_div(*mark, 100, 100_000, poc_core::Rounding::Floor).unwrap_or(0);
+        inventory_term = inventory_term.saturating_add(*lots as i128 * poc_core::to_i128(per_lot));
+    }
+    base.saturating_add(inventory_term)
+        .saturating_add(vault_collateral)
+}
+
+/// The second-wave command generator: everything the first mix had plus
+/// OCO brackets, TWAP parents, atomic batches, and vault flows.
+fn random_command_v2(rng: &mut Rng, now: u64, tick: u64, step: u64) -> Command {
+    let sub = 1 + rng.below(SUBS);
+    match rng.below(20) {
+        0..=5 => Command::Place {
+            request: OrderRequest::limit(
+                sub,
+                "BTC-PERP",
+                if rng.below(2) == 0 {
+                    Side::Bid
+                } else {
+                    Side::Ask
+                },
+                PRICES[rng.below(PRICES.len() as u64) as usize],
+                1 + rng.below(5),
+            ),
+            now,
+        },
+        6 => Command::PlaceOco {
+            first: OrderRequest::limit(
+                sub,
+                "BTC-PERP",
+                if rng.below(2) == 0 {
+                    Side::Bid
+                } else {
+                    Side::Ask
+                },
+                PRICES[rng.below(PRICES.len() as u64) as usize],
+                1 + rng.below(3),
+            ),
+            second: OrderRequest {
+                order_type: poc_core::OrderType::StopMarket {
+                    trigger_price: PRICES[rng.below(PRICES.len() as u64) as usize],
+                },
+                ..OrderRequest::limit(
+                    sub,
+                    "BTC-PERP",
+                    if rng.below(2) == 0 {
+                        Side::Bid
+                    } else {
+                        Side::Ask
+                    },
+                    PRICES[rng.below(PRICES.len() as u64) as usize],
+                    1 + rng.below(3),
+                )
+            },
+            now,
+        },
+        7 => Command::PlaceTwap {
+            subaccount: sub,
+            symbol: "BTC-PERP".into(),
+            side: if rng.below(2) == 0 {
+                Side::Bid
+            } else {
+                Side::Ask
+            },
+            total_lots: 2 + rng.below(6),
+            slices: 1 + rng.below(3),
+            slice_interval_ms: 1_000,
+            limit_ticks: Some(PRICES[rng.below(PRICES.len() as u64) as usize]),
+            now,
+        },
+        8 => Command::CancelTwap {
+            subaccount: sub,
+            parent_id: 1 + rng.below(4),
+            now,
+        },
+        9 => Command::PlaceBatch {
+            requests: (0..1 + rng.below(3))
+                .map(|_| {
+                    OrderRequest::limit(
+                        sub,
+                        "BTC-PERP",
+                        if rng.below(2) == 0 {
+                            Side::Bid
+                        } else {
+                            Side::Ask
+                        },
+                        PRICES[rng.below(PRICES.len() as u64) as usize],
+                        1 + rng.below(3),
+                    )
+                })
+                .collect(),
+            now,
+        },
+        10 => Command::VaultSubscribe {
+            vault_id: 1,
+            subaccount: sub,
+            amount_quote_minor: u128::from(rng.below(100_000)),
+            now,
+        },
+        11 => Command::VaultRedeem {
+            vault_id: 1,
+            subaccount: sub,
+            shares: u128::from(rng.below(100_000)),
+            now,
+        },
+        12 => Command::Cancel {
+            subaccount: sub,
+            order_id: 1 + rng.below(60),
+            now,
+        },
+        13 => Command::Tick { now: tick },
+        14 => Command::Withdraw {
+            subaccount: sub,
+            amount_quote_minor: u128::from(rng.below(1_000_000)),
+        },
+        15 | 16 => Command::OracleUpdate {
+            base_symbol: "BTC".into(),
+            provider: "pyth".into(),
+            ts: now,
+            price_quote_minor: 7_800_000 + u128::from(rng.below(400_000)),
+        },
+        17 => Command::OracleUpdate {
+            base_symbol: "BTC".into(),
+            provider: "chainlink".into(),
+            ts: now,
+            price_quote_minor: 7_800_000 + u128::from(rng.below(400_000)),
+        },
+        18 => Command::Transfer {
+            from: sub,
+            to: 1 + rng.below(SUBS),
+            amount_quote_minor: u128::from(rng.below(10_000)),
+            now,
+        },
+        _ => Command::CancelAll {
+            subaccount: sub,
+            symbol: None,
+            now,
+        },
+    }
+    .tap_unused(step)
+}
+
+/// Keep `step` referenced (generator API stability).
+trait TapUnused {
+    fn tap_unused(self, _: u64) -> Self;
+}
+impl TapUnused for Command {
+    fn tap_unused(self, _: u64) -> Self {
+        self
+    }
+}
+
+#[test]
+fn second_wave_commands_hold_invariants() {
+    for seed in 1..=10_u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x85EB_CA6B));
+        let cfg = EngineConfig {
+            vault_epoch_interval_ms: 5_000,
+            ..EngineConfig::default()
+        };
+        let mut live = Engine::new(cfg.clone());
+        live.register_instrument(Instrument::Perp(PerpMarket::default()));
+        for provider in ["pyth", "chainlink"] {
+            live.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: provider.into(),
+                ts: T0,
+                price_quote_minor: 8_000_000,
+            });
+        }
+        live.process(Command::Tick { now: T0 });
+        for sub in 1..=SUBS {
+            live.process(Command::Deposit {
+                subaccount: sub,
+                amount_quote_minor: 80_000_000,
+            });
+        }
+        live.process(Command::VaultCreate {
+            revenue_share_bps: 1_000,
+            now: T0,
+        });
+
+        let mut shadow = Engine::replay(cfg, live.journal());
+        shadow.register_instrument(Instrument::Perp(PerpMarket::default()));
+
+        // OCO bookkeeping (I-21): group -> both member ids.
+        let mut oco_members: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        // TWAP bookkeeping (I-22): parent -> (total, placed so far).
+        let mut twap: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        // Vault flow conservation (I-23).
+        let mut vault_flow_check = true;
+
+        let baseline = tracked_total_with_inventory(&live);
+        let mut custody: i128 = 0;
+        let mut lots_traded: i128 = 0;
+
+        for step in 0..160_u64 {
+            let now = T0 + step * 1_000;
+            let cmd = random_command_v2(&mut rng, now, now, step);
+            let evs = live.process(cmd.clone());
+            for ev in &evs {
+                match ev {
+                    Event::Withdrawal {
+                        amount_quote_minor, ..
+                    } => {
+                        custody = custody.saturating_sub(poc_core::to_i128(*amount_quote_minor));
+                    }
+                    Event::Deposit {
+                        amount_quote_minor, ..
+                    } => {
+                        custody = custody.saturating_add(poc_core::to_i128(*amount_quote_minor));
+                    }
+                    Event::Reward(paid) => {
+                        custody =
+                            custody.saturating_add(poc_core::to_i128(paid.amount_quote_minor));
+                    }
+                    Event::TradeExecuted(t) => {
+                        lots_traded = lots_traded.saturating_add(i128::from(t.qty_lots));
+                    }
+                    Event::OcoLinked {
+                        group,
+                        first,
+                        second,
+                        ..
+                    } => {
+                        oco_members.insert(*group, (*first, *second));
+                    }
+                    Event::TwapOpened(parent) => {
+                        twap.insert(parent.parent_id, (parent.total_lots, 0));
+                    }
+                    Event::TwapSliced {
+                        parent_id, request, ..
+                    } => {
+                        if let Some(entry) = twap.get_mut(parent_id) {
+                            entry.1 = entry.1.saturating_add(request.qty_lots);
+                        }
+                    }
+                    Event::VaultEpochSettled(epoch) => {
+                        // I-23: flows are subscriptions negative,
+                        // redemptions positive — their sum must equal
+                        // redeemed minus subscribed exactly.
+                        let net: i128 = epoch.flows.iter().map(|(_, f)| *f).sum::<i128>();
+                        let expected = poc_core::to_i128(epoch.redeemed_quote_minor)
+                            - poc_core::to_i128(epoch.subscribed_quote_minor);
+                        if net != expected {
+                            vault_flow_check = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            shadow.process(cmd);
+
+            // I-5 (with inventory): conservation up to rounding dust.
+            let total = tracked_total_with_inventory(&live);
+            let delta = (total - (baseline + custody)).abs();
+            assert!(
+                delta <= 10 * lots_traded + 64,
+                "seed {seed} step {step}: conservation broke by {delta}"
+            );
+
+            // I-21: at most one OCO member open per group.
+            let open_ids: Vec<u64> = live
+                .accounts_iter()
+                .flat_map(|(_, a)| a.open_orders.keys().copied())
+                .collect();
+            for (group, (a, b)) in &oco_members {
+                let both = open_ids.contains(a) && open_ids.contains(b);
+                if both {
+                    panic!("seed {seed} step {step}: OCO group {group} has both members open");
+                }
+            }
+
+            // I-22: TWAP never overslices.
+            for (parent, (total_lots, placed)) in &twap {
+                if *placed > *total_lots {
+                    panic!("seed {seed} step {step}: TWAP {parent} placed {placed} > {total_lots}");
+                }
+            }
+        }
+
+        assert!(vault_flow_check, "vault flows conserved");
+
+        // I-3: replay determinism across the new commands.
+        assert!(
+            engines_agree(&live, &shadow),
+            "seed {seed}: replay diverged with second-wave commands"
+        );
+        // Books sane end to end.
+        assert!(book_is_sane(&live));
+    }
+}

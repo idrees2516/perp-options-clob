@@ -151,6 +151,10 @@ pub struct OrderRiskContext<'a> {
     /// pre-trade gate sees the same balance sheet the liquidation engine
     /// enforces.
     pub collateral_equity_quote_minor: i128,
+    /// Oracle-priced collateral exposures per underlying, signed base
+    /// units (G-20): enter the scenario scan as linear spot legs so a
+    /// short call hedged with held collateral nets inside the grid.
+    pub collateral_spot_exposures: BTreeMap<String, f64>,
 }
 
 /// Run every pre-trade gate. Returns `Ok(())` or the first rejection.
@@ -249,7 +253,12 @@ pub fn check_order(ctx: &OrderRiskContext<'_>) -> Result<MarginSummary, Rejectio
 
     let mut summary = ctx
         .margin_engine
-        .margin_summary(&hypothetical, ctx.instruments, ctx.marks)
+        .margin_summary_ex(
+            &hypothetical,
+            ctx.instruments,
+            ctx.marks,
+            &ctx.collateral_spot_exposures,
+        )
         .ok_or(Rejection::MissingMark)?;
     summary.equity_quote_minor = summary
         .equity_quote_minor
@@ -379,6 +388,7 @@ mod tests {
             stp: SelfTradePrevention::CancelNewest,
             display_lots: None,
             trailing_extreme_quote_minor: None,
+            oco_group: None,
             client_ts: 0,
             engine_ts: 0,
         }
@@ -430,6 +440,7 @@ mod tests {
             halted: false,
             estimated_fee_quote_minor: 0,
             collateral_equity_quote_minor: 0,
+            collateral_spot_exposures: BTreeMap::new(),
         }
     }
 
@@ -488,7 +499,7 @@ mod tests {
 
         // Long 50: selling is allowed (reduces), buying is not.
         let mut pos = poc_margin::Position::flat("BTC-PERP");
-        pos.apply_fill(&perp_market(), Side::Bid, 50, 8_000_000);
+        let _ = pos.apply_fill(&perp_market(), Side::Bid, 50, 8_000_000);
         account.positions.insert("BTC-PERP".into(), pos);
         let o = order(1, 1, Side::Ask, Some(80_000), 10, true, false);
         let c = ctx(&f, &o, &account);
@@ -554,7 +565,7 @@ mod tests {
         // ≈ $2_100, so a further 100 lots must be rejected.
         let mut account = MarginAccount::new(1, 2_200);
         let mut pos = poc_margin::Position::flat("BTC-PERP");
-        pos.apply_fill(&perp_market(), Side::Bid, 500, 8_000_000);
+        let _ = pos.apply_fill(&perp_market(), Side::Bid, 500, 8_000_000);
         account.positions.insert("BTC-PERP".into(), pos);
         let o = order(1, 1, Side::Bid, Some(80_000), 100, false, false);
         let c = ctx(&f, &o, &account);

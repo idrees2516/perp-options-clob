@@ -162,3 +162,76 @@ anything instantly; executed proposals are immutable.
 Every withdrawal waits out the settlement delay; large ones require
 manual approval; pending ones are cancellable (refunding).
 *Tests:* withdrawal pipeline suite.
+
+## Execution algorithms (second closure wave)
+
+### I-21 An OCO group has at most one live member
+From the moment a bracket is linked (`OcoLinked`), the first member to
+reach *any* terminal state — filled completely, triggered, canceled,
+expired, or IOC remainder — cancels the other with the dedicated
+`OcoSibling` reason. The cascade is planned after every command batch as
+a pure function over (pre-apply state, planned events), so replay
+reproduces it exactly, and the group is released from the registry when
+either member closes.
+*Tests:* `oco_take_profit_fill_cancels_stop_loss`,
+`oco_stop_trigger_cancels_take_profit`,
+`second_wave_commands_hold_invariants` (fuzzed over random OCO mixes —
+asserts at most one member open per group after every command).
+
+### I-22 A TWAP parent never overslices
+The slicer's integer split guarantees `Σ slice_lots == total_lots`
+exactly (the first `total % slices` children carry one extra lot), each
+tick emits at most one child per parent, and the parent closes only
+after the last slice. Children are full order requests journaled inside
+`TwapSliced`, so replay never re-derives the arithmetic.
+*Tests:* `twap_slices_complete_and_sum_to_total`,
+`twap_cancel_stops_slicing`, and the fuzzed slice-bound check in
+`second_wave_commands_hold_invariants`.
+
+### I-23 Vault epoch flows conserve exactly
+At every epoch boundary, the per-subscriber signed flows inside
+`VaultEpochSettled` sum to `redeemed − subscribed` exactly; subscription
+shares are floored (dust never mints), redemptions are floored against
+NAV (the vault never overpays), and cash moves only at boundaries —
+never mid-epoch.
+*Tests:* `vault_epoch_subscribes_redeems_and_pays`, vault unit suite,
+fuzzed `second_wave_commands_hold_invariants` (flow-sum check per epoch
+plus the global conserved-quantity identity extended with vault
+collateral and insurance inventory).
+
+## Backstop & indexing
+
+### I-24 Insurance inventory is marked, and unwinds only into real liquidity
+Every position the fund absorbs as buyer of last resort is booked into
+`insurance_inventory` at the penalized execution price, marked to the
+current marks every sweep (PnL landing in the fund balance), and dripped
+back into the book only when a resting bid pays the configured edge over
+the carrying mark — crossing the book as a synthetic IOC taker whose
+fills are ordinary journaled trades (makers settle; nothing prints
+against phantom liquidity). The fund pays no taker fee on its own
+unwinds: routing a fee nobody paid into the pools would mint quote.
+*Tests:* `insurance_books_marks_and_rebalances_inventory`
+(booking, marking, and the drip), liquidation suite.
+
+### I-25 The volatility index is bounded by its inputs
+The published index (G-05) is an integer-arithmetic
+moneyness-weighted variance of the governed mark IVs inside the
+configured band — it can never exceed the max squared input IV and is
+computed without floating point in the publication path (integer
+`isqrt`), so it is byte-identical on every platform.
+*Tests:* `vol_index_publishes_near_the_mark_ivs` (band assertions),
+engine-level DVOL sanity in the demo run.
+
+## Batch atomicity (G-09 hardening)
+
+### I-26 A batch is atomic on validity, sequential in effect
+Every member of a `PlaceBatch`/`PlaceOco` is validated against the
+pre-command snapshot with a cumulative margin simulation; one failure
+rejects the whole command. After the gate passes, members commit
+sequentially: order ids advance and later members see earlier fills —
+no shared-id collisions, no phantom double-fills of the same maker. (The
+original single-pass planner violated both; the fuzz suite now pins
+distinct ids and maker-size-limited fills.)
+*Tests:* `batch_siblings_get_distinct_ids_and_see_each_other`,
+`batch_places_and_amend_reduces_in_place`, fuzzed batches in
+`second_wave_commands_hold_invariants`.

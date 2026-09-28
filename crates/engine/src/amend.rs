@@ -50,24 +50,30 @@ impl Engine {
         events
     }
 
-    /// Plan a batch placement: all-or-nothing validity + a cumulative
-    /// order-margin gate, then the per-order plans.
-    pub(crate) fn plan_place_batch(
+    /// The atomic pre-pass gate for batch placements and OCO pairs
+    /// (G-08/G-09): static validation of every request plus a
+    /// cumulative order-margin simulation per touched account.
+    /// `Some(rejection)` rejects the whole command atomically; `None`
+    /// means the caller may commit every member.
+    pub(crate) fn batch_gate(
         &self,
         requests: &[OrderRequest],
         now: TimestampMs,
-    ) -> Vec<Event> {
+    ) -> Option<Vec<Event>> {
+        let reject = |reason: &str| -> Option<Vec<Event>> {
+            Some(batch_rejection(requests, self.next_order_id, reason))
+        };
         // Static validation first — one bad request rejects the batch.
         for request in requests {
             let Some(instrument) = self.instruments.get(&request.symbol) else {
-                return batch_rejection(requests, self.next_order_id, "unknown instrument");
+                return reject("unknown instrument");
             };
             if let Err(why) = instrument.validate_qty(request.qty_lots) {
-                return batch_rejection(requests, self.next_order_id, &why.to_string());
+                return reject(&why.to_string());
             }
             if let Some(ticks) = request.price_ticks {
                 if instrument.price_quote_minor(ticks).is_none() {
-                    return batch_rejection(requests, self.next_order_id, "price off tick grid");
+                    return reject("price off tick grid");
                 }
             }
             if self
@@ -76,11 +82,7 @@ impl Engine {
                 .is_some_and(|b| b.auction_mode())
                 && !matches!(request.order_type, poc_core::OrderType::Limit)
             {
-                return batch_rejection(
-                    requests,
-                    self.next_order_id,
-                    "only limit orders rest in an auction",
-                );
+                return reject("only limit orders rest in an auction");
             }
         }
 
@@ -88,19 +90,17 @@ impl Engine {
         // of the batch's per-order reservations must still fit inside the
         // account's spendable cash after its existing reservations.
         let marks = self.build_marks(now);
-        let Some(marks) = marks else {
-            return batch_rejection(requests, self.next_order_id, "missing marks");
-        };
+        let marks = marks?;
         let mut reserved: BTreeMap<SubaccountId, u128> = BTreeMap::new();
         for request in requests {
             let Some(instrument) = self.instruments.get(&request.symbol) else {
                 continue;
             };
             let Some(account) = self.accounts.get(&request.subaccount) else {
-                continue;
+                return reject("unknown account");
             };
             let Some(mark) = self.instrument_mark(instrument, &marks) else {
-                return batch_rejection(requests, self.next_order_id, "missing mark");
+                return reject("missing mark");
             };
             let order = Order {
                 id: 0,
@@ -117,6 +117,7 @@ impl Engine {
                 stp: request.stp,
                 display_lots: request.display_lots,
                 trailing_extreme_quote_minor: None,
+                oco_group: request.oco_group,
                 client_ts: request.client_ts,
                 engine_ts: now,
             };
@@ -140,9 +141,10 @@ impl Engine {
                 collateral_equity_quote_minor: poc_core::to_i128(
                     self.collateral_value_of(request.subaccount, now),
                 ),
+                collateral_spot_exposures: self.collateral_spot_exposures_of(request.subaccount),
             };
             if let Err(reason) = poc_risk::check_order(&ctx) {
-                return batch_rejection(requests, self.next_order_id, &reason.to_string());
+                return reject(&reason.to_string());
             }
             let increment = poc_risk::order_margin_increment(&ctx);
             *reserved.entry(request.subaccount).or_insert(0) = reserved
@@ -158,22 +160,11 @@ impl Engine {
                     .cash_quote_minor
                     .saturating_sub(i128::try_from(existing).unwrap_or(i128::MAX));
                 if i128::try_from(*total_reserved).unwrap_or(i128::MAX) > headroom {
-                    return batch_rejection(
-                        requests,
-                        self.next_order_id,
-                        "batch exceeds order margin",
-                    );
+                    return reject("batch exceeds order margin");
                 }
             }
         }
-
-        // All gates passed: plan each order (each sees the pre-batch
-        // snapshot — the documented batch semantics).
-        let mut events = Vec::new();
-        for request in requests {
-            events.extend(self.plan_place(request, now));
-        }
-        events
+        None
     }
 
     /// Plan an amendment following the G-09 queue rules.
@@ -336,6 +327,7 @@ fn placeholder_request(subaccount: SubaccountId) -> OrderRequest {
         reduce_only: false,
         stp: poc_core::SelfTradePrevention::CancelNewest,
         display_lots: None,
+        oco_group: None,
         client_ts: 0,
     }
 }

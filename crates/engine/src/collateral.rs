@@ -416,12 +416,41 @@ impl Engine {
         marks: &BTreeMap<String, poc_margin::MarkSet>,
         now: TimestampMs,
     ) -> Option<poc_margin::MarginSummary> {
-        let mut summary = self
-            .margin_engine
-            .margin_summary(account, &self.instruments, marks)?;
+        let exposures = self.collateral_spot_exposures_of(account.id);
+        let mut summary =
+            self.margin_engine
+                .margin_summary_ex(account, &self.instruments, marks, &exposures)?;
         let value = self.collateral_value_of(account.id, now);
         summary.equity_quote_minor = summary.equity_quote_minor.saturating_add(to_i128(value));
         Some(summary)
+    }
+
+    /// Oracle-priced collateral exposures per underlying in signed base
+    /// units (G-20): the scanner treats each as a linear spot leg so
+    /// held collateral hedges short optionality inside the grid.
+    ///
+    /// Fixed-rate collateral (stablecoins) contributes nothing — its
+    /// value does not move with any underlying's spot.
+    #[must_use]
+    pub fn collateral_spot_exposures_of(&self, subaccount: SubaccountId) -> BTreeMap<String, f64> {
+        let mut out: BTreeMap<String, f64> = BTreeMap::new();
+        let Some(balances) = self.collateral.get(&subaccount) else {
+            return out;
+        };
+        for (code, balance) in balances {
+            if *balance == 0 {
+                continue;
+            }
+            let Some(cfg) = self.collateral_config(code) else {
+                continue;
+            };
+            let PriceSource::Oracle(base) = &cfg.price_source else {
+                continue;
+            };
+            let base_units = *balance as f64 / 10_f64.powi(cfg.decimals as i32);
+            *out.entry(base.clone()).or_insert(0.0) += base_units;
+        }
+        out
     }
 
     /// Credit or debit a collateral balance. `amount_minor` is signed.

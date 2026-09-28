@@ -469,3 +469,28 @@ Table 7 is the competitive snapshot in one view: the protocol against the benchm
 | Auto strike/expiry listing | No (G-34) | Yes | n/a | Partial | n/a | n/a |
 
 *n/a marks capabilities outside a venue's model (Paradigm is a network, not a venue; perp-only venues have no options rows). The matrix is structural, not exhaustive, and reflects the audit-date state of the benchmark set.*
+
+## Appendix C — Closure status (post-audit waves)
+
+The register above is the *audit-time* record. Three implementation
+waves have since closed it; this appendix tracks what shipped, so the
+table above stays a historical document rather than a stale claim.
+
+| Wave | Closed | Where |
+|---|---|---|
+| 1 (P0/P1 core) | F-1/G-01 everlasting roll wiring, G-04 governed vol surface, F-2 option fee caps, G-11/13/14/38 RFQ + blocks + streaming + MMP, G-21 breakers, G-22 volume ledger, G-31 transfers, G-28 Greeks view, G-40 coverage policy | engine + volsurface + rfq crates |
+| 2 (operations) | G-24 WAL + checkpoints, G-25/27/32 gateway protocol + market data + withdrawal pipeline, G-30 state-diff settlement with merkle proofs and exit queue, G-33 governance, G-19 iterative ADL, G-41 Greeks caps, G-36 referrals | persist + api + settlement + governance crates |
+| 3 (parity + differentiation) | G-03 strike-rebase ladder, G-05 DVOL-shaped vol index, G-06 icebergs, G-07 trailing stops, **G-08 OCO brackets**, G-09 batch + amend (with the shared-id/double-fill fix, I-26), **G-10 TWAP parents**, G-12 Dutch auctions, G-16 LP underwriter vaults, G-17 multi-collateral, **G-18 collateral interest**, G-20 spot-hedge-aware margin, G-23 insurance inventory + marking + rebalancing, **G-26 FIX session codec**, G-34 auto-listing, G-39 randomized sampling | engine (algorithms, vaults, sweep) + economics (vaults) + api (fix) |
+
+**Still open, by design:** G-15 (MM tier *program* — the obligations
+side; MMP protection itself ships), G-16's revenue-share wiring to the
+insurance allocation (vault mechanics ship; the routing weight defaults
+to zero), G-26's transport layer (TCP/sequence-reset — the codec and
+typed subset ship), G-35 (proof-of-reserves tooling), G-18 interest on
+*quote* balances (never charged — only foreign-currency utilization
+pays). Each remaining row is a deployment concern riding on shipped
+machinery, not a missing subsystem.
+
+The competitive matrix (Table 7) as of wave 3: every row that said
+"No (G-xx)" above is now "Yes" in the code, with the everlasting roll —
+the cell no incumbent claims — live end to end.

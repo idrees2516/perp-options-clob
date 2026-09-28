@@ -29,6 +29,9 @@ pub struct OrderRequest {
     pub stp: SelfTradePrevention,
     /// Iceberg display slice (G-06): visible lots per slice.
     pub display_lots: Option<u64>,
+    /// OCO group (G-08): engine-assigned when the request rides a
+    /// place-OCO pair; `None` on ordinary requests.
+    pub oco_group: Option<u64>,
     /// Client timestamp (reporting).
     pub client_ts: TimestampMs,
 }
@@ -55,6 +58,7 @@ impl OrderRequest {
             reduce_only: false,
             stp: SelfTradePrevention::CancelNewest,
             display_lots: None,
+            oco_group: None,
             client_ts: 0,
         }
     }
@@ -79,6 +83,7 @@ impl OrderRequest {
             reduce_only: false,
             stp: SelfTradePrevention::CancelNewest,
             display_lots: None,
+            oco_group: None,
             client_ts: 0,
         }
     }
@@ -153,6 +158,7 @@ pub enum Command {
         counterparties: Vec<SubaccountId>,
         /// Bounds on the taker's total cost.
         min_total_cost_quote_minor: Option<u128>,
+        /// Upper bound on the taker's total cost.
         max_total_cost_quote_minor: Option<u128>,
         /// Quoting window.
         ttl_ms: TimestampMs,
@@ -334,6 +340,83 @@ pub enum Command {
         to: String,
         /// Amount in the source currency's minor units.
         from_amount_minor: u128,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Place a one-cancels-other pair (G-08): two orders — typically a
+    /// take-profit and a stop-loss bracketing a position. The pair is
+    /// validated and margined atomically; the first sibling to fill
+    /// completely, trigger, or expire cancels the other with
+    /// [`OrderCloseReason::OcoSibling`](crate::event::OrderCloseReason::OcoSibling).
+    PlaceOco {
+        /// First leg of the bracket.
+        first: OrderRequest,
+        /// Second leg of the bracket.
+        second: OrderRequest,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Start a TWAP execution (G-10): a parent order sliced into equal
+    /// child placements spaced by `slice_interval_ms`. Children are
+    /// marketable limit orders bounded by `limit_ticks` (when supplied);
+    /// the parent completes when every slice has been placed.
+    PlaceTwap {
+        /// Owning subaccount.
+        subaccount: SubaccountId,
+        /// Instrument symbol.
+        symbol: Symbol,
+        /// Side of every slice.
+        side: Side,
+        /// Total quantity in lots (>= `slices`).
+        total_lots: u64,
+        /// Number of child slices.
+        slices: u64,
+        /// Wall-clock spacing between slices, ms.
+        slice_interval_ms: TimestampMs,
+        /// Worst acceptable price in ticks per slice (`None` = market
+        /// children, only bounded by the book).
+        limit_ticks: Option<u64>,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Cancel a TWAP parent (already-placed children are not recalled).
+    CancelTwap {
+        /// Owning subaccount.
+        subaccount: SubaccountId,
+        /// Parent id.
+        parent_id: u64,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Open a new LP underwriter vault (G-16, operator action).
+    VaultCreate {
+        /// Share of the insurance revenue allocation routed to this
+        /// vault, bps.
+        revenue_share_bps: u64,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Queue a subscription into a vault for the next epoch boundary
+    /// (G-16). Margin-gated: the amount must be spendable cash.
+    VaultSubscribe {
+        /// The vault.
+        vault_id: u64,
+        /// Subscribing subaccount.
+        subaccount: SubaccountId,
+        /// Quote minor to subscribe.
+        amount_quote_minor: u128,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Queue a redemption from a vault for the next epoch boundary
+    /// (G-16, first-come-first-served within the epoch).
+    VaultRedeem {
+        /// The vault.
+        vault_id: u64,
+        /// Redeeming subaccount.
+        subaccount: SubaccountId,
+        /// Shares to redeem.
+        shares: u128,
         /// Engine wall-clock.
         now: TimestampMs,
     },

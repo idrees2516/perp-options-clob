@@ -34,8 +34,10 @@ pub mod funding;
 pub mod incentives;
 pub mod referral;
 pub mod revenue;
+pub mod vaults;
 
 pub use fees::{FeeCalculator, FeeQuote, FeeSchedule, FeeTier, OptionFeeCaps};
 pub use funding::{EverlastingRoll, FundingCalculator, FundingQuote};
 pub use incentives::{IncentiveParams, LiquidityIncentives, RewardPool, RewardSettlement};
 pub use revenue::{Allocation, CoveragePolicy, RevenueRouter, RevenueSplit};
+pub use vaults::{EpochOutcome, LpVault};

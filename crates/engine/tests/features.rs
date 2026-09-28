@@ -182,6 +182,7 @@ fn trailing_request(sub: u64, offset: u64) -> OrderRequest {
         reduce_only: false,
         stp: poc_core::SelfTradePrevention::CancelNewest,
         display_lots: None,
+        oco_group: None,
         client_ts: 0,
     }
 }

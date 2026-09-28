@@ -21,6 +21,89 @@ pub struct OrderAmended {
     pub ts: TimestampMs,
 }
 
+/// A TWAP parent order (G-10): the deterministic slicer state.
+///
+/// Slicing rule: `total_lots` splits into `slices` children; the first
+/// `total_lots % slices` children carry one extra lot so the placed sum
+/// is exactly `total_lots` with integer lots. Children are marketable
+/// limit orders at `limit_ticks` (or pure markets when unbounded) with
+/// IOC semantics — the parent never rests on the book itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TwapParent {
+    /// Engine-assigned parent id.
+    pub parent_id: u64,
+    /// Owning subaccount.
+    pub subaccount: SubaccountId,
+    /// Instrument symbol.
+    pub symbol: Symbol,
+    /// Side of every slice.
+    pub side: Side,
+    /// Total quantity in lots.
+    pub total_lots: u64,
+    /// Number of child slices.
+    pub slices: u64,
+    /// Wall-clock spacing between slices, ms.
+    pub slice_interval_ms: TimestampMs,
+    /// Worst acceptable price in ticks per slice (`None` = market).
+    pub limit_ticks: Option<u64>,
+    /// Timestamp of the next child placement.
+    pub next_slice_ts: TimestampMs,
+    /// Children already emitted.
+    pub slices_placed: u64,
+    /// Lots already placed into children.
+    pub lots_placed: u64,
+    /// Placement wall-clock of the opening.
+    pub opened_ts: TimestampMs,
+}
+
+impl TwapParent {
+    /// Lot count of child `index` (0-based).
+    #[must_use]
+    pub fn slice_lots(&self, index: u64) -> u64 {
+        let base = self.total_lots / self.slices.max(1);
+        let rem = self.total_lots % self.slices.max(1);
+        if index < rem {
+            base + 1
+        } else {
+            base
+        }
+    }
+
+    /// Whether every child has been emitted.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.slices_placed >= self.slices
+    }
+}
+
+/// An LP underwriter vault epoch settlement (G-16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultEpoch {
+    /// The vault.
+    pub vault_id: u64,
+    /// Epoch index.
+    pub epoch: u64,
+    /// NAV per share before this epoch's flows (quote minor).
+    pub nav_per_share_quote_minor: u128,
+    /// Subscription shares issued this epoch.
+    pub subscribed_shares: u128,
+    /// Subscription quote minor received.
+    pub subscribed_quote_minor: u128,
+    /// Redemption shares burned this epoch.
+    pub redeemed_shares: u128,
+    /// Redemption quote minor paid out.
+    pub redeemed_quote_minor: u128,
+    /// Share of insurance revenue credited this epoch (quote minor).
+    pub insurance_credit_quote_minor: u128,
+    /// NAV per share after the epoch (quote minor).
+    pub nav_after_quote_minor: u128,
+    /// Per-subscriber signed quote flows (subscriptions negative,
+    /// redemptions positive).
+    pub flows: Vec<(SubaccountId, i128)>,
+    /// Engine wall-clock.
+    pub ts: TimestampMs,
+}
+
 /// A collateral movement (G-17).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollateralMoved {
@@ -329,6 +412,7 @@ pub enum Event {
         counterparties: Vec<SubaccountId>,
         /// Cost bounds.
         min_total_cost_quote_minor: Option<u128>,
+        /// Upper cost bound.
         max_total_cost_quote_minor: Option<u128>,
         /// Quoting window.
         ttl_ms: TimestampMs,
@@ -363,8 +447,9 @@ pub enum Event {
         rfq_id: u64,
         /// The executed quote.
         quote_id: u64,
-        /// Taker / maker.
+        /// The executing taker.
         taker: SubaccountId,
+        /// The quoting maker.
         maker: SubaccountId,
         /// Per-leg trades (synthetic order ids; prices in ticks).
         trades: Vec<Trade>,
@@ -391,8 +476,9 @@ pub enum Event {
     },
     /// A block trade registered (private until broadcast; id at apply).
     BlockRegistered {
-        /// Counterparties.
+        /// The taker-side counterparty.
         taker: SubaccountId,
+        /// The maker-side counterparty.
         maker: SubaccountId,
         /// Legs (symbol, taker side, qty, price ticks).
         legs: Vec<(Symbol, Side, u64, u64)>,
@@ -571,6 +657,126 @@ pub enum Event {
         /// Engine wall-clock.
         ts: TimestampMs,
     },
+    /// An OCO pair was linked (G-08): the engine assigned a group id to
+    /// two orders; the first terminal sibling cancels the other.
+    OcoLinked {
+        /// The group.
+        group: u64,
+        /// First sibling's order id.
+        first: OrderId,
+        /// Second sibling's order id.
+        second: OrderId,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A TWAP parent opened (G-10): the slicer state that emits child
+    /// placements every `slice_interval_ms`.
+    TwapOpened(Box<TwapParent>),
+    /// A TWAP parent emitted one child placement (G-10). The embedded
+    /// request is journaled in full so replay reproduces the child
+    /// without re-deriving the slice arithmetic.
+    TwapSliced {
+        /// The parent.
+        parent_id: u64,
+        /// The child placement request.
+        request: crate::command::OrderRequest,
+        /// Slice index (0-based) of this child.
+        slice_index: u64,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A TWAP parent finished (all slices placed) or was canceled (G-10).
+    TwapClosed {
+        /// The parent.
+        parent_id: u64,
+        /// Owning subaccount.
+        subaccount: SubaccountId,
+        /// Why the parent closed: `completed` or `canceled`.
+        reason: &'static str,
+        /// Total lots placed by the parent.
+        placed_lots: u64,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// The 30-day volatility index was published (G-05, DVOL-shaped):
+    /// 100 x sqrt(annualized 30-day fair variance off the live surface).
+    VolIndexPublished {
+        /// Underlying.
+        base_symbol: String,
+        /// Index level, scaled by 1000 (three decimals).
+        index_permille: u64,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// Interest accrued on utilized non-quote collateral (G-18): the
+    /// in-kind charge for borrowing margin capacity in a foreign
+    /// currency, credited to the house.
+    CollateralInterestAccrued {
+        /// The account.
+        subaccount: SubaccountId,
+        /// Currency code.
+        currency: String,
+        /// Minor units debited from the account's balance.
+        amount_minor: u128,
+        /// Quote value of the charge (at the accrual price).
+        quote_value_minor: u128,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// The insurance fund marked its inventory to the current marks
+    /// (G-23): position PnL since the last mark lands in the fund balance.
+    InsuranceMarked {
+        /// Instrument.
+        symbol: Symbol,
+        /// Signed lots carried.
+        signed_lots: i64,
+        /// Mark used (quote minor per base).
+        mark_quote_minor: u128,
+        /// PnL applied to the fund (positive = gain).
+        pnl_quote_minor: i128,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// The insurance fund rebalanced inventory back into the book
+    /// (G-23): the drips are journaled as ordinary trades; this event
+    /// updates fund inventory and completes the audit trail.
+    InsuranceRebalanced {
+        /// Instrument.
+        symbol: Symbol,
+        /// Lots sold back into the book.
+        lots: u64,
+        /// Proceeds (quote minor) added to the fund.
+        proceeds_quote_minor: u128,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// An LP underwriter vault epoch settled (G-16): subscriptions and
+    /// redemptions processed at the epoch NAV, and the vault's share of
+    /// insurance revenue was credited.
+    VaultEpochSettled(Box<VaultEpoch>),
+    /// A vault was opened (G-16).
+    VaultOpened {
+        /// The vault.
+        vault_id: u64,
+        /// Share of the insurance revenue allocation routed here, bps.
+        revenue_share_bps: u64,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A subscription or redemption was queued for the next vault epoch
+    /// (G-16). The cash movement itself happens only at the boundary.
+    VaultQueued {
+        /// The vault.
+        vault_id: u64,
+        /// The account.
+        subaccount: SubaccountId,
+        /// `true` = subscription, `false` = redemption.
+        is_subscribe: bool,
+        /// Quote minor (subscribe) or shares (redeem).
+        amount: u128,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
 }
 
 /// Why an order left the book.
@@ -584,6 +790,9 @@ pub enum OrderCloseReason {
     Expired,
     /// Cancelled remainder of an IOC order.
     IocRemainder,
+    /// Cancelled because its OCO sibling filled completely or triggered
+    /// (G-08).
+    OcoSibling,
 }
 
 /// Read-only view of one account for API surfaces.

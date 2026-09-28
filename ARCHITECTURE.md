@@ -320,22 +320,101 @@ expires unexecuted proposals, and a guardian can veto anything
 instantly. Every transition emits a `GovernanceEvent` so the host
 journals governance with the same discipline as the engine journal.
 
+## Execution algorithms (second closure wave)
+
+**Crate:**  + 
+(G-08/10/16, plus G-05/18/23 sweep stages).
+
+**OCO brackets (G-08).** A pair shares one group id () and
+the invariant is enforced by a *cascade scan* run after every planning
+pass: a pure function over (pre-apply state, planned events) that finds
+terminal members and appends the sibling cancel. Because it runs in
+ — before apply — the journal records it as part of the same
+command, and replay reproduces it without re-deriving anything.
+Bracket legs are same-side by design (a long position's TP sell-limit
+and SL sell-stop are both asks); atomicity rides the batch gate.
+
+**TWAP parents (G-10).** The parent is accounting, never book state.
+Each tick the slicer emits at most one child per parent — a full order
+request journaled inside  — which the engine then runs
+through the ordinary place path (risk gates, matching, fees). The
+integer split guarantees  exactly. Sequential commit
+means two parents slicing on the same tick cannot collide on order
+ids.
+
+**Sequential-commit batches (the G-09 fix).**  and
+ gate atomically (validity + cumulative order-margin against
+the pre-command snapshot), then commit member by member: order ids
+advance and later members see earlier fills. The original single-pass
+planner gave every sibling the same id and could double-fill one maker
+against phantom liquidity — now pinned by test (I-26).
+
+**LP vaults (G-16).** Subscriptions and redemptions queue during an
+epoch and settle at its boundary through a single 
+event whose per-subscriber flows are the exact cash movements (share
+issuance floored, redemption payouts floored against NAV — no unit of
+account is ever created). The planner simulates the settlement on a
+clone and journals the outcome; apply replays the identical simulation.
+
+**Insurance inventory (G-23).** Phase-B liquidations book the fund's
+carried positions at the penalized price; every sweep marks them to the
+current marks (PnL lands in the fund balance) and drips inventory back
+into the book as a synthetic IOC taker when a resting bid pays the
+configured edge over the carrying mark. The fund pays no taker fee on
+its own unwinds — a fee nobody paid, routed into pools, would mint
+quote.
+
+**Collateral interest (G-18).** At UTC day boundaries the sweep charges
+the *utilized* portion of oracle-priced non-quote collateral (min of
+haircut value and maintenance usage) in kind, routing the quote value
+through the revenue router. Idle collateral pays nothing; fixed-rate
+(stablecoin) collateral pays nothing (it moves with no underlying).
+
+**Volatility index (G-05).** A moneyness-weighted variance of the
+governed mark IVs inside a band, published in permille through integer
+arithmetic only (Newton ) — byte-identical on every platform.
+This is the honest DVOL simplification: a full variance-strip
+replication needs a liquid strip; a young surface would publish noise.
+
+**Spot-hedge-aware margin (G-20).** Oracle-priced collateral enters the
+scenario scan as a linear spot leg (), so BTC held
+against a short BTC call nets inside the grid instead of sitting
+outside it as an unshocked credit. Equity still credits only the
+haircut value; the scanner shocks the full balance — conservative on
+both sides.
+
+**FIX (G-26).**  is the deterministic protocol core: the
+tag=value wire codec with BodyLength/Checksum validation, the venue's
+typed message subset (Logon, NewOrderSingle, Cancel, Status,
+MarketDataRequest, ExecutionReport, CancelReject), and the pure
+translation onto engine commands. Transport, sequence persistence, and
+session recovery are gateway-host concerns, deliberately out of scope.
+
 ## Known simplifications
 
-Honest scope boundaries, each isolated behind a typed interface:
+Honest scope boundaries, each isolated behind a typed interface. Items
+struck through were simplifications of earlier waves that have since
+closed (kept for the record):
 
-- **In-memory only.** The journal is the persistence seam — a disk/log
-  writer, a gRPC/WS front-end, and on-chain settlement are the natural
-  next layers, out of scope here.
-- **Single collateral.** Quote-currency cash only; no multi-collateral
-  haircuts.
-- **IV is configured, not surfaced.** Option marks use a per-market IV
-  from config; a live vol surface (and marking off the book with clamps)
-  is a `Mark`-producer swap.
-- **ADL pricing is single-shot.** The bankruptcy price covers the
-  projected deficit in one calculation; production systems iterate.
+- ~~**Single collateral.**~~ Closed by G-17: multi-collateral with
+  per-currency haircuts, oracle pricing, conversions, spot-hedge-aware
+  scanning (G-20), and utilization interest (G-18).
+- ~~**IV is configured, not surfaced.**~~ Closed by G-04: the governed
+  anchor-blend surface; G-05 publishes the DVOL-shaped index off it.
+- ~~**ADL pricing is single-shot.**~~ Closed by G-19: iterative rounds.
+- ~~**Insurance inventory is virtual.**~~ Closed by G-23: carried
+  positions, mark-to-market, and book-crossing rebalancing drips.
+- ~~**In-memory only.**~~ The persistence seam is no longer an excuse:
+  the WAL (G-24), gateway protocol (G-25/27), settlement commitments
+  (G-30), and FIX codec (G-26) ship. What remains deliberately out of
+  scope for a reference engine: actual network transports (TCP/TLS/
+  WebSocket hosts), key custody, and chain integrations — the library
+  is the deterministic core those hosts drive.
 - **Fee volume decay is fixed-rate.** The 30-day window slides at ~1/90
   per funding interval rather than being recomputed from a time-indexed
   ledger.
-- **Insurance inventory is virtual.** The fund books the penalty and the
-  absorbed shortfall but does not carry the closed risk as positions.
+- **Vault revenue routing defaults off.** Vault mechanics (G-16) ship;
+  the insurance-allocation share that would credit them defaults to
+  zero until governance sets it.
+- **FIX transport.** The codec and typed subset (G-26) ship; sequence
+  persistence and session recovery belong to the gateway host.

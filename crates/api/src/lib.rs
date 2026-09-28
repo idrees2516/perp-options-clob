@@ -23,6 +23,7 @@
 //! bit-exactly in CI.
 
 pub mod auth;
+pub mod fix;
 pub mod json;
 pub mod session;
 pub mod withdrawal;

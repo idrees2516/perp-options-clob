@@ -47,6 +47,20 @@ The program has already paid for itself — three real defects:
 3. **Fee routing leak (I-4):** the buyback share of routed fees was
    debited from users and never credited to any pool — a conservation
    hole the settlement validator now structurally rejects.
+4. **Shared order ids inside PlaceBatch (I-26):** the single-pass batch
+   planner assigned every sibling the same engine id — tracked orders,
+   reservations, and book keys collided, and marketable siblings could
+   double-fill the same maker against phantom liquidity. Found by a
+   targeted id-distinctness probe written while designing OCO; fixed by
+   making batches and OCO pairs *sequential-commit* after an atomic
+   validity + cumulative-margin pre-pass.
+5. **Vault collateral outside the conserved universe:** the first cut of
+   the vault epoch settled cash into vault collateral that the
+   conservation checker did not track, so any subscription read as a
+   leak of exactly the subscribed amount. Found by
+   `second_wave_commands_hold_invariants` on seed 1 step 14; fixed by
+   extending the conserved quantity with vault collateral (and, in the
+   same pass, the insurance fund's inventory entry value).
 
 ## Running
 

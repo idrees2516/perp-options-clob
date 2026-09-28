@@ -183,6 +183,12 @@ pub struct Order {
     /// sell-side. Updated only by journaled `TrailingUpdated` events so
     /// replay is exact. `None` for non-trailing orders.
     pub trailing_extreme_quote_minor: Option<u128>,
+    /// OCO group (G-08): orders sharing a group id are bracket siblings;
+    /// the first to fill completely, trigger, or leave the book
+    /// terminally cancels the other. Assigned by the engine from the
+    /// place-OCO command; `None` for standalone orders. Journaled inside
+    /// the order so replay wires group state exactly.
+    pub oco_group: Option<u64>,
     /// Client-assigned epoch-ms for report matching.
     pub client_ts: TimestampMs,
     /// Engine-assigned epoch-ms.

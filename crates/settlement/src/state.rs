@@ -13,8 +13,12 @@ use crate::merkle::{inclusion_proof, leaf_hash, merkle_root, InclusionProof};
 /// stay below `USER_SUBACCOUNT_CEILING` (enforced by the capture, not the
 /// engine).
 pub const HOUSE_SUBACCOUNT: SubaccountId = SubaccountId::MAX - 4;
+/// Reserved synthetic subaccount the insurance pool trades through on
+/// the settlement capture.
 pub const INSURANCE_SUBACCOUNT: SubaccountId = SubaccountId::MAX - 3;
+/// Reserved synthetic subaccount holding unsettled reward emissions.
 pub const REWARDS_SUBACCOUNT: SubaccountId = SubaccountId::MAX - 2;
+/// Reserved synthetic subaccount holding the buyback overflow pool.
 pub const BUYBACK_SUBACCOUNT: SubaccountId = SubaccountId::MAX - 1;
 /// The largest subaccount id the settlement layer attributes to users.
 pub const USER_SUBACCOUNT_CEILING: SubaccountId = SubaccountId::MAX - 8;
