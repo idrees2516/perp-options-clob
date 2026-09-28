@@ -273,6 +273,9 @@ pub struct LiquidityObservation {
     pub spread_bps: u64,
     /// Whether the account quotes both sides simultaneously.
     pub two_sided: bool,
+    /// The quote's side (G-15: tier obligations are evaluated per
+    /// side — the worst side decides).
+    pub side: Side,
 }
 
 /// The full engine journal. Every variant is applied via
@@ -774,6 +777,44 @@ pub enum Event {
         is_subscribe: bool,
         /// Quote minor (subscribe) or shares (redeem).
         amount: u128,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A subaccount enrolled in the market-maker tier program (G-15).
+    /// Enrollment persists across review windows; withdrawal is an
+    /// explicit venue action.
+    MmEnrolled {
+        /// The enrolled maker.
+        subaccount: SubaccountId,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// One monthly market-maker tier review outcome (G-15): the tier the
+    /// trailing window earned, the discount it activates, and the
+    /// measured uptime that justified it.
+    MmTierAdjusted {
+        /// The reviewed maker.
+        subaccount: SubaccountId,
+        /// The tier name earned (`None` = demoted to standard fees).
+        tier: Option<&'static str>,
+        /// Fee discount active after this review, bps.
+        fee_discount_bps: u64,
+        /// Measured overall two-sided presence uptime, permille.
+        uptime_permille: u64,
+        /// Sampled ticks in the window.
+        ticks: u64,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// Quote-balance interest accrued on *utilized* quote margin at a
+    /// UTC day boundary (G-18 completion): the charge for margin
+    /// capacity borrowed in the quote currency, routed through the
+    /// revenue router like every other fee income.
+    QuoteInterestAccrued {
+        /// The charged account.
+        subaccount: SubaccountId,
+        /// Interest charged, quote minor.
+        amount_quote_minor: u128,
         /// Engine wall-clock.
         ts: TimestampMs,
     },

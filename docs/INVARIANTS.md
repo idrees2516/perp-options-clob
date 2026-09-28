@@ -235,3 +235,63 @@ distinct ids and maker-size-limited fills.)
 *Tests:* `batch_siblings_get_distinct_ids_and_see_each_other`,
 `batch_places_and_amend_reduces_in_place`, fuzzed batches in
 `second_wave_commands_hold_invariants`.
+
+## Fourth closure wave (G-15/16/18/26/35)
+
+### I-27 An MM tier discount exists only for an enrolled maker, and only as earned
+The discount map is written exclusively by journaled `MmTierAdjusted`
+events; a discount requires prior enrollment, is re-derived at every
+review from the drained measurement window (never carried by trust),
+never exceeds the program's configured cap (50%), and never flips a
+fee into a rebate. Demotion on silence is automatic — there is no
+grandfathering path in the state machine.
+*Tests:* `mm_tier_discount_requires_earned_obligations` (award, fee
+discrimination, demotion, replay), `mm_tiers` unit suite (ladder
+validity, evaluation, bounded discount math), fuzzed tier legality in
+`third_wave_commands_hold_invariants` (enrollment ⊆ discount, cap).
+
+### I-28 The vault revenue split never exceeds the insurance allocation
+Every routed fee's insurance share splits through the LP vaults first:
+each vault takes `floor(allocation × revenue_share_bps / 10_000)`,
+granted in ascending vault-id order and capped by the remaining
+allocation, so `Σ vault credits + fund credit == insurance share`
+exactly — under any configuration of shares, including multiple vaults
+each claiming 100%.
+*Tests:* `vault_revenue_share_routes_and_conserves` (exact split +
+global conservation), `vault_share_never_exceeds_the_allocation`
+(over-subscribed shares), fuzzed routing inside
+`third_wave_commands_hold_invariants`.
+
+### I-29 A FIX session delivers each application message exactly once, or explains the gap
+Inbound sequence numbers must arrive exactly at the expected value;
+ahead-of-sequence messages trigger a ResendRequest and buffer until the
+gap fills; PossDup-tagged replays below the sequence are dropped
+silently; untagged regressions are answered with a GapFill resync. On
+resend, application messages replay with their original sequence and
+`43=Y`, while administrative messages are covered by GapFill — the
+recovered stream contains state changes, never heartbeats.
+*Tests:* the `fix_session` suite (gap + buffered delivery, possdup
+drop, stale reset, admin-run gapfill on resend, sequence-reset jump,
+TCP loopback lifecycle).
+
+### I-30 Every provable liability is committed, and only to its owner
+The proof-of-reserves tree binds (subaccount, nonce, cash, collateral
+valuations, vault claims) into one leaf per account, sorted by
+subaccount, under a domain-separated hash; the total committed equals
+the sum of the leaves; any balance change (or a nonce change alone)
+changes the root; and a redemption can only burn shares its redeemer
+holds — the claim ledger is exactly the liability set.
+*Tests:* `por_proves_every_liability_from_engine_state` (proofs,
+tamper resistance, totals, monotonic publication), `por` unit suite
+(duplicates, nonce binding, ledger monotonicity), `redemption_requires_owned_shares`.
+
+### I-31 Quote interest charges utilization, never balances
+The quote-currency charge at a UTC day boundary is
+`ceil(min(positive cash, maintenance requirement) × bps)`: idle cash
+pays nothing, negative balances pay nothing, the charge can never
+exceed the cash available, and exactly one accrual happens per day per
+engine. The charge routes through the same revenue router as every
+other fee income — no parallel money path exists.
+*Tests:* `quote_interest_charges_only_utilized_cash` (idle exemption,
+single charge per day, conservation through routing, replay),
+`quote_interest_ceils_against_the_holder` unit test.

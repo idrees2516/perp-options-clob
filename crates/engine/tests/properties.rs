@@ -685,3 +685,223 @@ fn second_wave_commands_hold_invariants() {
         assert!(book_is_sane(&live));
     }
 }
+
+// ----------------------------------------------------------------------
+// Third closure wave: MM tiers, vault revenue share, quote interest
+// ----------------------------------------------------------------------
+
+/// The third-wave generator: the second-wave mix plus MM tier
+/// enrollment and day-boundary-crossing ticks that exercise quote
+/// interest. Conservation, replay determinism, and tier legality are
+/// asserted after every command.
+fn random_command_v3(rng: &mut Rng, now: u64, tick: u64) -> Command {
+    let sub = 1 + rng.below(SUBS);
+    // Bias toward ticks: the review windows and day boundaries must
+    // actually fire inside the run.
+    match rng.below(24) {
+        0..=5 => Command::Place {
+            request: OrderRequest::limit(
+                sub,
+                "BTC-PERP",
+                if rng.below(2) == 0 {
+                    Side::Bid
+                } else {
+                    Side::Ask
+                },
+                PRICES[rng.below(PRICES.len() as u64) as usize],
+                1 + rng.below(5),
+            ),
+            now,
+        },
+        6 => Command::MmTierEnroll {
+            subaccount: sub,
+            now,
+        },
+        7 => Command::PlaceBatch {
+            requests: (0..1 + rng.below(2))
+                .map(|_| {
+                    OrderRequest::limit(
+                        sub,
+                        "BTC-PERP",
+                        if rng.below(2) == 0 {
+                            Side::Bid
+                        } else {
+                            Side::Ask
+                        },
+                        PRICES[rng.below(PRICES.len() as u64) as usize],
+                        1 + rng.below(3),
+                    )
+                })
+                .collect(),
+            now,
+        },
+        8 => Command::VaultSubscribe {
+            vault_id: 1,
+            subaccount: sub,
+            amount_quote_minor: u128::from(rng.below(100_000)),
+            now,
+        },
+        9 => Command::VaultRedeem {
+            vault_id: 1,
+            subaccount: sub,
+            shares: u128::from(rng.below(100_000)),
+            now,
+        },
+        10 => Command::Cancel {
+            subaccount: sub,
+            order_id: 1 + rng.below(60),
+            now,
+        },
+        11..=14 => Command::Tick { now: tick },
+        15 => Command::Withdraw {
+            subaccount: sub,
+            amount_quote_minor: u128::from(rng.below(1_000_000)),
+        },
+        16 | 17 => Command::OracleUpdate {
+            base_symbol: "BTC".into(),
+            provider: "pyth".into(),
+            ts: now,
+            price_quote_minor: 7_800_000 + u128::from(rng.below(400_000)),
+        },
+        18 => Command::OracleUpdate {
+            base_symbol: "BTC".into(),
+            provider: "chainlink".into(),
+            ts: now,
+            price_quote_minor: 7_800_000 + u128::from(rng.below(400_000)),
+        },
+        19 => Command::Transfer {
+            from: sub,
+            to: 1 + rng.below(SUBS),
+            amount_quote_minor: u128::from(rng.below(10_000)),
+            now,
+        },
+        _ => Command::CancelAll {
+            subaccount: sub,
+            symbol: None,
+            now,
+        },
+    }
+}
+
+#[test]
+fn third_wave_commands_hold_invariants() {
+    for seed in 1..=10_u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9));
+        let cfg = EngineConfig {
+            vault_epoch_interval_ms: 5_000,
+            // Quote interest on: every day-crossing tick charges
+            // utilized quote margin through the revenue router.
+            quote_interest_bps_per_day: 5,
+            // Reward faucet off: `venue_pools().1` reports the budget
+            // (per-interval + carry), which would move the metric on
+            // zero-payment settles without moving cash.
+            reward_per_interval_quote_minor: 0,
+            mm_program: poc_economics::MmTierProgram {
+                tiers: vec![poc_economics::MmTierSpec {
+                    name: "FUZZ-MM",
+                    fee_discount_bps: 1_500,
+                    min_uptime_permille: 100,
+                    max_spread_bps: 400,
+                    min_size_lots: 1,
+                }],
+                review_interval_ms: 4_000,
+            },
+            ..EngineConfig::default()
+        };
+        let mut live = Engine::new(cfg.clone());
+        live.register_instrument(Instrument::Perp(PerpMarket::default()));
+        for provider in ["pyth", "chainlink"] {
+            live.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: provider.into(),
+                ts: T0,
+                price_quote_minor: 8_000_000,
+            });
+        }
+        live.process(Command::Tick { now: T0 });
+        for sub in 1..=SUBS {
+            live.process(Command::Deposit {
+                subaccount: sub,
+                amount_quote_minor: 80_000_000,
+            });
+        }
+        live.process(Command::VaultCreate {
+            revenue_share_bps: 4_000,
+            now: T0,
+        });
+
+        let mut shadow = Engine::replay(cfg, live.journal());
+        shadow.register_instrument(Instrument::Perp(PerpMarket::default()));
+
+        let baseline = tracked_total_with_inventory(&live);
+        let mut custody: i128 = 0;
+        let mut lots_traded: i128 = 0;
+
+        for step in 0..200_u64 {
+            // Cross a UTC day boundary once mid-run so quote interest
+            // fires deterministically in every seed.
+            let now = if step == 100 {
+                T0 + 24 * 60 * 60 * 1000
+            } else {
+                T0 + step * 1_000
+            };
+            let cmd = random_command_v3(&mut rng, now, now);
+            let evs = live.process(cmd.clone());
+            for ev in &evs {
+                match ev {
+                    Event::Withdrawal {
+                        amount_quote_minor, ..
+                    } => {
+                        custody = custody.saturating_sub(poc_core::to_i128(*amount_quote_minor));
+                    }
+                    Event::Deposit {
+                        amount_quote_minor, ..
+                    } => {
+                        custody = custody.saturating_add(poc_core::to_i128(*amount_quote_minor));
+                    }
+                    Event::Reward(paid) => {
+                        custody =
+                            custody.saturating_add(poc_core::to_i128(paid.amount_quote_minor));
+                    }
+                    Event::TradeExecuted(t) => {
+                        lots_traded = lots_traded.saturating_add(i128::from(t.qty_lots));
+                    }
+                    _ => {}
+                }
+            }
+            shadow.process(cmd);
+
+            // I-5 (with vaults + inventory): conservation up to
+            // rounding dust.
+            let total = tracked_total_with_inventory(&live);
+            let delta = (total - (baseline + custody)).abs();
+            assert!(
+                delta <= 10 * lots_traded + 64,
+                "seed {seed} step {step}: conservation broke by {delta}"
+            );
+
+            // I-27 (MM tier legality): a discount exists only for an
+            // enrolled subaccount, and never exceeds the tier cap.
+            for sub in 1..=SUBS {
+                let discount = live.mm_discount_of(sub);
+                if discount > 0 {
+                    assert!(
+                        live.mm_ledger().is_enrolled(sub),
+                        "seed {seed} step {step}: discount for unenrolled sub {sub}"
+                    );
+                    assert!(
+                        discount <= 5_000,
+                        "seed {seed} step {step}: discount cap exceeded"
+                    );
+                }
+            }
+        }
+
+        // I-3: replay determinism across the third-wave commands.
+        assert!(
+            engines_agree(&live, &shadow),
+            "seed {seed}: replay diverged with third-wave commands"
+        );
+        assert!(book_is_sane(&live));
+    }
+}

@@ -215,6 +215,9 @@ pub fn rfq_taker_fees(
     let tier = engine.fee_schedule_ref().tier_for(taker);
     let caps = engine.config().option_fee_caps;
     let marks = engine.build_marks(engine.now_ref());
+    // G-15: the taker's active MM tier discount composes after the
+    // ladder, before the grouped multi-leg ladder.
+    let mm_discount = engine.mm_discount_of(taker);
     let mut classified: Vec<(LegFeeClass, u128)> = Vec::with_capacity(legs.len());
     for (symbol, taker_side, qty, price_ticks) in legs {
         let Some(instrument) = engine.instruments().get(symbol) else {
@@ -227,6 +230,7 @@ pub fn rfq_taker_fees(
                     .notional_quote_minor(*price_ticks, *qty)
                     .unwrap_or(0);
                 let fee = poc_economics::FeeCalculator::taker_fee(tier, notional).unwrap_or(0);
+                let fee = poc_economics::apply_tier_discount(fee, mm_discount);
                 classified.push((LegFeeClass::Perp, fee.unsigned_abs()));
             }
             Instrument::Option(m) => {
@@ -246,6 +250,7 @@ pub fn rfq_taker_fees(
                 let fee =
                     poc_economics::FeeCalculator::option_taker_fee(tier, &caps, notional, premium)
                         .unwrap_or(0);
+                let fee = poc_economics::apply_tier_discount(fee, mm_discount);
                 classified.push((class, fee.unsigned_abs()));
             }
         }

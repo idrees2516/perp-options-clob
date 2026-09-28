@@ -32,6 +32,8 @@
 //! mutation is planned by the engine's sweep and applied through
 //! journaled [`VaultEpochSettled`](poc_engine::VaultEpochSettled) events.
 
+use std::collections::BTreeMap;
+
 use poc_core::mul_div;
 
 /// A shared backstop vault.
@@ -47,6 +49,11 @@ pub struct LpVault {
     pub pending_subscriptions: Vec<(u64, u128)>,
     /// Redemption queue: (redeemer, shares).
     pub pending_redemptions: Vec<(u64, u128)>,
+    /// Per-subscriber share holdings (proof-of-claim ledger: the
+    /// liability the vault owes each depositor, required by
+    /// proof-of-reserves (G-35) and enforced by redemption
+    /// validation — a redeemer can only burn shares they hold).
+    pub shareholders: BTreeMap<u64, u128>,
     /// Share of the insurance revenue allocation routed here, bps.
     pub revenue_share_bps: u64,
     /// Epoch index of the last settlement.
@@ -83,6 +90,7 @@ impl LpVault {
             collateral_quote_minor: 0,
             pending_subscriptions: Vec::new(),
             pending_redemptions: Vec::new(),
+            shareholders: BTreeMap::new(),
             revenue_share_bps,
             last_epoch: 0,
             last_settle_ts: 0,
@@ -106,11 +114,43 @@ impl LpVault {
         }
     }
 
-    /// Queue a redemption for the next epoch boundary.
+    /// Queue a redemption for the next epoch boundary. Shares the
+    /// redeemer does not hold are clipped at queue time — a redemption
+    /// is a burn of *your own* claim, never of the pool's.
     pub fn redeem(&mut self, redeemer: u64, shares: u128) {
-        if shares > 0 {
-            self.pending_redemptions.push((redeemer, shares));
+        if shares == 0 {
+            return;
         }
+        let held = self.shareholders.get(&redeemer).copied().unwrap_or(0);
+        let burnable = shares.min(held);
+        if burnable > 0 {
+            self.pending_redemptions.push((redeemer, burnable));
+        }
+    }
+
+    /// Shares a subaccount currently holds.
+    #[must_use]
+    pub fn holdings(&self, subscriber: u64) -> u128 {
+        self.shareholders.get(&subscriber).copied().unwrap_or(0)
+    }
+
+    /// The claim a shareholder can prove against the vault at the
+    /// current NAV, quote minor — the liability entry proof-of-reserves
+    /// publishes (share x NAV, floored in the holder's disfavour so the
+    /// published liability never exceeds the provable one).
+    #[must_use]
+    pub fn claim_quote_minor(&self, subscriber: u64) -> u128 {
+        let shares = self.holdings(subscriber);
+        if shares == 0 {
+            return 0;
+        }
+        mul_div(
+            shares,
+            self.nav_per_share_quote_minor(),
+            1_000_000,
+            poc_core::Rounding::Floor,
+        )
+        .unwrap_or(0)
     }
 
     /// Credit insurance revenue (raises NAV, no new shares).
@@ -153,15 +193,22 @@ impl LpVault {
             subscribed_quote = subscribed_quote.saturating_add(debited);
             self.shares = self.shares.saturating_add(shares);
             self.collateral_quote_minor = self.collateral_quote_minor.saturating_add(debited);
+            let holdings = self.shareholders.get(&sub).copied().unwrap_or(0);
+            self.shareholders
+                .insert(sub, holdings.saturating_add(shares));
             flows.push((sub, -poc_core::to_i128(debited)));
         }
 
         // Redemptions: collateral = shares * nav / scale, floored — the
-        // vault never pays out more than it computed.
+        // vault never pays out more than it computed. Each redemption
+        // burns the redeemer's own holdings (queue-time validation
+        // clipped anything beyond them).
         let mut redeemed_shares = 0u128;
         let mut redeemed_quote = 0u128;
         for (red, shares) in self.pending_redemptions.drain(..) {
-            let burn = shares.min(self.shares.saturating_sub(redeemed_shares));
+            let held = self.shareholders.get(&red).copied().unwrap_or(0);
+            let by_pool = self.shares.saturating_sub(redeemed_shares);
+            let burn = shares.min(held).min(by_pool);
             if burn == 0 {
                 continue;
             }
@@ -170,6 +217,12 @@ impl LpVault {
             redeemed_quote = redeemed_quote.saturating_add(payout);
             self.shares = self.shares.saturating_sub(burn);
             self.collateral_quote_minor = self.collateral_quote_minor.saturating_sub(payout);
+            let remaining = held.saturating_sub(burn);
+            if remaining == 0 {
+                self.shareholders.remove(&red);
+            } else {
+                self.shareholders.insert(red, remaining);
+            }
             flows.push((red, poc_core::to_i128(payout)));
         }
 
@@ -235,5 +288,62 @@ mod tests {
         let out = v.settle_epoch();
         assert_eq!(out.redeemed_shares, 100);
         assert_eq!(v.shares, 0);
+    }
+
+    #[test]
+    fn redemption_requires_owned_shares() {
+        let mut v = LpVault::new(1, 0);
+        v.subscribe(10, 1_000);
+        v.settle_epoch();
+        // Account 11 holds nothing: the redemption queues zero burns.
+        v.redeem(11, 500);
+        let out = v.settle_epoch();
+        assert_eq!(out.redeemed_shares, 0);
+        assert_eq!(v.shares, 1_000);
+        assert_eq!(v.holdings(11), 0);
+        // Account 10 redeeming more than held clips at holdings.
+        v.redeem(10, 5_000);
+        let out = v.settle_epoch();
+        assert_eq!(out.redeemed_shares, 1_000);
+        assert_eq!(v.holdings(10), 0);
+        assert!(!v.shareholders.contains_key(&10));
+    }
+
+    #[test]
+    fn shareholder_holdings_track_multiple_subscribers() {
+        let mut v = LpVault::new(1, 0);
+        v.subscribe(10, 600);
+        v.subscribe(11, 400);
+        let out = v.settle_epoch();
+        assert_eq!(out.subscribed_shares, 1_000);
+        assert_eq!(v.holdings(10), 600);
+        assert_eq!(v.holdings(11), 400);
+        assert_eq!(v.shares, 600 + 400);
+        // Claims at par NAV sum to collateral.
+        assert_eq!(v.claim_quote_minor(10) + v.claim_quote_minor(11), 1_000);
+        // Revenue raises claims pro-rata.
+        v.credit_revenue(500);
+        let c10 = v.claim_quote_minor(10);
+        let c11 = v.claim_quote_minor(11);
+        assert_eq!(c10, 900); // 600 shares x 1.5 NAV
+        assert_eq!(c11, 600);
+        assert!(c10 + c11 <= v.collateral_quote_minor);
+        // Partial redemption reduces holdings only.
+        v.redeem(10, 300);
+        v.settle_epoch();
+        assert_eq!(v.holdings(10), 300);
+        assert_eq!(v.holdings(11), 400);
+    }
+
+    #[test]
+    fn draw_spreads_across_shareholders_proportionally() {
+        let mut v = LpVault::new(1, 0);
+        v.subscribe(10, 700);
+        v.subscribe(11, 300);
+        v.settle_epoch();
+        v.draw(400);
+        // NAV per share = 600_000 (0.6); claims floored.
+        assert_eq!(v.claim_quote_minor(10), 420); // 700 x 0.6
+        assert_eq!(v.claim_quote_minor(11), 180); // 300 x 0.6
     }
 }

@@ -32,6 +32,7 @@
 pub mod fees;
 pub mod funding;
 pub mod incentives;
+pub mod mm_tiers;
 pub mod referral;
 pub mod revenue;
 pub mod vaults;
@@ -39,5 +40,8 @@ pub mod vaults;
 pub use fees::{FeeCalculator, FeeQuote, FeeSchedule, FeeTier, OptionFeeCaps};
 pub use funding::{EverlastingRoll, FundingCalculator, FundingQuote};
 pub use incentives::{IncentiveParams, LiquidityIncentives, RewardPool, RewardSettlement};
+pub use mm_tiers::{
+    apply_tier_discount, MmLedger, MmTickStats, MmTierProgram, MmTierSpec, MmWindowStats,
+};
 pub use revenue::{Allocation, CoveragePolicy, RevenueRouter, RevenueSplit};
 pub use vaults::{EpochOutcome, LpVault};

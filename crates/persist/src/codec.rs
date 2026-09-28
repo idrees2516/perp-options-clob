@@ -914,6 +914,11 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
             e.varint(*shares);
             e.varint(u128::from(*now));
         }
+        Command::MmTierEnroll { subaccount, now } => {
+            e.varint(30);
+            e.varint(u128::from(*subaccount));
+            e.varint(u128::from(*now));
+        }
     }
     e.into_vec()
 }
@@ -1153,6 +1158,10 @@ pub fn decode_command(data: &[u8]) -> Result<Command, DecodeError> {
                 now,
             }
         }
+        30 => Command::MmTierEnroll {
+            subaccount: d.u64()?,
+            now: d.u64()?,
+        },
         23 => Command::ConvertCollateral {
             subaccount: d.u64()?,
             from: d.str()?,

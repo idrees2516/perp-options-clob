@@ -61,6 +61,14 @@ venue charges the microseconds where it buys a guarantee.
   making checkpoint cadence a storage decision, not a recovery-time
   decision.
 
+## Fourth-wave subsystems (2026-09, same container)
+
+| Operation | p50 | p99 | Notes |
+|---|---|---|---|
+| MM tier sample + review tick (64 MMs) | 43.0 µs | 92.4 µs | One liquidity-scoring tick + one review-boundary tick: the monthly review of 64 market makers costs less than one settlement merkle root |
+| PoR build + prove all (64 accounts) | 2.78 ms | 3.08 ms | Liability-tree construction over 64 accounts plus verification of every account's inclusion proof |
+| FIX session lifecycle (logon + order + logout) | 6.2 µs | 11.6 µs | Full session choreography over the in-memory duplex: framing, sequence assignment, checksums, logout exchange |
+
 ## Reproducing
 
 ```bash

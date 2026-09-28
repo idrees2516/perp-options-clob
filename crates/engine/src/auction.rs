@@ -76,6 +76,16 @@ pub(crate) fn plan_auction_uncross(engine: &Engine, now: TimestampMs) -> Vec<Eve
             };
             let maker_fee =
                 poc_economics::FeeCalculator::maker_fee(maker_tier, notional).unwrap_or(0);
+            // G-15: the MM tier discount composes after the maker rate
+            // auctions charge both participants.
+            let taker_fee = poc_economics::apply_tier_discount(
+                taker_fee,
+                engine.mm_discount_of(fill.taker_subaccount),
+            );
+            let maker_fee = poc_economics::apply_tier_discount(
+                maker_fee,
+                engine.mm_discount_of(fill.maker_subaccount),
+            );
             events.push(Event::TradeExecuted(Box::new(Trade {
                 seq: engine.seq + u64::try_from(taker_reductions.len()).unwrap_or(0) + 1,
                 symbol: symbol.clone(),

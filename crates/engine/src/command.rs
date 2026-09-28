@@ -420,6 +420,17 @@ pub enum Command {
         /// Engine wall-clock.
         now: TimestampMs,
     },
+    /// Enroll a subaccount in the market-maker tier program (G-15).
+    /// Enrollment is free but *measured*: obligations are evaluated at
+    /// every review window from the randomized liquidity samples the
+    /// sweep already takes, and the tier discount follows the measured
+    /// performance — never the enrollment.
+    MmTierEnroll {
+        /// The enrolling maker.
+        subaccount: SubaccountId,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
 }
 
 /// One RFQ package leg as issued by a client.

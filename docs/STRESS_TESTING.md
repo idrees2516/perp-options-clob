@@ -59,3 +59,23 @@ all stress scenarios completed without invariant violations
 * Numbers are from a shared 2-vCPU container: treat magnitudes, not
   decimals, as the signal. Reproduce with `cargo run --release -p
   poc-bench -- stress`.
+
+## Wave-4 re-run (2026-09)
+
+All six scenarios re-executed after the fourth closure wave (MM tiers,
+vault revenue split, quote-interest machinery, FIX transport, PoR) with
+the same seeds:
+
+| Scenario | Result |
+|---|---|
+| flash-crash (−50% in 100 ticks) | 1.4 ms, 301 events, no invariant violations |
+| vol-spike (500 coordinated swings) | 7.8 ms, mark survived 500/500 ticks |
+| order-spam (40k place/cancel) | 67 ms, 6,957 resting, books sane |
+| liquidation-cascade (20 degens) | 5.9 ms, 465 liquidation events |
+| oracle-split (1 rogue of 3) | 1.7 ms, mark held 300/300, zero halts |
+| crash-recovery determinism | 13.3 ms, 6,004/6,004 commands, state identical |
+
+**No regressions.** The sweep's two new stages (MM review, quote
+interest) add no measurable cost to the hot paths at these scales —
+see the fourth-wave table in `docs/BENCHMARKS.md` for their isolated
+cost.

@@ -47,12 +47,13 @@ pub mod engine;
 pub mod event;
 pub mod institutions;
 pub mod listing;
+pub mod mm;
 pub mod sweep;
 pub mod vaults;
 
 pub use collateral::{CollateralCurrency, PriceSource, QUOTE_CODE};
 pub use command::{Command, OrderRequest, RfqLegCommand};
-pub use engine::{Engine, EngineConfig, EngineStats, ListingPolicy};
+pub use engine::{Engine, EngineConfig, EngineStats, ListingPolicy, PorLiabilityRow};
 pub use event::{
     AccountView, AdlExecuted, BookView, Event, FundingPaid, FundingSettled, LiquidationExecuted,
     LiquidityObservation, MarketStateView, OptionSettled, OrderCloseReason, OrderRejected,

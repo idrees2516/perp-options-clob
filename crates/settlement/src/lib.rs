@@ -36,18 +36,24 @@
 //!
 //! SHA-256 throughout (dependency-free, FIPS 180-4; see [`hash`]), with
 //! domain separation between leaves (`POC-LEAF`), nodes (`POC-NODE`),
-//! operation leaves (`POC-OP`), and batch headers (`POC-BATCH`).
+//! operation leaves (`POC-OP`), batch headers (`POC-BATCH`), and
+//! proof-of-reserves liability leaves (`POC-POR`).
 
 pub mod batch;
 pub mod diff;
 pub mod exit;
 pub mod hash;
 pub mod merkle;
+pub mod por;
 pub mod state;
 
 pub use batch::{build_batch, validate_batch, validate_chain, SettlementBatch, ValidationError};
 pub use diff::StateCapture;
 pub use exit::{ExitQueue, WithdrawalIntent};
+pub use por::{
+    build_report_from_rows, check_solvency, report_commitment, verify_liability, FixedAttestor,
+    LiabilityEntry, LiabilityTree, PorError, PorLedger, PorReport, ReserveAttestor, SolvencyCheck,
+};
 pub use state::{
     AccountCommitment, AccountMutation, SettlementState, HOUSE_SUBACCOUNT, INSURANCE_SUBACCOUNT,
     REWARDS_SUBACCOUNT, USER_SUBACCOUNT_CEILING,

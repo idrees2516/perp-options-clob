@@ -113,6 +113,14 @@ pub struct EngineConfig {
     /// Insurance rebalancing (G-23): minimum bid edge over the carrying
     /// mark before a drip is worth the market impact, bps.
     pub insurance_rebalance_edge_bps: u64,
+    /// Market-maker tier program (G-15): the obligations ladder and
+    /// review cadence. Disabled (`MmTierProgram::disabled`) opts the
+    /// venue out.
+    pub mm_program: poc_economics::MmTierProgram,
+    /// Quote-balance interest (G-18 completion): daily bps charged on
+    /// the *utilized* portion of positive quote cash. Default 0 — a
+    /// governance decision to enable, never a default cost.
+    pub quote_interest_bps_per_day: u64,
 }
 
 /// Circuit-breaker parameters (G-21).
@@ -172,8 +180,25 @@ impl Default for EngineConfig {
             vault_epoch_interval_ms: 24 * 60 * 60 * 1000,
             insurance_rebalance_max_lots: 10,
             insurance_rebalance_edge_bps: 50,
+            mm_program: poc_economics::MmTierProgram::mainnet(),
+            quote_interest_bps_per_day: 0,
         }
     }
+}
+
+/// One proof-of-reserves liability row (G-35): what the venue owes one
+/// subaccount, at oracle prices, pre-haircut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PorLiabilityRow {
+    /// The subaccount.
+    pub subaccount: SubaccountId,
+    /// Positive quote-currency cash, quote minor.
+    pub quote_cash_minor: u128,
+    /// Non-quote collateral: `(code, balance minor, full oracle value
+    /// quote minor)`.
+    pub collateral: Vec<(String, u128, u128)>,
+    /// Vault share claims at current NAV, quote minor.
+    pub vault_claims_quote_minor: u128,
 }
 
 /// Aggregate statistics of the running engine.
@@ -279,6 +304,16 @@ pub struct Engine {
     pub(crate) vaults: BTreeMap<u64, poc_economics::LpVault>,
     /// Next vault id.
     pub(crate) next_vault_id: u64,
+    /// MM tier program ledger (G-15): enrollment + in-flight window
+    /// stats, fed by the journaled liquidity samples.
+    pub(crate) mm_ledger: poc_economics::MmLedger,
+    /// Active MM tier fee discounts per subaccount (G-15), bps. Set
+    /// only by journaled `MmTierAdjusted` events.
+    pub(crate) mm_discount_bps: BTreeMap<SubaccountId, u64>,
+    /// Next MM tier review boundary (G-15).
+    pub(crate) next_mm_review_ts: TimestampMs,
+    /// Day index of the last quote-interest accrual (G-18).
+    pub(crate) last_quote_interest_day: u64,
 
     // statistics
     pub(crate) trades: u64,
@@ -311,6 +346,7 @@ impl Engine {
         let vol_surface = VolSurface::new(config.surface_config)
             .or_else(|_| VolSurface::new(SurfaceConfig::default()))
             .expect("default surface config is valid");
+        let next_mm_review_ts = config.mm_program.review_interval_ms;
         Self {
             config,
             instruments: BTreeMap::new(),
@@ -355,6 +391,10 @@ impl Engine {
             insurance_inventory: BTreeMap::new(),
             vaults: BTreeMap::new(),
             next_vault_id: 1,
+            mm_ledger: poc_economics::MmLedger::new(),
+            mm_discount_bps: BTreeMap::new(),
+            next_mm_review_ts,
+            last_quote_interest_day: 0,
             trades: 0,
             lots_traded: 0,
             notional_traded: 0,
@@ -458,6 +498,71 @@ impl Engine {
     #[must_use]
     pub fn journal(&self) -> &[Event] {
         &self.journal
+    }
+
+    /// The active MM tier fee discount of a subaccount (G-15), bps.
+    /// Zero when the account holds no tier.
+    #[must_use]
+    pub fn mm_discount_of(&self, subaccount: SubaccountId) -> u64 {
+        self.mm_discount_bps.get(&subaccount).copied().unwrap_or(0)
+    }
+
+    /// The MM tier program ledger view (G-15): enrolled subaccounts and
+    /// their in-flight window statistics.
+    #[must_use]
+    pub fn mm_ledger(&self) -> &poc_economics::MmLedger {
+        &self.mm_ledger
+    }
+
+    /// Build the proof-of-reserves liability rows (G-35): one row per
+    /// subaccount — positive quote cash, non-quote collateral at full
+    /// (un-haircut) oracle value, and vault share claims at current
+    /// NAV. Liabilities are what customers can *claim*; the venue's
+    /// haircut is its own risk buffer, not the customer's.
+    ///
+    /// Publication itself is a settlement-layer act
+    /// (`poc_settlement::por`): the engine exposes the projection, the
+    /// settlement crate commits it.
+    #[must_use]
+    pub fn por_liabilities(&self, now: TimestampMs) -> Vec<PorLiabilityRow> {
+        let mut vault_claims: BTreeMap<SubaccountId, u128> = BTreeMap::new();
+        for vault in self.vaults.values() {
+            for holder in vault.shareholders.keys() {
+                let claim = vault.claim_quote_minor(*holder);
+                let acc = vault_claims.entry(*holder).or_insert(0);
+                *acc = acc.saturating_add(claim);
+            }
+        }
+        let mut rows: Vec<PorLiabilityRow> = Vec::with_capacity(self.accounts.len());
+        for (sub, account) in &self.accounts {
+            // A negative balance is a debt the customer owes the venue,
+            // not a liability the venue owes them.
+            let cash = account.cash_quote_minor.max(0).unsigned_abs();
+            let mut collateral = Vec::new();
+            if let Some(balances) = self.collateral.get(sub) {
+                for (code, minor) in balances {
+                    let value = self
+                        .collateral_price(code, now)
+                        .and_then(|price| {
+                            let unit = self
+                                .collateral_config(code)
+                                .map(|cfg| 10_u128.saturating_pow(cfg.decimals))
+                                .unwrap_or(1);
+                            mul_div(*minor, price, unit, poc_core::Rounding::Floor)
+                        })
+                        .unwrap_or(0);
+                    collateral.push((code.clone(), *minor, value));
+                }
+            }
+            let claims = vault_claims.get(sub).copied().unwrap_or(0);
+            rows.push(PorLiabilityRow {
+                subaccount: *sub,
+                quote_cash_minor: cash,
+                collateral,
+                vault_claims_quote_minor: claims,
+            });
+        }
+        rows
     }
 
     /// Engine wall clock.
@@ -727,6 +832,16 @@ impl Engine {
             Command::VaultCreate { .. }
             | Command::VaultSubscribe { .. }
             | Command::VaultRedeem { .. } => self.plan_vault_command(cmd, self.now),
+            Command::MmTierEnroll { subaccount, now } => {
+                if self.accounts.contains_key(subaccount) {
+                    vec![Event::MmEnrolled {
+                        subaccount: *subaccount,
+                        ts: *now,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
         }
     }
 
@@ -1253,6 +1368,16 @@ impl Engine {
                     ),
                 }
             };
+            // G-15: the active MM tier discount composes after the
+            // volume ladder (fees round in the payer's favour).
+            let taker_fee = poc_economics::apply_tier_discount(
+                taker_fee,
+                self.mm_discount_of(fill.taker_subaccount),
+            );
+            let maker_fee = poc_economics::apply_tier_discount(
+                maker_fee,
+                self.mm_discount_of(fill.maker_subaccount),
+            );
             events.push(Event::TradeExecuted(Box::new(Trade {
                 seq: self.seq + trades_in_batch - 1,
                 symbol: order.symbol.clone(),
@@ -1716,6 +1841,47 @@ impl Engine {
                         obs.two_sided,
                     );
                 }
+                // G-15: the same journaled samples feed the MM tier
+                // ledger — one measurement, two incentive systems.
+                crate::mm::apply_liquidity_scored(self, observations);
+            }
+            Event::MmEnrolled { subaccount, .. } => {
+                self.mm_ledger.enroll(*subaccount);
+            }
+            Event::MmTierAdjusted {
+                subaccount,
+                fee_discount_bps,
+                ts,
+                ..
+            } => {
+                // Re-derive the ledger transition exactly as planned:
+                // the planner drained the window on a clone; replay the
+                // drain so live state matches.
+                let _ = self.mm_ledger.drain_window();
+                if *fee_discount_bps == 0 {
+                    self.mm_discount_bps.remove(subaccount);
+                } else {
+                    self.mm_discount_bps.insert(*subaccount, *fee_discount_bps);
+                }
+                crate::mm::advance_review_schedule(self);
+                let _ = ts;
+            }
+            Event::QuoteInterestAccrued {
+                subaccount,
+                amount_quote_minor,
+                ts,
+            } => {
+                // Charge the account, route the income — the same
+                // fee-income path every other charge uses.
+                if let Some(account) = self.accounts.get_mut(subaccount) {
+                    let cash = account.cash_quote_minor;
+                    let charge = (*amount_quote_minor as i128).min(cash.max(0));
+                    account.cash_quote_minor = cash - charge;
+                    if let Ok(amount) = u128::try_from(charge.max(0)) {
+                        self.apply_fee_income(amount, *ts);
+                    }
+                }
+                crate::mm::mark_quote_interest_day(self, *ts);
             }
             Event::Reward(paid) => {
                 if let Some(account) = self.accounts.get_mut(&paid.subaccount) {
@@ -1853,26 +2019,9 @@ impl Engine {
                         .record_volume_at(*taker, notional, *broadcast_ts);
                     let gross = taker_fees_quote_minor.get(i).copied().unwrap_or(0).max(0);
                     if gross > 0 {
-                        if let Some(allocation) = self.revenue_router.route(gross.unsigned_abs()) {
-                            if allocation.insurance > 0 {
-                                let coverage = self.insurance_coverage_permille();
-                                if self.config.coverage_policy.above_target(coverage) {
-                                    self.buyback_pool_quote_minor = self
-                                        .buyback_pool_quote_minor
-                                        .saturating_add(allocation.insurance);
-                                } else {
-                                    self.insurance
-                                        .credit_penalty(allocation.insurance, *broadcast_ts);
-                                }
-                            }
-                            // The routed buyback share is credited to the
-                            // buyback pool (conservation).
-                            if allocation.buyback > 0 {
-                                self.buyback_pool_quote_minor = self
-                                    .buyback_pool_quote_minor
-                                    .saturating_add(allocation.buyback);
-                            }
-                        }
+                        // One fee-income path: vault split + coverage
+                        // policy + buyback (G-16/G-40).
+                        self.apply_fee_income(gross.unsigned_abs(), *broadcast_ts);
                     }
                     self.trades += 1;
                     self.lots_traded += *qty;
@@ -2228,8 +2377,7 @@ impl Engine {
     /// and apply the allocations.
     fn apply_revenue(&mut self, allocation: poc_economics::Allocation) {
         if allocation.insurance > 0 {
-            self.insurance
-                .credit_penalty(allocation.insurance, self.now);
+            self.credit_insurance_allocation(allocation.insurance, self.now);
         }
         self.buyback_pool_quote_minor = self
             .buyback_pool_quote_minor
@@ -2237,6 +2385,83 @@ impl Engine {
         // The house share stays outside engine balances (the venue's
         // own account ledger is out of scope for the reference engine).
         let _ = allocation.house;
+    }
+
+    /// Route a gross fee income through the revenue router and apply
+    /// the allocations: insurance share first through the vault
+    /// revenue split (G-16), then the coverage policy, then the buyback
+    /// pool — one path for trade fees, RFQ fees, block fees, and
+    /// interest charges alike.
+    pub(crate) fn apply_fee_income(&mut self, gross: u128, ts: TimestampMs) {
+        if gross == 0 {
+            return;
+        }
+        if let Some(allocation) = self.revenue_router.route(gross) {
+            self.credit_insurance_allocation(allocation.insurance, ts);
+            if allocation.buyback > 0 {
+                self.buyback_pool_quote_minor = self
+                    .buyback_pool_quote_minor
+                    .saturating_add(allocation.buyback);
+            }
+            // The house share stays outside engine balances.
+            let _ = allocation.house;
+        }
+    }
+
+    /// Credit the insurance allocation: LP vaults take their
+    /// configured share of the routed insurance revenue first (G-16,
+    /// deterministic ascending vault-id order, each vault's share
+    /// floored from the *full* allocation and capped by what remains,
+    /// so the split can never exceed the allocation); the remainder
+    /// lands in the fund — or, when the fund is above its coverage
+    /// target, overflows to the buyback pool (G-40).
+    ///
+    /// Vault shares are an LP yield, not a fund top-up: they apply
+    /// even when the fund is above target, because depositors earn
+    /// their backstop premium in every regime.
+    pub(crate) fn credit_insurance_allocation(&mut self, amount: u128, ts: TimestampMs) {
+        if amount == 0 {
+            return;
+        }
+        // Snapshot the weights first (immutable), then mutate.
+        let weights: Vec<(u64, u64)> = self
+            .vaults
+            .values()
+            .filter(|v| v.revenue_share_bps > 0 && v.collateral_quote_minor > 0)
+            .map(|v| (v.vault_id, v.revenue_share_bps))
+            .collect();
+        let mut remaining = amount;
+        for (vault_id, share_bps) in weights {
+            if remaining == 0 {
+                break;
+            }
+            let credit = mul_div(
+                amount,
+                u128::from(share_bps),
+                10_000,
+                poc_core::Rounding::Floor,
+            )
+            .unwrap_or(0)
+            .min(remaining);
+            if credit > 0 {
+                if let Some(vault) = self.vaults.get_mut(&vault_id) {
+                    vault.credit_revenue(credit);
+                }
+                remaining -= credit;
+            }
+        }
+        if remaining > 0 {
+            // G-40: an insurance fund above its coverage target stops
+            // hoarding — the share overflows to the buyback pool (the
+            // Hyperliquid-validated pattern).
+            let coverage = self.insurance_coverage_permille();
+            if self.config.coverage_policy.above_target(coverage) {
+                self.buyback_pool_quote_minor =
+                    self.buyback_pool_quote_minor.saturating_add(remaining);
+            } else {
+                self.insurance.credit_penalty(remaining, ts);
+            }
+        }
     }
 
     /// Apply one leg of an RFQ settlement (no book interaction).
@@ -2269,26 +2494,7 @@ impl Engine {
             .record_volume_at(taker, trade.notional_quote_minor, trade.ts);
         let gross = trade.taker_fee_quote_minor.max(0);
         if gross > 0 {
-            if let Some(allocation) = self.revenue_router.route(gross.unsigned_abs()) {
-                if allocation.insurance > 0 {
-                    let coverage = self.insurance_coverage_permille();
-                    if self.config.coverage_policy.above_target(coverage) {
-                        self.buyback_pool_quote_minor = self
-                            .buyback_pool_quote_minor
-                            .saturating_add(allocation.insurance);
-                    } else {
-                        self.insurance
-                            .credit_penalty(allocation.insurance, trade.ts);
-                    }
-                }
-                // The routed buyback share is credited to the buyback pool
-                // (conservation: every debited fee unit lands in a pool).
-                if allocation.buyback > 0 {
-                    self.buyback_pool_quote_minor = self
-                        .buyback_pool_quote_minor
-                        .saturating_add(allocation.buyback);
-                }
-            }
+            self.apply_fee_income(gross.unsigned_abs(), trade.ts);
         }
         self.seq = self.seq.max(trade.seq + 1);
         self.trades += 1;
@@ -2411,29 +2617,9 @@ impl Engine {
             .max(0)
             .saturating_add(trade.maker_fee_quote_minor.max(0));
         if gross > 0 {
-            if let Some(allocation) = self.revenue_router.route(gross.unsigned_abs()) {
-                if allocation.insurance > 0 {
-                    // G-40: an insurance fund above its coverage target
-                    // stops hoarding — the share overflows to the buyback
-                    // pool (the Hyperliquid-validated pattern).
-                    let coverage = self.insurance_coverage_permille();
-                    if self.config.coverage_policy.above_target(coverage) {
-                        self.buyback_pool_quote_minor = self
-                            .buyback_pool_quote_minor
-                            .saturating_add(allocation.insurance);
-                    } else {
-                        self.insurance
-                            .credit_penalty(allocation.insurance, trade.ts);
-                    }
-                }
-                // The routed buyback share is credited to the buyback pool
-                // (conservation: every debited fee unit lands in a pool).
-                if allocation.buyback > 0 {
-                    self.buyback_pool_quote_minor = self
-                        .buyback_pool_quote_minor
-                        .saturating_add(allocation.buyback);
-                }
-            }
+            // One fee-income path: vault split + coverage policy +
+            // buyback (G-16/G-40).
+            self.apply_fee_income(gross.unsigned_abs(), trade.ts);
         }
 
         // Scale the maker's order-margin reservation to its remaining size.
@@ -3197,6 +3383,9 @@ fn event_ts(event: &Event) -> TimestampMs {
         Event::InsuranceRebalanced { ts, .. } => *ts,
         Event::VaultEpochSettled(v) => v.ts,
         Event::VaultOpened { ts, .. } | Event::VaultQueued { ts, .. } => *ts,
+        Event::MmEnrolled { ts, .. }
+        | Event::MmTierAdjusted { ts, .. }
+        | Event::QuoteInterestAccrued { ts, .. } => *ts,
         Event::RfqClosed { .. }
         | Event::BlockRegistered { .. }
         | Event::BlockPrinted { .. }

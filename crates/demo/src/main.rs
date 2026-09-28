@@ -21,6 +21,11 @@ fn usd(minor: i128) -> String {
     format!("{sign}${whole}.{cents:02}")
 }
 
+/// First 8 hex chars of a digest.
+fn hex_prefix(bytes: &[u8; 32]) -> String {
+    bytes.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Basis points → signed percent string.
 fn bps_display(bps: i64) -> String {
     format!("{:+.4}%", bps as f64 / 100.0)
@@ -126,6 +131,17 @@ fn main() {
         reward_interval_ms: HOUR,
         insurance_seed_quote_minor: 10_000_000, // $100k seeded fund
         option_ivs: [("BTC-80000-C".to_string(), 0.55)].into_iter().collect(),
+        // G-15: the MM tier program with a demo-friendly daily review.
+        mm_program: poc_economics::MmTierProgram {
+            tiers: vec![poc_economics::MmTierSpec {
+                name: "MM-PRO",
+                fee_discount_bps: 1_500,
+                min_uptime_permille: 600,
+                max_spread_bps: 100,
+                min_size_lots: 2,
+            }],
+            review_interval_ms: 24 * HOUR,
+        },
         ..EngineConfig::default()
     };
 
@@ -425,6 +441,119 @@ fn main() {
     println!(
         "          (80k calls expire {} ITM — cash-settled on the 30-min TWAP)",
         usd((8_600_000_i128 - 8_000_000) / 100 * 100)
+    );
+    println!();
+
+    // ------------------------------------------------------------------
+    // 8b. Fourth wave: MM tier program, vault revenue share, PoR.
+    // ------------------------------------------------------------------
+    println!("[tiers]   the MM tier program reviews the day...");
+    // Enroll the two market makers and quote two-sided at the touch:
+    // the randomized liquidity sampler scores every tick, and the
+    // review window closes at the next daily boundary.
+    for mm in [1_u64, 2] {
+        s.engine.process(Command::MmTierEnroll {
+            subaccount: mm,
+            now: s.now,
+        });
+    }
+    s.engine.process(Command::Place {
+        request: OrderRequest::limit(1, "BTC-PERP", Side::Bid, 85_990, 5),
+        now: s.now,
+    });
+    s.engine.process(Command::Place {
+        request: OrderRequest::limit(1, "BTC-PERP", Side::Ask, 86_010, 100),
+        now: s.now,
+    });
+    // A few sampling ticks inside the window, then cross the boundary.
+    for _ in 0..3 {
+        s.now += 10_000;
+        s.tick();
+    }
+    s.now += 24 * HOUR;
+    s.feed_oracle(8_600_000);
+    let tier_events = s.tick();
+    for ev in &tier_events {
+        if let Event::MmTierAdjusted {
+            subaccount,
+            tier,
+            fee_discount_bps,
+            uptime_permille,
+            ..
+        } = ev
+        {
+            println!(
+                "          MM-{}: tier {:?} ({} bps discount, uptime {:.1}%)",
+                subaccount,
+                tier,
+                fee_discount_bps,
+                *uptime_permille as f64 / 10.0
+            );
+        }
+    }
+    println!();
+
+    // LP vault: an underwriter subscribes and earns the insurance share.
+    println!("[vault]   underwriter vault with a 40% insurance revenue share...");
+    s.engine.process(Command::VaultCreate {
+        revenue_share_bps: 4_000,
+        now: s.now,
+    });
+    s.engine.process(Command::VaultSubscribe {
+        vault_id: 1,
+        subaccount: 5,
+        amount_quote_minor: 5_000_000,
+        now: s.now,
+    });
+    s.now += 24 * HOUR; // epoch boundary
+    s.feed_oracle(8_600_000);
+    s.tick();
+    let vault_before = s
+        .engine
+        .vaults()
+        .get(&1)
+        .map(|v| v.collateral_quote_minor)
+        .unwrap_or(0);
+    // A taker trade routes its fee: the vault earns its share of the
+    // insurance allocation (sized so the share is visible above the
+    // integer rounding floor).
+    s.engine.process(Command::Place {
+        request: OrderRequest::limit(4, "BTC-PERP", Side::Bid, 90_000, 100),
+        now: s.now,
+    });
+    let vault_after = s
+        .engine
+        .vaults()
+        .get(&1)
+        .map(|v| v.collateral_quote_minor)
+        .unwrap_or(0);
+    println!(
+        "          vault collateral: {} → {} (revenue share routed)",
+        usd(vault_before as i128),
+        usd(vault_after as i128)
+    );
+    println!();
+
+    // Proof-of-reserves: publish the liability commitment.
+    println!("[por]     publishing proof-of-reserves...");
+    let rows = s.engine.por_liabilities(s.now);
+    let (_tree, report) =
+        poc_settlement::build_report_from_rows(rows, 1, s.now).expect("liability rows build");
+    println!(
+        "          root 0x{}…  liabilities {}  entries {}",
+        hex_prefix(&report.root),
+        usd(report.total_liabilities_quote_minor as i128),
+        report.entry_count
+    );
+    // Every account verifies its own leaf against the published root.
+    let all_provable = (1..=6_u64).all(|sub| {
+        _tree.proof(sub).is_some_and(|(entry, proof)| {
+            poc_settlement::verify_liability(&entry, &proof, &report.root, report.nonce)
+        })
+    });
+    println!(
+        "          every account proves its balance against the root: {}",
+        if all_provable { "YES ✓" } else { "NO ✗" }
     );
     println!();
 

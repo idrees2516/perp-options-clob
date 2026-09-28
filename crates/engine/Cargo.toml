@@ -17,6 +17,11 @@ poc-economics = { path = "../economics" }
 poc-margin = { path = "../margin" }
 poc-risk = { path = "../risk" }
 
+[dev-dependencies]
+# Dev-only (cargo permits dev-dep cycles): the proof-of-reserves
+# integration tests build liability trees from engine state.
+poc-settlement = { path = "../settlement" }
+
 
 [lints]
 workspace = true

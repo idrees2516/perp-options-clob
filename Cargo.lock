@@ -14,7 +14,9 @@ dependencies = [
 name = "poc-bench"
 version = "0.1.0"
 dependencies = [
+ "poc-api",
  "poc-core",
+ "poc-economics",
  "poc-engine",
  "poc-margin",
  "poc-oracle",
@@ -37,6 +39,7 @@ dependencies = [
  "poc-oracle",
  "poc-orderbook",
  "poc-risk",
+ "poc-settlement",
 ]
 
 [[package]]
@@ -57,6 +60,7 @@ dependencies = [
  "poc-orderbook",
  "poc-rfq",
  "poc-risk",
+ "poc-settlement",
  "poc-volsurface",
 ]
 

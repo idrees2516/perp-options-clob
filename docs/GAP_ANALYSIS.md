@@ -481,15 +481,39 @@ table above stays a historical document rather than a stale claim.
 | 1 (P0/P1 core) | F-1/G-01 everlasting roll wiring, G-04 governed vol surface, F-2 option fee caps, G-11/13/14/38 RFQ + blocks + streaming + MMP, G-21 breakers, G-22 volume ledger, G-31 transfers, G-28 Greeks view, G-40 coverage policy | engine + volsurface + rfq crates |
 | 2 (operations) | G-24 WAL + checkpoints, G-25/27/32 gateway protocol + market data + withdrawal pipeline, G-30 state-diff settlement with merkle proofs and exit queue, G-33 governance, G-19 iterative ADL, G-41 Greeks caps, G-36 referrals | persist + api + settlement + governance crates |
 | 3 (parity + differentiation) | G-03 strike-rebase ladder, G-05 DVOL-shaped vol index, G-06 icebergs, G-07 trailing stops, **G-08 OCO brackets**, G-09 batch + amend (with the shared-id/double-fill fix, I-26), **G-10 TWAP parents**, G-12 Dutch auctions, G-16 LP underwriter vaults, G-17 multi-collateral, **G-18 collateral interest**, G-20 spot-hedge-aware margin, G-23 insurance inventory + marking + rebalancing, **G-26 FIX session codec**, G-34 auto-listing, G-39 randomized sampling | engine (algorithms, vaults, sweep) + economics (vaults) + api (fix) |
+| 4 (final closure) | G-15 MM tier program (I-27), G-16 vault revenue-share wiring + per-shareholder holdings (I-28), G-26 FIX session transport (I-29), G-35 proof-of-reserves (I-30), G-18 quote-balance interest (I-31) | economics (mm_tiers, vaults) + api (fix_session) + settlement (por) + engine (mm, sweep, routing) |
 
-**Still open, by design:** G-15 (MM tier *program* — the obligations
-side; MMP protection itself ships), G-16's revenue-share wiring to the
-insurance allocation (vault mechanics ship; the routing weight defaults
-to zero), G-26's transport layer (TCP/sequence-reset — the codec and
-typed subset ship), G-35 (proof-of-reserves tooling), G-18 interest on
-*quote* balances (never charged — only foreign-currency utilization
-pays). Each remaining row is a deployment concern riding on shipped
-machinery, not a missing subsystem.
+**The register is closed (wave 4, 2026-09).** The last "still open"
+qualifications shipped:
+
+* **G-15 — MM tier program**: the obligations ladder (uptime /
+  worst-side spread / smaller-side size) measured from the randomized
+  liquidity samples, journaled monthly reviews, fee discounts that
+  compose after the volume ladder on every fee path, automatic
+  demotion (I-27).
+* **G-16 — revenue-share wiring**: every routed insurance allocation
+  now splits through the LP vaults (deterministic ascending-id order,
+  never exceeding the allocation); vaults gained per-shareholder
+  holdings — claim proofs for PoR and redemption ownership
+  validation (I-28).
+* **G-26 — FIX transport**: the session state machine over the shipped
+  codec — framing, sequence integrity, ResendRequest + buffered
+  delivery, PossDup dedup, admin GapFill on resend, heartbeat
+  enforcement, and a real TCP acceptor (I-29).
+* **G-35 — proof-of-reserves**: nonce-bound merkle liability trees
+  over cash + collateral + vault claims, per-account inclusion proofs,
+  a monotonic publication ledger, and the `ReserveAttestor`
+  integration point (I-30).
+* **G-18 — quote-balance interest**: utilization-bounded, day-boundary
+  charged, revenue-routed; defaults to zero as a governance decision
+  (I-31).
+
+Every item ships, every invariant has a test, and the competitive
+matrix (Table 7) reads "Yes" in every row this protocol claims — with
+the everlasting roll remaining the cell no incumbent claims. What
+remains beyond this repository is deployment plumbing (supervision,
+TLS, key custody, the chain), each behind a typed interface that
+already exists.
 
 The competitive matrix (Table 7) as of wave 3: every row that said
 "No (G-xx)" above is now "Yes" in the code, with the everlasting roll —

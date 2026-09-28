@@ -336,6 +336,119 @@ fn micro() {
         }
         stats("tick (incl. vol index + interest)", &mut samples);
     }
+
+    // 8. Fourth closure wave: MM tier review, proof-of-reserves, FIX
+    // session (G-15/35/26).
+    {
+        const N: usize = 1_000;
+
+        // MM tier review cycle: enroll, sample liquidity ticks, close
+        // the window. Measures the whole monthly-review cost per maker.
+        let cfg = EngineConfig {
+            mm_program: poc_economics::MmTierProgram {
+                tiers: vec![poc_economics::MmTierSpec {
+                    name: "BENCH-MM",
+                    fee_discount_bps: 1_000,
+                    min_uptime_permille: 100,
+                    max_spread_bps: 10_000,
+                    min_size_lots: 1,
+                }],
+                review_interval_ms: 10_000,
+            },
+            ..EngineConfig::default()
+        };
+        let mut e = Engine::new(cfg);
+        e.register_instrument(Instrument::Perp(PerpMarket::default()));
+        for provider in ["pyth", "chainlink"] {
+            e.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: provider.into(),
+                ts: 1_000,
+                price_quote_minor: 8_000_000,
+            });
+        }
+        e.process(Command::Tick { now: 1_000 });
+        for sub in 1..=64_u64 {
+            e.process(Command::Deposit {
+                subaccount: sub,
+                amount_quote_minor: 1_000_000_000,
+            });
+            e.process(Command::MmTierEnroll {
+                subaccount: sub,
+                now: 1_000,
+            });
+            e.process(Command::Place {
+                request: OrderRequest::limit(sub, "BTC-PERP", Side::Bid, 79_990, 5),
+                now: 1_000,
+            });
+            e.process(Command::Place {
+                request: OrderRequest::limit(sub, "BTC-PERP", Side::Ask, 80_010, 5),
+                now: 1_000,
+            });
+        }
+        let mut samples = Vec::with_capacity(N);
+        for i in 0..N as u64 {
+            let t = Instant::now();
+            // Sampling tick (liquidity scoring feeds the MM ledger).
+            e.process(Command::Tick { now: 2_000 + i });
+            // Review boundary every other iteration.
+            e.process(Command::Tick {
+                now: 12_000 + i * 20_000,
+            });
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("MM tier sample + review tick (64 MMs)", &mut samples);
+
+        // Proof-of-reserves: liability tree build + per-account proof
+        // verification over the settled venue.
+        let mut samples = Vec::with_capacity(N);
+        for i in 0..N as u64 {
+            let t = Instant::now();
+            let rows = e.por_liabilities(50_000 + i);
+            let (tree, report) =
+                poc_settlement::build_report_from_rows(rows, i, 50_000 + i).expect("build");
+            for entry in &tree.entries {
+                let (proved, proof) = tree.proof(entry.subaccount).expect("proof");
+                assert!(poc_settlement::verify_liability(
+                    &proved,
+                    &proof,
+                    &report.root,
+                    report.nonce
+                ));
+            }
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("PoR build + prove all (64 accounts)", &mut samples);
+
+        // FIX session round trip: logon, order, logout over the
+        // in-memory duplex (the codec + session layers).
+        let mut samples = Vec::with_capacity(N);
+        for i in 0..N as u64 {
+            let t = Instant::now();
+            let pair = poc_api::LoopbackPair::new();
+            let mut client = poc_api::FixSession::new(pair.a, poc_api::Role::Initiator);
+            let mut server = poc_api::FixSession::new(pair.b, poc_api::Role::Acceptor);
+            let _ = client.logon(30);
+            let _ = server.pump(100);
+            let _ = client.pump(200);
+            let mut order = poc_api::fix::FixMessage::new();
+            order
+                .set(35, "D")
+                .set(49, "7")
+                .set(55, "BTC-PERP")
+                .set(54, "1")
+                .set(38, "5")
+                .set(44, "79900")
+                .set(40, "3")
+                .set(11, format!("bench-{i}"));
+            let _ = client.send(&order);
+            let _ = server.pump(300);
+            let _ = client.logout();
+            let _ = server.pump(400);
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("FIX session lifecycle (logon+order+logout)", &mut samples);
+    }
 }
 
 // ----------------------------------------------------------------------

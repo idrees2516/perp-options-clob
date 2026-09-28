@@ -82,3 +82,21 @@ cargo +nightly fuzz run fuzz_fees     -- -max_total_time=120
 Corpora live in `fuzz/corpus/<target>/`; committed seeds reproduce
 past findings. Regression minimization is manual (the checkers print
 the failing seed and step).
+
+## Fourth wave: the third command stream
+
+`third_wave_commands_hold_invariants` (10 seeds × 200 commands) mixes
+the second-wave generator with MM tier enrollment, a live vault revenue
+share, quote interest, and a mid-run UTC day crossing. It asserts:
+
+* **I-5 conservation** with vault collateral in the tracked universe,
+  through fee routing, vault revenue splits, quote interest, funding,
+  and liquidations;
+* **I-3 replay determinism** across every new command;
+* **I-27 tier legality** — a nonzero discount implies enrollment and
+  respects the cap, checked after *every* command.
+
+Findings: **none** — the wave-4 code paths survived their first
+property run. (The wave-3 credit for catching real defects belongs to
+the suite's predecessors; the bar this wave had to clear was not
+regressing them.)

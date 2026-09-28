@@ -390,6 +390,80 @@ MarketDataRequest, ExecutionReport, CancelReject), and the pure
 translation onto engine commands. Transport, sequence persistence, and
 session recovery are gateway-host concerns, deliberately out of scope.
 
+## Fourth closure wave: tier program, vault yield, FIX transport, proof-of-reserves
+
+**MM tier program (G-15).** Market making is an *obligations* business,
+not a volume business, and the engine now prices it that way. The
+sweep's randomized liquidity samples (the same journaled
+`LiquidityScored` events that drive reward payouts) feed a per-maker
+measurement window: every sampled tick, each enrolled maker's quotes
+are grouped by side, and the tightest tier whose bar *some bid and
+some ask* both clear (worst-side spread, smaller-side size) is
+credited. At every review boundary the window drains, tiers are
+re-earned or lost, and the outcome lands as a journaled
+`MmTierAdjusted` event — the only writer of the discount map. The
+discount composes *after* the volume ladder on every fee path (CLOB
+matching, auction uncrosses, RFQ legs, block trades), rounds in the
+payer's favour, is capped at 50%, and cannot flip a fee into a rebate.
+Demotion on silence is automatic; there is no grandfathering path in
+the state machine. One measurement system feeds both the reward pool
+and the tier ledger — paying twice for the same quote would be
+double-counting the same behaviour.
+
+**Vault revenue share (G-16 wiring).** Every routed fee's insurance
+allocation now splits through the LP vaults before the fund: each vault
+takes `floor(allocation × revenue_share_bps / 10⁴)`, granted in
+ascending vault-id order and capped by the remaining allocation, so
+the split is exact under any share configuration. The remainder lands
+in the insurance fund — or, above the coverage target, overflows to
+the buyback pool (G-40). The split applies in every coverage regime:
+an LP's yield is the premium for standing behind the book, not a fund
+top-up. Vaults also track per-shareholder holdings — the proof-of-claim
+ledger that backs proof-of-reserves entries and validates redemption
+ownership (a redemption burns only shares its redeemer holds).
+
+**Quote-balance interest (G-18 completion).** The quote currency's own
+utilization charge mirrors the non-quote collateral path:
+`ceil(min(positive cash, maintenance requirement) × daily bps)` at
+UTC day boundaries, routed through the same revenue router as every
+other fee income — there is exactly one money path into the venue
+pools. Idle cash pays nothing; negative balances pay nothing; the
+default rate is zero (enabling it is what the governance timelock
+exists to decide).
+
+**FIX transport (G-26 completion).** The session layer over the shipped
+codec: a framing accumulator that reassembles split TCP segments at
+the `10=XXX<SOH>` terminators; inbound sequence validation (exact-next
+delivers, ahead-of-sequence triggers a ResendRequest and buffers until
+the gap fills, PossDup-tagged stale messages drop silently, untagged
+regressions answer with a GapFill resync); an outbound message store
+whose resends replay application messages with their *original*
+sequence numbers and PossDup flag while administrative messages are
+covered by admin-run GapFills (the recovered stream carries state
+changes, never heartbeats); heartbeat/TestRequest liveness with
+deadline disconnects. Everything runs behind the `Wire` trait — an
+in-memory duplex for deterministic tests, a non-blocking `TcpStream`
+adapter and threaded acceptor for deployment. Time enters only through
+the explicit `now_ms` of `pump`, the same determinism discipline the
+engine uses.
+
+**Proof-of-reserves (G-35).** The engine exposes the liability
+projection (`por_liabilities`: positive quote cash, non-quote
+collateral at full oracle value, vault share claims at NAV — the
+pre-haircut claim set, because the haircut is the venue's risk buffer,
+not the customer's). The settlement layer commits it:
+`build_report_from_rows` builds the nonce-bound merkle tree (the nonce
+hashed into every leaf makes every publication unique and
+replay-proof), returns the report and per-account inclusion proofs,
+and binds the two with a commitment hash for on-chain publication.
+A monotonic `PorLedger` orders the publication history (nonce and
+timestamp strictly increase — withheld or reordered reports are
+detectable by comparing ledgers), and the `ReserveAttestor` trait is
+where wallet sign-overs, custodian letters, and auditor statements
+plug in. Publication is deliberately a settlement-layer act: it reads
+engine state and never mutates it — a projection, not a transaction,
+so replay determinism is untouched.
+
 ## Known simplifications
 
 Honest scope boundaries, each isolated behind a typed interface. Items
@@ -410,11 +484,15 @@ closed (kept for the record):
   scope for a reference engine: actual network transports (TCP/TLS/
   WebSocket hosts), key custody, and chain integrations — the library
   is the deterministic core those hosts drive.
-- **Fee volume decay is fixed-rate.** The 30-day window slides at ~1/90
-  per funding interval rather than being recomputed from a time-indexed
-  ledger.
-- **Vault revenue routing defaults off.** Vault mechanics (G-16) ship;
-  the insurance-allocation share that would credit them defaults to
-  zero until governance sets it.
-- **FIX transport.** The codec and typed subset (G-26) ship; sequence
-  persistence and session recovery belong to the gateway host.
+- ~~**Fee volume decay is fixed-rate.**~~ Closed by G-22: the exact
+  day-bucketed 30-day volume ledger.
+- ~~**Vault revenue routing defaults off.**~~ Closed by the G-16 wiring:
+  every routed insurance allocation splits through the vaults by their
+  configured bps; what defaults to zero is each vault's *share* (the
+  operator's choice at vault creation), not the machinery.
+- ~~**FIX transport.**~~ Closed by G-26's session layer: framing,
+  sequence integrity, resend/GapFill recovery, heartbeats, and the TCP
+  acceptor. What still belongs to a deployment host: TLS termination
+  and session-state persistence across process restarts.
+- ~~**No proof-of-reserves.**~~ Closed by G-35: liability trees,
+  per-account proofs, monotonic publication, attestation hook.

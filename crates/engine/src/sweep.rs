@@ -89,6 +89,11 @@ pub(crate) fn plan_tick(engine: &Engine, now: TimestampMs) -> Vec<Event> {
     // 6b. Auto-listing + everlasting rebase (G-34/G-03).
     events.extend(crate::listing::plan_auto_listing(engine, now));
 
+    // 6c. MM tier review (G-15): closes the window BEFORE this tick's
+    // samples are scored, so the closing tick's quotes count toward the
+    // *next* window instead of being drained with the old one.
+    events.extend(crate::mm::plan_mm_review(engine, now));
+
     // 7. Liquidity scoring and rewards.
     events.extend(plan_liquidity(engine, now, &marks));
 
@@ -105,6 +110,10 @@ pub(crate) fn plan_tick(engine: &Engine, now: TimestampMs) -> Vec<Event> {
 
     // 7d. Collateral interest accrual (G-18, daily boundaries).
     events.extend(plan_collateral_interest(engine, now));
+
+    // 7d2. Quote-balance interest (G-18 completion): the quote
+    // currency's own utilization charge, same day-boundary rule.
+    events.extend(crate::mm::plan_quote_interest(engine, now));
 
     // 7e. Insurance inventory: mark to market, rebalance drips (G-23).
     if let Some(marks) = &marks {
@@ -714,6 +723,7 @@ fn plan_liquidity(
                     size_lots: resting.visible_qty(),
                     spread_bps,
                     two_sided: has_other_side,
+                    side: resting.order.side,
                 });
             }
         }

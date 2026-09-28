@@ -19,6 +19,7 @@ poc-economics = { path = "../economics" }
 poc-margin = { path = "../margin" }
 poc-risk = { path = "../risk" }
 poc-engine = { path = "../engine" }
+poc-settlement = { path = "../settlement" }
 
 [lints]
 workspace = true

@@ -13,11 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 poc-core = { path = "../core" }
+poc-economics = { path = "../economics" }
 poc-engine = { path = "../engine" }
 poc-oracle = { path = "../oracle" }
 poc-margin = { path = "../margin" }
 poc-persist = { path = "../persist" }
 poc-settlement = { path = "../settlement" }
+poc-api = { path = "../api" }
 
 [lints]
 workspace = true

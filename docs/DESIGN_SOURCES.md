@@ -191,3 +191,52 @@ the live index per expiry tenor.
 band relative to strike spacing, the sweep lists the missing strikes (journaled
 `MarketListed` events), and for **everlasting** options, the daily strike-rebase ladder
 (G-03, Everstrike pattern) keeps contracts near the money.
+
+
+## Wave 4 sources (final closure)
+
+**MM tier program (G-15). From Deribit's market-maker program (via
+benchmark) and Aevo's tiered benefits:** makers earn fee discounts for
+*continuous quoting obligations* (uptime within a spread band at a
+minimum size), measured — never self-reported — and re-earned at every
+review. **Resolution:** obligations are evaluated per sampled tick on
+the *worst* side (a two-sided quote is only as tight as its wider leg);
+the same randomized liquidity sampler that drives reward payouts (G-39)
+feeds the tier ledger — one measurement, two incentive systems, no
+double-counting; discounts compose *after* the volume ladder and are
+capped at 50%.
+
+**Vault revenue share (G-16). From Lyra v2 / Thales SAFE-shaped
+underwriter pools:** depositors share the yield of the backstop they
+provide. **Resolution:** each vault's configured bps of every routed
+insurance allocation is credited pro-rata at apply time (deterministic
+ascending-id order, never exceeding the allocation); the split applies
+in every coverage regime — an LP's yield is not a fund top-up.
+
+**FIX transport (G-26). From FIX 4.4 (the institutional wire) and
+Deribit's FIX gateway:** sequence integrity, PossDup-tagged resends,
+GapFill for administrative messages, TestRequest liveness. **Resolution
+beyond the spec's minimum:** ahead-of-sequence messages buffer until the
+gap fills (not just dropped); the outbound store covers evicted ranges
+with a leading GapFill so recovery never loops; everything is driven
+through the `Wire` trait with an in-memory duplex for deterministic
+tests and a real TCP acceptor for deployment.
+
+**Proof-of-reserves (G-35). From Hyperliquid's PoR culture and the
+merkle-liability pattern shared by exchange audits:** commit the whole
+liability set, let every customer verify their leaf, attest reserves
+externally. **Resolution:** the nonce is hashed into every leaf
+(publication replay-proof and auditor-verifiable); liabilities are
+pre-haircut (the customer's claim, not the venue's risk buffer);
+vault share claims enter at NAV (the per-shareholder holdings added for
+exactly this); the `ReserveAttestor` trait is the integration point for
+wallet sign-overs and custodian letters; publication is a
+settlement-layer projection, never an engine mutation.
+
+**Quote-balance interest (G-18). From BitMEX's historical balance
+interest and the utilization principle of the collateral charge:**
+charge what the margin system actually uses, not what the customer
+holds. **Resolution:** `ceil(min(positive cash, maintenance) × bps)` per
+UTC day, routed through the same revenue router as every other fee
+income; default zero — enabling it is a governance decision the timelock
+exists to make.
