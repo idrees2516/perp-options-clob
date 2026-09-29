@@ -295,3 +295,96 @@ other fee income — no parallel money path exists.
 *Tests:* `quote_interest_charges_only_utilized_cash` (idle exemption,
 single charge per day, conservation through routing, replay),
 `quote_interest_ceils_against_the_holder` unit test.
+
+## American exercise (v0.6)
+
+### I-32 Exercise settles only what the position can stand
+`settled_lots = min(requested_lots, long position at settle)`, clamped
+again to total short size — exercise can never over-settle, open
+positions the account does not hold, or unbalance the ledger.
+*Enforcement:* `exercise.rs::plan_american_exercises` (the clamp is
+computed from live state at settlement, not at request).
+*Tests:* `exercised_lots_capped_by_position_at_settle`,
+`exercise_requires_a_long_position`.
+
+### I-33 Assignment is exact pro-rata (zero-sum through settlement)
+Short assignment distributes settled lots pro-rata by short size with
+exact largest-remainder completion: `Σ assignment.lots == settled_lots`
+always. The position ledger stays zero-sum through the exercise event
+and cash flows only as (intrinsic − entry) realization plus the fee.
+*Enforcement:* largest-remainder allocation with deterministic ties
+(subaccount id ascending); `Σ frac < n` bounds the remainder pass.
+*Tests:* `exercise_lifecycle_with_pro_rata_assignment` (2:1 split,
+exact cash economics, conservation to the minor unit).
+
+### I-34 Exercise strikes on a TWAP, never a spot print
+Intrinsic is struck on the oracle TWAP of the window ending at
+`settle_at`; if the TWAP is not computable the request defers one
+window rather than settling on a degraded price.
+*Enforcement:* `plan_american_exercises` (TWAP lookup + `ExerciseDeferred`).
+*Tests:* `settlement_on_sparse_oracle_never_drops` (step-TWAP
+forward-hold verified; no-drop guarantee asserted).
+
+### I-35 Only American markets can be exercised
+European markets reject the exercise command at the plan gate; expired
+dated markets reject it; halted underlyings reject it.
+*Enforcement:* `plan_exercise` validation ladder.
+*Tests:* `european_markets_reject_exercise`,
+`exercise_requires_a_long_position`.
+
+### I-36 Zero-rate style equivalence (migration safety)
+Under the venue's default carry convention (`risk_free_rate = 0`,
+`b = r`), the American mark equals the European mark exactly, and the
+American implied-vol inversion coincides with the European one —
+flipping a market's style moves no marks, no surface, no margin.
+*Enforcement:* BAW collapses to the European pricer at `r ≤ 0 && b ≤ 0`
+and at `b ≥ r` for calls (Merton).
+*Tests:* `american_mark_equals_european_at_zero_rate`,
+`zero_rate_collapses_to_european`, `american_inversion_matches_european_at_zero_rate`.
+
+## Channel book (v0.6)
+
+### I-37 Channel aggregates never drift
+Every channel's cached `visible_total`/`live` equals the sum of its
+live slots' quantities, and every level's cached totals equal the sum of
+its channels' — the O(1) aggregate queries are only trustworthy because
+the caches are contractual, not advisory.
+*Enforcement:* `LimitOrderBook::invariants_hold` walks and re-derives
+every aggregate; run after every property-test step.
+*Tests:* `channels_pack_eight_deep`,
+`tombstone_cancel_keeps_aggregates_honest`,
+`interleaved_cancel_fill_churn_keeps_channels_tight`,
+`partial_fill_shrinks_aggregate_in_place`.
+
+### I-38 Arrivals land behind live orders (price-time priority)
+A pushed order is appended strictly after the last live slot of the
+tail channel; tombstone gaps are never filled. Iceberg reslicing
+(remove + push) therefore re-queues at the level's back — never
+resurrects inside its old slot to leapfrog competitors.
+*Enforcement:* `Channel::push` tail-append rule.
+*Tests:* `iceberg_requeue_moves_to_channel_back`,
+`iceberg_reslice_requeues_at_back`, FIFO priority tests.
+
+### I-39 No orphan slots, no double slots
+Every resting order occupies exactly one channel slot; every live slot
+references an order in the venue map at the correct level and side.
+*Enforcement:* `invariants_hold` uniqueness walk.
+*Tests:* the churn test; the full orderbook suite.
+
+### I-40 The uncross maximizes executable volume at a uniform price
+Auction clearing picks the volume-maximizing candidate level (ties:
+toward the indicative mid, then lower), and every fill prints at that
+one price; the prefix-sum implementation must agree with the naive
+candidate scan on every book.
+*Enforcement:* `uncross` prefix-sum curves + differential tests.
+*Tests:* `uncross_prefix_sums_match_naive_clearing` (25 randomized
+books), auction suite in `poc-engine`.
+
+### I-41 The book commitment is a replay function
+`BookCommitment::capture` is a pure function of engine state in
+canonical order: engines that replayed the same journal produce the
+identical root, and any matching divergence changes it.
+*Enforcement:* canonical iteration (symbol order, id order) +
+domain-separated SHA-256 chain.
+*Tests:* `replayed_engines_agree_bit_for_bit`,
+`commitment_captures_fills_and_cancels`.

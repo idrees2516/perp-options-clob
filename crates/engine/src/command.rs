@@ -224,6 +224,22 @@ pub enum Command {
         /// Engine wall-clock.
         now: TimestampMs,
     },
+    /// Tender a long American option position for early exercise.
+    ///
+    /// The request parks until `requested_at + settlement_twap_ms`, then
+    /// settles on the TWAP of that window: the long closes at TWAP
+    /// intrinsic (minus the exercise fee) and matching short positions
+    /// are assigned pro-rata. European markets reject the command.
+    Exercise {
+        /// The tendering (long) subaccount.
+        subaccount: SubaccountId,
+        /// American option market.
+        symbol: Symbol,
+        /// Lots to exercise.
+        lots: u64,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
     /// Configure market-maker protection for (subaccount, currency).
     SetMmp {
         /// Protected subaccount.

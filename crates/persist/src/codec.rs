@@ -16,8 +16,9 @@
 //! safe.
 
 use poc_core::{
-    EverlastingParams, FundingParams, Instrument, OptionKind, OptionMarginParams, OptionMarket,
-    OptionVariant, OrderType, PerpMarket, SelfTradePrevention, Side, TimeInForce, TimestampMs,
+    AmericanParams, EverlastingParams, ExerciseStyle, FundingParams, Instrument, OptionKind,
+    OptionMarginParams, OptionMarket, OptionVariant, OrderType, PerpMarket, SelfTradePrevention,
+    Side, Symbol, TimeInForce, TimestampMs,
 };
 use poc_engine::{Command, OrderRequest, RfqLegCommand};
 
@@ -78,6 +79,12 @@ fn encode_option(e: &mut Encoder, m: &OptionMarket) {
     e.varint(u128::from(m.max_order_lots));
     e.varint(u128::from(m.margin.short_option_min_bps));
     e.varint(u128::from(m.margin.liquidation_fee_bps));
+    e.varint(match m.exercise_style {
+        ExerciseStyle::European => 0,
+        ExerciseStyle::American => 1,
+    });
+    e.varint(u128::from(m.american.settlement_twap_ms));
+    e.varint(u128::from(m.american.exercise_fee_bps));
 }
 
 /// Decode an instrument (must consume the whole buffer).
@@ -155,6 +162,13 @@ fn decode_option(d: &mut Decoder<'_>) -> Result<OptionMarket, DecodeError> {
     let max_order_lots = d.u64()?;
     let short_option_min_bps = d.u64()?;
     let liquidation_fee_bps = d.u64()?;
+    let exercise_style = match d.varint()? {
+        0 => ExerciseStyle::European,
+        1 => ExerciseStyle::American,
+        other => return Err(DecodeError::UnknownTag(other as u8)),
+    };
+    let settlement_twap_ms = d.u64()?;
+    let exercise_fee_bps = d.u64()?;
     Ok(OptionMarket {
         symbol,
         base_symbol,
@@ -175,6 +189,11 @@ fn decode_option(d: &mut Decoder<'_>) -> Result<OptionMarket, DecodeError> {
         margin: OptionMarginParams {
             short_option_min_bps,
             liquidation_fee_bps,
+        },
+        exercise_style,
+        american: AmericanParams {
+            settlement_twap_ms,
+            exercise_fee_bps,
         },
     })
 }
@@ -751,6 +770,18 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
             e.varint(u128::from(*delta_limit_lots));
             e.varint(u128::from(*now));
         }
+        Command::Exercise {
+            subaccount,
+            symbol,
+            lots,
+            now,
+        } => {
+            e.varint(60);
+            e.varint(u128::from(*subaccount));
+            e.str(symbol);
+            e.varint(u128::from(*lots));
+            e.varint(u128::from(*now));
+        }
         Command::SetCod {
             subaccount,
             enabled,
@@ -1160,6 +1191,12 @@ pub fn decode_command(data: &[u8]) -> Result<Command, DecodeError> {
         }
         30 => Command::MmTierEnroll {
             subaccount: d.u64()?,
+            now: d.u64()?,
+        },
+        60 => Command::Exercise {
+            subaccount: d.u64()?,
+            symbol: Symbol::from(d.str()?),
+            lots: u64::try_from(d.varint()?).unwrap_or(0),
             now: d.u64()?,
         },
         23 => Command::ConvertCollateral {

@@ -41,7 +41,7 @@ use std::fmt;
 
 use poc_core::num::mul_div_floor;
 use poc_core::{Symbol, TimestampMs};
-use poc_margin::{Flavour, OptionAnalytics};
+use poc_margin::{AmericanAnalytics, Flavour, OptionAnalytics};
 
 /// Milliseconds per year for the ms→years conversion (365-day convention,
 /// mirroring poc-engine exactly so surface IVs and engine marks share one
@@ -279,6 +279,74 @@ impl VolSurface {
         ask_lots: u64,
         now: TimestampMs,
     ) {
+        self.observe_inner(
+            symbol,
+            spot_quote_minor,
+            strike_quote_minor,
+            is_call,
+            tte_ms,
+            bid_quote_minor,
+            ask_quote_minor,
+            bid_lots,
+            ask_lots,
+            now,
+            false,
+        );
+    }
+
+    /// American-quote observation: identical gating, but the mid premium
+    /// is inverted through the Barone-Adesi-Whaley American pricer
+    /// instead of Black-Scholes.
+    #[allow(clippy::too_many_arguments)]
+    ///
+    /// At the crate's zero-rate convention the two inversions coincide
+    /// exactly (early exercise is worthless when `r = 0`, `b = 0` — a
+    /// property the tests assert), so this flag is a correctness rail for
+    /// the day the surface carries a non-zero rate: American quotes must
+    /// never be inverted through the European curve.
+    pub fn observe_american(
+        &mut self,
+        symbol: &str,
+        spot_quote_minor: u128,
+        strike_quote_minor: u128,
+        is_call: bool,
+        tte_ms: u128,
+        bid_quote_minor: u128,
+        ask_quote_minor: u128,
+        bid_lots: u64,
+        ask_lots: u64,
+        now: TimestampMs,
+    ) {
+        self.observe_inner(
+            symbol,
+            spot_quote_minor,
+            strike_quote_minor,
+            is_call,
+            tte_ms,
+            bid_quote_minor,
+            ask_quote_minor,
+            bid_lots,
+            ask_lots,
+            now,
+            true,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe_inner(
+        &mut self,
+        symbol: &str,
+        spot_quote_minor: u128,
+        strike_quote_minor: u128,
+        is_call: bool,
+        tte_ms: u128,
+        bid_quote_minor: u128,
+        ask_quote_minor: u128,
+        bid_lots: u64,
+        ask_lots: u64,
+        now: TimestampMs,
+        american: bool,
+    ) {
         let cfg = self.config;
         let Some(m) = self.markets.get_mut(symbol) else {
             return; // unregistered: nothing to mark
@@ -300,9 +368,16 @@ impl VolSurface {
             return;
         };
         let mid = sum / 2;
-        // Gate 3 — Black-76 inversion.
-        let Some(book_iv) = book_iv_bps(spot_quote_minor, strike_quote_minor, is_call, tte_ms, mid)
-        else {
+        // Gate 3 — Black-76 inversion (European) or BAW inversion
+        // (American), by exercise style.
+        let Some(book_iv) = book_iv_bps(
+            spot_quote_minor,
+            strike_quote_minor,
+            is_call,
+            tte_ms,
+            mid,
+            american,
+        ) else {
             return;
         };
         // Gate 4 — sanity band around the anchor.
@@ -442,18 +517,30 @@ fn book_iv_bps(
     is_call: bool,
     tte_ms: u128,
     mid_premium_quote_minor: u128,
+    american: bool,
 ) -> Option<u64> {
     let flavour = if is_call { Flavour::Call } else { Flavour::Put };
-    let iv = OptionAnalytics::implied_vol(
-        flavour,
-        spot_quote_minor as f64,
-        strike_quote_minor as f64,
-        tau_years_from_ms(tte_ms),
-        0.0,
-        mid_premium_quote_minor as f64,
-    )
-    .ok()?;
-    iv_fraction_to_bps(iv)
+    let solved = if american {
+        AmericanAnalytics::implied_vol(
+            flavour,
+            spot_quote_minor as f64,
+            strike_quote_minor as f64,
+            tau_years_from_ms(tte_ms),
+            0.0,
+            0.0,
+            mid_premium_quote_minor as f64,
+        )
+    } else {
+        OptionAnalytics::implied_vol(
+            flavour,
+            spot_quote_minor as f64,
+            strike_quote_minor as f64,
+            tau_years_from_ms(tte_ms),
+            0.0,
+            mid_premium_quote_minor as f64,
+        )
+    };
+    iv_fraction_to_bps(solved.ok()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,5 +1213,28 @@ mod tests {
         assert_eq!(iv_fraction_to_bps(0.550_06), Some(5_501));
         assert_eq!(iv_fraction_to_bps(f64::NAN), None);
         assert_eq!(iv_fraction_to_bps(-0.1), None);
+    }
+
+    #[test]
+    fn american_inversion_matches_european_at_zero_rate() {
+        // r = 0, b = 0: early exercise is worthless, so the American
+        // and European inversions of the same mid premium agree exactly.
+        let p = premium_at(SPOT, STRIKE, true, 0.44);
+        let mut amer = surface(5_000);
+        amer.observe_american(SYM, SPOT, STRIKE, true, TTE_MS, p, p, 10, 10, 1_000);
+        let mut eur = surface(5_000);
+        eur.observe(SYM, SPOT, STRIKE, true, TTE_MS, p, p, 10, 10, 1_000);
+        let a = amer.mark_iv_bps(SYM).unwrap();
+        let e = eur.mark_iv_bps(SYM).unwrap();
+        assert_eq!(a, e, "zero-rate inversions must coincide: {a} vs {e}");
+    }
+
+    #[test]
+    fn american_inversion_gates_like_european() {
+        // Thin one-sided books are ignored identically under both styles.
+        let p = premium_at(SPOT, STRIKE, true, 0.44);
+        let mut s = surface(5_000);
+        s.observe_american(SYM, SPOT, STRIKE, true, TTE_MS, p, p, 0, 10, 1_000);
+        assert!(s.surface(SYM).unwrap().last_book_ts.is_none());
     }
 }

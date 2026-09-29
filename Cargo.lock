@@ -121,6 +121,7 @@ version = "0.1.0"
 dependencies = [
  "poc-core",
  "poc-engine",
+ "poc-orderbook",
 ]
 
 [[package]]

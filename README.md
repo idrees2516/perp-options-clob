@@ -1,13 +1,14 @@
 # perp-options-clob
 
-A **perpetuals + options central limit order book** engine in Rust: the
+A **perpetuals + American-style options central limit order book** engine
+in Rust (zkLighter-style channel matching): the
 matching core, portfolio margin, oracle defense, funding economics, and
 liquidation cascade of a production venue — as a deterministic, replayable,
 event-sourced library.
 
 ```
 cargo run -p poc-demo               # watch a full session: quoting → trading → funding → crash → liquidation → expiry → MM tiers → vault revenue → proof-of-reserves
-cargo test --workspace              # 332 unit + integration + property tests, journal-replay determinism included
+cargo test --workspace              # 370 unit + integration + property tests, journal-replay determinism included
 cargo run --release -p poc-bench -- micro    # benchmarks (docs/BENCHMARKS.md)
 cargo run --release -p poc-bench -- stress    # architecture stress scenarios (docs/STRESS_TESTING.md)
 ```
@@ -99,11 +100,26 @@ use.
 
 ## Marks never listen to the book
 
-The perp mark is the oracle spot; the option mark is Black-Scholes at the
-oracle spot with a configured IV. A book-derived mark would let one large
-order move every account's margin — circularity and a manipulation
-vector. The order book influences the system only through the funding
-premium (BBO-mid TWAP vs index TWAP), where clamps bound its power.
+The perp mark is the oracle spot; the option mark is the theoretical
+value (Black-Scholes for European, Barone-Adesi-Whaley for American)
+at the oracle spot with the governed surface's IV. A book-derived mark
+would let one large order move every account's margin — circularity
+and a manipulation vector. The order book influences the system only
+through the funding premium (BBO-mid TWAP vs index TWAP), where clamps
+bound its power.
+
+## American options
+
+Every option market carries an explicit exercise style. **American**
+markets add the early-exercise right: the holder tenders any portion of
+a long position (`Command::Exercise`), the request parks for a TWAP
+window (30-minute default), settles at the window's TWAP intrinsic
+minus a 5 bp fee, and matching short positions are assigned **pro-rata
+with exact largest-remainder distribution** — `Σ assigned == settled`,
+so the position ledger stays zero-sum through settlement. American
+marks price through BAW; at the venue's default zero-rate convention
+they equal European marks exactly (asserted by test). Deep dive:
+[`docs/OPTIONS.md`](docs/OPTIONS.md).
 
 ## Determinism
 
@@ -187,6 +203,44 @@ register, with design choices taken from live competitor documentation
 Test suite: **181 passing** (was 123). Replay determinism extends to the new
 subsystems — see `new_features_replay_bit_for_bit`.
 
+## September 2026 — American Options & Channel Book Release (v0.6)
+
+This release makes the option family complete and rebuilds the
+matching core for throughput and provability:
+
+- **American-style exercise** — `ExerciseStyle` on every option market
+  (European default, American opt-in): tender → TWAP window →
+  settlement at window-TWAP intrinsic, pro-rata short assignment with
+  exact largest-remainder distribution, exercise fee through the
+  revenue router, deferral on degraded oracles, and same-sweep
+  liquidation handling of assigned shorts. Works for both dated and
+  everlasting American markets.
+- **American pricing suite** (`poc-margin::american`) — Barone-Adesi-
+  Whaley quadratic approximation (bracketed-bisection boundary solve),
+  Merton perpetual closed form (the everlasting τ→∞ anchor), American
+  implied-vol inversion, and a CRR binomial referee validating BAW
+  against 2,000-step trees.
+- **zkLighter channel orderbook** — every price level is now a chain of
+  8-slot channels with cached aggregates: O(1) touch sizes and
+  O(levels) depth (the vol-surface observation path dropped from
+  O(orders) to O(1)), tombstone cancels, bounded per-step matching
+  work, and a lazy early-terminating match walk. A taker that fills at
+  the touch of a 2,000-order book costs **485 ns p50 — less than the
+  old eager walk against 200 orders (506 ns)**.
+- **Prefix-sum auction uncrossing** — the uniform-price call auction
+  evaluates candidate prices in O(log L); 10,000 auction orders across
+  121 levels uncross (with full journaling) in 9.1 ms.
+  Differential-tested against a naive scan.
+- **Provable book state** (`poc-settlement::books`) — SHA-256 hash
+  chain over every resting order in canonical order; replayed engines
+  agree bit-for-bit, any matching divergence changes the root.
+- **Style-aware margin and surface** — the SFPM scenario grid reprices
+  American legs through BAW; the vol surface inverts American quotes
+  through the BAW curve.
+
+Test suite: **370 passing** (was 332). Clippy clean under the CI
+profile, rustfmt clean.
+
 ## September 2026 — Final Gap-Closure Release (v0.5, wave 4)
 
 The last five items of the register close:
@@ -233,7 +287,12 @@ asserting conservation, replay determinism, and tier legality (I-27).
 | Doc | Contents |
 |---|---|
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | The full system: determinism model, order lifecycle, marks, margin, liquidations, funding, fees, settlement, persistence, gateway, governance, and the fourth-wave subsystems |
-| [`docs/INVARIANTS.md`](docs/INVARIANTS.md) | The invariant catalog (I-1..I-31) with enforcement points and the tests that guard each |
+| [`docs/CLOB_ENGINE.md`](docs/CLOB_ENGINE.md) | **Deep dive**: the channel-layout matching engine — data structures, algorithms, auction uncrossing, determinism/provability, performance |
+| [`docs/OPTIONS.md`](docs/OPTIONS.md) | **Deep dive**: the option family — European/American × dated/everlasting, BAW/Merton pricing, the exercise lifecycle, assignment, margin treatment |
+| [`docs/research/ZKLIGHTER.md`](docs/research/ZKLIGHTER.md) | zkLighter research: what we adopted (channels, bounded work, provable state), adapted, and deferred |
+| [`docs/research/DERIVE_V3.md`](docs/research/DERIVE_V3.md) | Derive V3: the journal/replay discipline, sub-account margin, MMP/CoD, exercise-margin interaction |
+| [`docs/research/TRADE_PARADIGM_PARADEX.md`](docs/research/TRADE_PARADIGM_PARADEX.md) | Paradigm's RFQ network + Paradex's everlasting/margin design and how they compose here |
+| [`docs/INVARIANTS.md`](docs/INVARIANTS.md) | The invariant catalog (I-1..I-45) with enforcement points and the tests that guard each |
 | [`docs/ECONOMICS.md`](docs/ECONOMICS.md) | The complete economic incentive design: who pays whom, why, and under which caps |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Deployment shape, monitoring surfaces, runbooks, and the safety-parameter reference |
 | [`docs/FUZZING.md`](docs/FUZZING.md) | Property + fuzz strategy, and the three real defects it found (oracle liveness, ADL inversion, fee-routing leak) |

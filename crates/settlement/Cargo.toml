@@ -10,6 +10,7 @@ description = "On-chain settlement layer for the perp-options-clob: merkleized s
 [dependencies]
 poc-core = { path = "../core" }
 poc-engine = { path = "../engine" }
+poc-orderbook = { path = "../orderbook" }
 
 [lints]
 workspace = true

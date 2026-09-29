@@ -40,6 +40,7 @@
 //! proof-of-reserves liability leaves (`POC-POR`).
 
 pub mod batch;
+pub mod books;
 pub mod diff;
 pub mod exit;
 pub mod hash;
@@ -48,6 +49,7 @@ pub mod por;
 pub mod state;
 
 pub use batch::{build_batch, validate_batch, validate_chain, SettlementBatch, ValidationError};
+pub use books::{BookCommitment, BookEntry};
 pub use diff::StateCapture;
 pub use exit::{ExitQueue, WithdrawalIntent};
 pub use por::{

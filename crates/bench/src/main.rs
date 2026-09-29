@@ -449,6 +449,196 @@ fn micro() {
         }
         stats("FIX session lifecycle (logon+order+logout)", &mut samples);
     }
+
+    // 9. zkLighter channel book: deep-book takers with early termination.
+    {
+        const N: usize = 20_000;
+        let mut e = setup_engine(8);
+        // 100 ask levels x 20 orders each = 2,000 resting orders.
+        for level in 0..100_u64 {
+            for j in 0..20_u64 {
+                e.process(Command::Place {
+                    request: OrderRequest::limit(
+                        1 + ((level + j) % 8),
+                        "BTC-PERP",
+                        Side::Ask,
+                        79_500 + level,
+                        5,
+                    ),
+                    now: 2_000,
+                });
+            }
+        }
+        let mut samples = Vec::with_capacity(N);
+        for i in 0..N {
+            let t = Instant::now();
+            // Taker fills 3 lots at the touch: the walk terminates at the
+            // first level (channel laziness), never paying for the 99
+            // levels behind it.
+            e.process(Command::Place {
+                request: OrderRequest::limit(9 - (i % 8) as u64, "BTC-PERP", Side::Bid, 79_500, 3),
+                now: 3_000 + i as u64,
+            });
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("taker vs 2000-order deep book (lazy)", &mut samples);
+    }
+
+    // 10. Auction uncross at scale (prefix-sum clearing).
+    {
+        let mut e = setup_engine(8);
+        e.process(Command::BeginAuction {
+            symbol: "BTC-PERP".into(),
+            uncross_at: 60_000,
+            now: 2_000,
+        });
+        // 5,000 auction orders across 60 levels on each side.
+        for i in 0..5_000_u64 {
+            let side = if i % 2 == 0 { Side::Bid } else { Side::Ask };
+            let price = if side == Side::Bid {
+                81_000 - (i % 60)
+            } else {
+                79_000 + (i % 60)
+            };
+            e.process(Command::Place {
+                request: OrderRequest::limit(1 + (i % 8), "BTC-PERP", side, price, 2),
+                now: 2_500,
+            });
+        }
+        let mut samples = Vec::with_capacity(1);
+        let t = Instant::now();
+        e.process(Command::Tick { now: 60_001 });
+        samples.push(t.elapsed().as_nanos() as u64);
+        stats("auction uncross (10k orders, 121 lvls)", &mut samples);
+    }
+
+    // 11. American analytics: BAW mark vs European BSM vs Merton perpetual.
+    {
+        use poc_margin::{AmericanAnalytics, Flavour, OptionAnalytics};
+        const N: usize = 50_000;
+        let mut samples = Vec::with_capacity(N);
+        for i in 0..N {
+            let m = (i % 60) as f64 / 100.0 - 0.3; // moneyness -30%..+30%
+            let s = 100_000_f64 * (1.0 + m);
+            let t = Instant::now();
+            let _ =
+                AmericanAnalytics::baw_price(Flavour::Put, s, 100_000.0, 0.25, 0.55, 0.03, 0.03);
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("BAW American mark (put, r=3%)", &mut samples);
+
+        for i in 0..N {
+            let m = (i % 60) as f64 / 100.0 - 0.3;
+            let s = 100_000_f64 * (1.0 + m);
+            let t = Instant::now();
+            let _ = OptionAnalytics::price(Flavour::Put, s, 100_000.0, 0.25, 0.55, 0.03);
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("European BSM mark (reference)", &mut samples);
+
+        for i in 0..N {
+            let m = (i % 60) as f64 / 100.0 - 0.3;
+            let s = 100_000_f64 * (1.0 + m);
+            let t = Instant::now();
+            let _ =
+                AmericanAnalytics::merton_perpetual(Flavour::Put, s, 100_000.0, 0.03, 0.03, 0.55);
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("Merton perpetual American (closed form)", &mut samples);
+    }
+
+    // 12. American exercise settlement sweep (queue + pro-rata assignment).
+    {
+        use poc_core::{AmericanParams, ExerciseStyle, OptionKind, OptionMarket, OptionVariant};
+        let mut e = setup_engine(64);
+        let opt = OptionMarket {
+            symbol: "BTC-AMER-80000-C".into(),
+            base_symbol: "BTC".into(),
+            kind: OptionKind::Call,
+            strike_quote_minor: 8_000_000,
+            expiry_ts_ms: 30 * 86_400_000,
+            variant: OptionVariant::Dated,
+            exercise_style: ExerciseStyle::American,
+            american: AmericanParams {
+                settlement_twap_ms: 60_000,
+                exercise_fee_bps: 5,
+            },
+            ..OptionMarket::default()
+        };
+        e.register_instrument(poc_core::Instrument::Option(opt));
+        for provider in ["pyth", "chainlink"] {
+            e.process(Command::OracleUpdate {
+                base_symbol: "BTC".into(),
+                provider: provider.into(),
+                ts: 1_000,
+                price_quote_minor: 10_000_000,
+            });
+        }
+        e.process(Command::Tick { now: 1_000 });
+        // One long (sub 64) buys 500 lots from 63 shorts.
+        let mut ask_id = 0_u64;
+        for sub in 1..=63_u64 {
+            e.process(Command::Place {
+                request: OrderRequest::limit(sub, "BTC-AMER-80000-C", Side::Ask, 48_000, 8),
+                now: 1_500,
+            });
+            ask_id += 1;
+        }
+        e.process(Command::Place {
+            request: OrderRequest::limit(64, "BTC-AMER-80000-C", Side::Bid, 48_000, 504),
+            now: 1_600,
+        });
+        let _ = ask_id;
+        e.process(Command::Exercise {
+            subaccount: 64,
+            symbol: "BTC-AMER-80000-C".into(),
+            lots: 504,
+            now: 2_000,
+        });
+        // Fill the TWAP window.
+        for dt in [20_000_u64, 40_000, 59_000] {
+            for provider in ["pyth", "chainlink"] {
+                e.process(Command::OracleUpdate {
+                    base_symbol: "BTC".into(),
+                    provider: provider.into(),
+                    ts: 2_000 + dt,
+                    price_quote_minor: 10_000_000,
+                });
+            }
+        }
+        let mut samples = Vec::with_capacity(1);
+        let t = Instant::now();
+        e.process(Command::Tick { now: 62_001 });
+        samples.push(t.elapsed().as_nanos() as u64);
+        stats("exercise settle (63 shorts pro-rata)", &mut samples);
+    }
+
+    // 13. Book commitment over a deep book.
+    {
+        let mut e = setup_engine(8);
+        for level in 0..50_u64 {
+            for j in 0..20_u64 {
+                e.process(Command::Place {
+                    request: OrderRequest::limit(
+                        1 + ((level + j) % 8),
+                        "BTC-PERP",
+                        Side::Bid,
+                        79_000 + level,
+                        4,
+                    ),
+                    now: 2_000,
+                });
+            }
+        }
+        let mut samples = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let t = Instant::now();
+            let c = poc_settlement::BookCommitment::capture(&e);
+            let _ = c.root;
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("book commitment (1000 resting orders)", &mut samples);
+    }
 }
 
 // ----------------------------------------------------------------------

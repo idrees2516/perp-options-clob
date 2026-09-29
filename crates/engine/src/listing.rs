@@ -87,6 +87,10 @@ pub struct OptionTemplate {
     pub margin: poc_core::OptionMarginParams,
     /// Everlasting roll parameters.
     pub everlasting: poc_core::EverlastingParams,
+    /// Exercise style of auto-generated markets (EUR or AMER).
+    pub exercise_style: poc_core::ExerciseStyle,
+    /// American early-exercise parameters.
+    pub american: poc_core::AmericanParams,
     /// Anchor IV for the governed surface, bps (55% → 5_500).
     pub anchor_iv_bps: u64,
 }
@@ -104,6 +108,8 @@ pub fn default_btc_template() -> OptionTemplate {
         max_order_lots: 10_000,
         margin: poc_core::OptionMarginParams::default(),
         everlasting: poc_core::EverlastingParams::default(),
+        exercise_style: poc_core::ExerciseStyle::European,
+        american: poc_core::AmericanParams::default(),
         anchor_iv_bps: 5_500,
     }
 }
@@ -213,6 +219,8 @@ fn build_market(
         strike_quote_minor: strike,
         expiry_ts_ms: expiry,
         variant,
+        exercise_style: t.exercise_style,
+        american: t.american,
         everlasting: t.everlasting,
         quote_decimals: t.quote_decimals,
         base_decimals: t.base_decimals,

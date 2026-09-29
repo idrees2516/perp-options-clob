@@ -269,32 +269,51 @@ pub struct OptionLegView {
     pub rate: f64,
     /// Call or put.
     pub flavour: Flavour,
+    /// Exercise style: American legs reprice with the early-exercise
+    /// premium (BAW), European legs with plain Black-Scholes. Under the
+    /// venue's carry convention (`b = r`, no dividends) the two coincide
+    /// while `r = 0`, so the default configuration is migration-safe.
+    pub american: bool,
 }
 
 impl OptionLegView {
+    /// Price under this leg's exercise style at an arbitrary spot and IV.
+    #[must_use]
+    fn price_under_style(&self, spot: f64, iv: f64) -> f64 {
+        if self.american {
+            crate::american::AmericanAnalytics::baw_price(
+                self.flavour,
+                spot,
+                self.strike,
+                self.tau_years,
+                iv,
+                self.rate,
+                self.rate, // b = r: non-dividend carry convention
+            )
+        } else {
+            OptionAnalytics::price(
+                self.flavour,
+                spot,
+                self.strike,
+                self.tau_years,
+                iv,
+                self.rate,
+            )
+        }
+    }
+
     /// Current mark value per `1.0` base unit.
     #[must_use]
     pub fn mark(&self) -> f64 {
-        OptionAnalytics::price(
-            self.flavour,
-            self.spot,
-            self.strike,
-            self.tau_years,
-            self.iv,
-            self.rate,
-        )
+        self.price_under_style(self.spot, self.iv)
     }
 
     /// Value under a shocked spot and vol.
     #[must_use]
     pub fn reprice(&self, spot_shock: f64, vol_shock: f64) -> f64 {
-        OptionAnalytics::price(
-            self.flavour,
+        self.price_under_style(
             (self.spot * (1.0 + spot_shock)).max(1e-12),
-            self.strike,
-            self.tau_years,
             (self.iv * (1.0 + vol_shock)).max(0.0),
-            self.rate,
         )
     }
 }
@@ -391,10 +410,37 @@ mod tests {
             iv: 0.4,
             rate: 0.0,
             flavour: Flavour::Call,
+            american: false,
         };
         let base = leg.mark();
         assert!(leg.reprice(0.10, 0.0) > base, "up-spot helps long call");
         assert!(leg.reprice(0.0, 0.10) > base, "up-vol helps long call");
         assert!(leg.reprice(-0.10, -0.50) < base);
+    }
+
+    #[test]
+    fn american_leg_dominates_european_leg() {
+        // r > 0: an American put leg marks above the European leg.
+        let euro = OptionLegView {
+            spot: 90.0,
+            strike: 100.0,
+            tau_years: 0.5,
+            iv: 0.3,
+            rate: 0.05,
+            flavour: Flavour::Put,
+            american: false,
+        };
+        let amer = OptionLegView {
+            american: true,
+            ..euro
+        };
+        assert!(
+            amer.mark() > euro.mark(),
+            "american {} must exceed european {}",
+            amer.mark(),
+            euro.mark()
+        );
+        // Scenario repricing stays monotone in the adverse shock.
+        assert!(amer.reprice(-0.20, 0.0) > amer.mark());
     }
 }

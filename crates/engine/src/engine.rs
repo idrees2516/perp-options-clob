@@ -220,6 +220,8 @@ pub struct EngineStats {
     pub funding_intervals: u64,
     /// Options settled at expiry.
     pub options_settled: u64,
+    /// American early exercises settled.
+    pub exercises_settled: u64,
     /// Liquidation closures executed.
     pub liquidations: u64,
     /// ADL executions.
@@ -281,6 +283,10 @@ pub struct Engine {
     /// Open auctions per symbol: uncross deadline (G-12). Presence = the
     /// book accumulates without matching.
     pub(crate) auctions: BTreeMap<Symbol, TimestampMs>,
+    /// Parked American early-exercise requests by id (AMER exercise).
+    pub(crate) exercises: BTreeMap<u64, crate::exercise::ExerciseRequest>,
+    /// Next exercise request id (monotonic, deterministic).
+    pub(crate) next_exercise_id: u64,
     /// Non-quote collateral balances per subaccount (G-17):
     /// currency code → minor units.
     pub(crate) collateral: BTreeMap<SubaccountId, BTreeMap<String, u128>>,
@@ -321,6 +327,7 @@ pub struct Engine {
     pub(crate) notional_traded: u128,
     pub(crate) funding_intervals: u64,
     pub(crate) options_settled: u64,
+    pub(crate) exercises_settled: u64,
     pub(crate) liquidations: u64,
     pub(crate) adls: u64,
 }
@@ -381,6 +388,8 @@ impl Engine {
             cascade_suspended_until: 0,
             liq_window: std::collections::VecDeque::new(),
             auctions: BTreeMap::new(),
+            exercises: BTreeMap::new(),
+            next_exercise_id: 1,
             collateral: BTreeMap::new(),
             oco_groups: BTreeMap::new(),
             next_oco_id: 1,
@@ -400,6 +409,7 @@ impl Engine {
             notional_traded: 0,
             funding_intervals: 0,
             options_settled: 0,
+            exercises_settled: 0,
             liquidations: 0,
             adls: 0,
         }
@@ -660,6 +670,12 @@ impl Engine {
                 amount_quote_minor,
             } => self.plan_withdraw(*subaccount, *amount_quote_minor),
             Command::Place { request, now } => self.plan_place(request, *now),
+            Command::Exercise {
+                subaccount,
+                symbol,
+                lots,
+                now,
+            } => crate::exercise::plan_exercise(self, *subaccount, symbol, *lots, *now),
             Command::Cancel {
                 subaccount,
                 order_id,
@@ -1831,6 +1847,43 @@ impl Engine {
                 self.instruments.remove(symbol);
                 self.books.remove(symbol);
                 self.mark_samples.remove(symbol);
+                // Any exercise requests parked on the delisted market are
+                // consumed (the expiry settlement already closed the
+                // positions they referenced).
+                self.exercises.retain(|_, ex| ex.symbol != *symbol);
+            }
+            Event::ExerciseQueued {
+                request_id,
+                subaccount,
+                symbol,
+                lots,
+                requested_at,
+                settle_at,
+            } => {
+                self.exercises.insert(
+                    *request_id,
+                    crate::exercise::ExerciseRequest {
+                        id: *request_id,
+                        subaccount: *subaccount,
+                        symbol: symbol.clone(),
+                        lots: *lots,
+                        requested_at: *requested_at,
+                        settle_at: *settle_at,
+                    },
+                );
+                self.next_exercise_id = self.next_exercise_id.max(*request_id + 1);
+            }
+            Event::OptionExercised(ex) => {
+                self.apply_exercise(ex);
+            }
+            Event::ExerciseRejected { .. } => {}
+            Event::ExerciseDeferred {
+                request_id,
+                new_settle_at,
+            } => {
+                if let Some(req) = self.exercises.get_mut(request_id) {
+                    req.settle_at = *new_settle_at;
+                }
             }
             Event::LiquidityScored { observations } => {
                 for obs in observations {
@@ -2113,18 +2166,33 @@ impl Engine {
             }
             Event::BreakerReleased { .. } => {}
             Event::SurfaceObserved(obs) => {
-                self.vol_surface.observe(
-                    &obs.symbol,
-                    obs.spot_quote_minor,
-                    obs.strike_quote_minor,
-                    obs.is_call,
-                    obs.tte_ms,
-                    obs.bid_quote_minor,
-                    obs.ask_quote_minor,
-                    obs.bid_lots,
-                    obs.ask_lots,
-                    obs.ts,
-                );
+                if obs.american {
+                    self.vol_surface.observe_american(
+                        &obs.symbol,
+                        obs.spot_quote_minor,
+                        obs.strike_quote_minor,
+                        obs.is_call,
+                        obs.tte_ms,
+                        obs.bid_quote_minor,
+                        obs.ask_quote_minor,
+                        obs.bid_lots,
+                        obs.ask_lots,
+                        obs.ts,
+                    );
+                } else {
+                    self.vol_surface.observe(
+                        &obs.symbol,
+                        obs.spot_quote_minor,
+                        obs.strike_quote_minor,
+                        obs.is_call,
+                        obs.tte_ms,
+                        obs.bid_quote_minor,
+                        obs.ask_quote_minor,
+                        obs.bid_lots,
+                        obs.ask_lots,
+                        obs.ts,
+                    );
+                }
             }
             Event::SurfaceSwept { now } => {
                 self.vol_surface.sweep(*now);
@@ -2762,6 +2830,91 @@ impl Engine {
     // Marks
     // ------------------------------------------------------------------
 
+    /// Apply an American early-exercise settlement: the long closes at
+    /// TWAP intrinsic (realized against entry, exactly like expiry),
+    /// pays the fee through the revenue router, and each assigned short
+    /// closes its assigned lots at the same per-base intrinsic.
+    fn apply_exercise(&mut self, ex: &crate::event::OptionExercised) {
+        let Some(Instrument::Option(market)) = self.instruments.get(&ex.symbol).cloned() else {
+            // Market gone (delisted between plan and apply): consume the
+            // request without touching accounts.
+            self.exercises.remove(&ex.request_id);
+            return;
+        };
+        let instrument = Instrument::Option(market.clone());
+
+        // Long side: close settled lots at per-base intrinsic.
+        if ex.settled_lots > 0 {
+            let per_base_intrinsic = ex
+                .settlement_quote_minor
+                .saturating_sub(market.strike_quote_minor);
+            let per_base_intrinsic = match market.kind {
+                poc_core::OptionKind::Call => per_base_intrinsic,
+                poc_core::OptionKind::Put => market
+                    .strike_quote_minor
+                    .saturating_sub(ex.settlement_quote_minor),
+            };
+            if let Some(account) = self.accounts.get_mut(&ex.subaccount) {
+                account.apply_fill(
+                    &instrument,
+                    &ex.symbol,
+                    Side::Ask, // closing a long
+                    ex.settled_lots,
+                    per_base_intrinsic,
+                );
+            }
+            self.options_settled += 1;
+        }
+        // Exercise fee: charged to the long, routed to venue revenue.
+        if ex.exercise_fee_quote_minor > 0 {
+            if let Some(account) = self.accounts.get_mut(&ex.subaccount) {
+                account.apply_fee(i128::try_from(ex.exercise_fee_quote_minor).unwrap_or(i128::MAX));
+            }
+            if let Some(allocation) = self.revenue_router.route(ex.exercise_fee_quote_minor) {
+                if allocation.insurance > 0 {
+                    let coverage = self.insurance_coverage_permille();
+                    if self.config.coverage_policy.above_target(coverage) {
+                        self.buyback_pool_quote_minor = self
+                            .buyback_pool_quote_minor
+                            .saturating_add(allocation.insurance);
+                    } else {
+                        self.insurance
+                            .credit_penalty(allocation.insurance, self.now);
+                    }
+                }
+                self.buyback_pool_quote_minor = self
+                    .buyback_pool_quote_minor
+                    .saturating_add(allocation.buyback);
+            }
+        }
+        // Short side: close assigned lots at per-base intrinsic.
+        for a in &ex.assignments {
+            if a.lots == 0 {
+                continue;
+            }
+            let per_base_intrinsic = ex
+                .settlement_quote_minor
+                .saturating_sub(market.strike_quote_minor);
+            let per_base_intrinsic = match market.kind {
+                poc_core::OptionKind::Call => per_base_intrinsic,
+                poc_core::OptionKind::Put => market
+                    .strike_quote_minor
+                    .saturating_sub(ex.settlement_quote_minor),
+            };
+            if let Some(account) = self.accounts.get_mut(&a.subaccount) {
+                account.apply_fill(
+                    &instrument,
+                    &ex.symbol,
+                    Side::Bid, // closing a short
+                    a.lots,
+                    per_base_intrinsic,
+                );
+            }
+        }
+        self.exercises.remove(&ex.request_id);
+        self.exercises_settled += 1;
+    }
+
     /// Build the mark set for every underlying with a live oracle.
     ///
     /// Marks are oracle-anchored (see crate docs): perps mark at spot,
@@ -2797,14 +2950,31 @@ impl Engine {
                             poc_core::OptionKind::Call => poc_margin::Flavour::Call,
                             poc_core::OptionKind::Put => poc_margin::Flavour::Put,
                         };
-                        let premium = poc_margin::OptionAnalytics::price(
-                            flavour,
-                            spot as f64,
-                            m.strike_quote_minor as f64,
-                            tau,
-                            iv,
-                            self.config.risk_free_rate,
-                        );
+                        let rate = self.config.risk_free_rate;
+                        let premium = if m.is_american() {
+                            // American: the early-exercise premium is
+                            // priced in (BAW); at the venue's zero-rate
+                            // convention this equals the European mark
+                            // exactly (migration-safe default).
+                            poc_margin::AmericanAnalytics::baw_price(
+                                flavour,
+                                spot as f64,
+                                m.strike_quote_minor as f64,
+                                tau,
+                                iv,
+                                rate,
+                                rate, // b = r: non-dividend carry
+                            )
+                        } else {
+                            poc_margin::OptionAnalytics::price(
+                                flavour,
+                                spot as f64,
+                                m.strike_quote_minor as f64,
+                                tau,
+                                iv,
+                                rate,
+                            )
+                        };
                         Mark::Option {
                             premium_quote_minor_per_base: half_up_u128(premium),
                             iv,
@@ -3079,6 +3249,7 @@ impl Engine {
             insurance_balance: self.insurance.balance(),
             funding_intervals: self.funding_intervals,
             options_settled: self.options_settled,
+            exercises_settled: self.exercises_settled,
             liquidations: self.liquidations,
             adls: self.adls,
         }
@@ -3346,12 +3517,16 @@ fn event_ts(event: &Event) -> TimestampMs {
         Event::ClockAdvanced { now } => *now,
         Event::FundingFlow(_)
         | Event::OptionExpiry(_)
+        | Event::OptionExercised(_)
+        | Event::ExerciseDeferred { .. }
         | Event::OptionDelisted { .. }
         | Event::LiquidityScored { .. }
         | Event::Reward(_)
         | Event::RewardsSettled
         | Event::Liquidation(_)
         | Event::Adl(_) => 0,
+        Event::ExerciseQueued { requested_at, .. } => *requested_at,
+        Event::ExerciseRejected { ts, .. } => *ts,
         Event::RfqCreated { ts, .. }
         | Event::RfqQuoted { ts, .. }
         | Event::RfqRejected { ts, .. }

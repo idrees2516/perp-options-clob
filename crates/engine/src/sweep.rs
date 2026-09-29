@@ -86,6 +86,11 @@ pub(crate) fn plan_tick(engine: &Engine, now: TimestampMs) -> Vec<Event> {
     // 6. Option expiry.
     events.extend(plan_option_expiry(engine, now, &marks));
 
+    // 6c. American early-exercise settlements (TWAP-struck, pro-rata
+    // short assignment; runs before the liquidation cascade so assigned
+    // shorts that breach maintenance are handled in the same tick).
+    events.extend(crate::exercise::plan_american_exercises(engine, now));
+
     // 6b. Auto-listing + everlasting rebase (G-34/G-03).
     events.extend(crate::listing::plan_auto_listing(engine, now));
 
@@ -182,6 +187,7 @@ fn plan_vol_surface(
                 ask_quote_minor: ask,
                 bid_lots: sizes.0,
                 ask_lots: sizes.1,
+                american: m.is_american(),
                 ts: now,
             },
         )));

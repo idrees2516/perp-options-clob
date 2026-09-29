@@ -45,6 +45,7 @@ pub mod collateral;
 pub mod command;
 pub mod engine;
 pub mod event;
+pub mod exercise;
 pub mod institutions;
 pub mod listing;
 pub mod mm;

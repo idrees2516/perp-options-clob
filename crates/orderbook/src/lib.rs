@@ -18,18 +18,47 @@
 //! the same state transitions — the dYdX v4 / Derive V3 determinism model —
 //! and makes the matching core trivially property-testable.
 //!
-//! ## Microstructure choices
+//! ## Microstructure: zkLighter-style channels
 //!
-//! * Price levels are stored in `BTreeMap`s keyed by price (inverted for
-//!   bids) with FIFO `VecDeque` order queues — the [flood](https://github.com/paradigmxyz/flood-rs)
-//!   layout: O(log n) best-quote maintenance, no empty-level scanning.
+//! Price levels are stored in `BTreeMap`s keyed by price (inverted for
+//! bids) — O(log n) best-quote maintenance, no empty-level scanning — and
+//! each level's FIFO queue is a chain of **channels**: fixed-capacity
+//! groups of eight resting orders with a cached aggregate of their
+//! visible quantity. This is the zkLighter orderbook layout:
+//!
+//! * **Bounded work per match step** — matching walks whole channels;
+//!   a taker that exhausts a level touches only that level's channels,
+//!   and the per-step cost is structurally capped (8 slot probes),
+//!   which is what makes zk-provable matching and per-block work
+//!   budgeting tractable in production rollups.
+//! * **O(1) aggregate queries** — every channel caches its live visible
+//!   quantity and live order count, and every level caches the sum, so
+//!   [`best_touch_sizes`] and [`depth`] answer from cached numbers
+//!   instead of scanning orders. (The vol-surface observation path, which
+//!   runs per option market per tick, went from *O(orders)* to *O(1)*.)
+//! * **Lazy matching with early termination** — [`match_taker`] pulls
+//!   candidates level-by-level through the channel chain and stops the
+//!   moment the taker is filled, instead of materializing the full
+//!   reachable order list up front.
+//! * **Tombstone cancels** — canceling tombstones the order's slot in
+//!   its channel and decrements the cached aggregates; fully-dead
+//!   channels are dropped from the level.
+//!
+//! ## Microstructure conventions
+//!
 //! * Fills always execute at the **maker's** price (takers get price
 //!   improvement), the universal CLOB convention.
 //! * Four self-trade-prevention modes; `CancelNewest` is the engine default.
+//! * The uniform-price call auction ([`uncross`]) clears with prefix-sum
+//!   supply/demand curves in O(L log L), not the naive O(L²) candidate
+//!   scan.
 
 use std::collections::{BTreeMap, VecDeque};
 
 use poc_core::{Order, OrderId, SelfTradePrevention, Side, SubaccountId, Symbol};
+
+/// Number of resting order slots per channel (zkLighter layout).
+pub const CHANNEL_CAPACITY: usize = 8;
 
 /// A resting order plus its queue-time metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +79,151 @@ impl RestingOrder {
     #[must_use]
     pub fn visible_qty(&self) -> u64 {
         self.visible_lots
+    }
+}
+
+/// One channel: a fixed-capacity group of resting order ids at a single
+/// price level, with cached aggregates.
+///
+/// Slot `0` is the tombstone sentinel (engine order ids start at 1). A
+/// channel's `visible_total` is the sum of its live orders' visible lots;
+/// keeping it cached is what turns touch-size and depth queries from
+/// per-order scans into O(1) lookups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Channel {
+    slots: [OrderId; CHANNEL_CAPACITY],
+    live: u8,
+    visible_total: u64,
+}
+
+impl Default for Channel {
+    fn default() -> Self {
+        Self {
+            slots: [0; CHANNEL_CAPACITY],
+            live: 0,
+            visible_total: 0,
+        }
+    }
+}
+
+impl Channel {
+    /// Append `id` strictly **after the last live slot** — the first
+    /// free slot beyond every live order. Cancels tombstone slots in the
+    /// middle; a new (or re-queued, iceberg-resliced) arrival must land
+    /// behind every currently-live order or price-time priority breaks.
+    /// Returns `false` when the channel is full past its live prefix.
+    fn push(&mut self, id: OrderId, visible: u64) -> bool {
+        let mut target = 0_usize;
+        for (i, &s) in self.slots.iter().enumerate() {
+            if s != 0 {
+                target = i + 1;
+            }
+        }
+        if target >= CHANNEL_CAPACITY {
+            return false;
+        }
+        self.slots[target] = id;
+        self.live += 1;
+        self.visible_total = self.visible_total.saturating_add(visible);
+        true
+    }
+
+    /// Tombstone `id`, subtracting its visible quantity.
+    fn remove(&mut self, id: OrderId, visible: u64) {
+        for slot in &mut self.slots {
+            if *slot == id {
+                *slot = 0;
+                self.live = self.live.saturating_sub(1);
+                self.visible_total = self.visible_total.saturating_sub(visible);
+                return;
+            }
+        }
+    }
+
+    /// Live order ids in arrival (price-time) order.
+    fn iter_live(&self) -> impl Iterator<Item = OrderId> + '_ {
+        self.slots.iter().filter(|&&id| id != 0).copied()
+    }
+
+    /// Number of live orders.
+    fn live_count(&self) -> usize {
+        usize::from(self.live)
+    }
+}
+
+/// A price level's FIFO queue: a chain of channels plus the level's
+/// cached aggregates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelQueue {
+    channels: VecDeque<Channel>,
+    total_visible: u64,
+    live_orders: u64,
+}
+
+impl ChannelQueue {
+    /// Append an order (to the tail channel if it has room, else a new
+    /// channel — O(1) amortized).
+    fn push(&mut self, id: OrderId, visible: u64) {
+        if let Some(back) = self.channels.back_mut() {
+            if back.push(id, visible) {
+                self.total_visible = self.total_visible.saturating_add(visible);
+                self.live_orders += 1;
+                return;
+            }
+        }
+        let mut ch = Channel::default();
+        ch.push(id, visible);
+        self.channels.push_back(ch);
+        self.total_visible = self.total_visible.saturating_add(visible);
+        self.live_orders += 1;
+    }
+
+    /// Tombstone an order and drop channels it empties.
+    fn remove(&mut self, id: OrderId, visible: u64) {
+        for ch in &mut self.channels {
+            let before = ch.live_count();
+            ch.remove(id, visible);
+            if ch.live_count() != before {
+                self.total_visible = self.total_visible.saturating_sub(visible);
+                self.live_orders = self.live_orders.saturating_sub(1);
+                if ch.live_count() == 0 {
+                    self.channels.retain(|c| c.live_count() > 0);
+                }
+                return;
+            }
+        }
+    }
+
+    /// Adjust one order's cached visible contribution by `delta` (the
+    /// order stays in its slot — partial fills and iceberg slicing only
+    /// shrink the displayed quantity, never the queue position).
+    fn adjust_visible(&mut self, id: OrderId, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        for ch in &mut self.channels {
+            if ch.slots.contains(&id) {
+                ch.visible_total = ch.visible_total.saturating_sub(delta);
+                self.total_visible = self.total_visible.saturating_sub(delta);
+                return;
+            }
+        }
+    }
+
+    /// Live order ids in price-time order (lazily pulls through the
+    /// channel chain, skipping tombstones).
+    fn iter_live(&self) -> impl Iterator<Item = OrderId> + '_ {
+        self.channels.iter().flat_map(Channel::iter_live)
+    }
+
+    /// Cached total visible quantity at the level.
+    fn total_visible(&self) -> u64 {
+        self.total_visible
+    }
+
+    /// Cached live order count.
+    fn live_orders(&self) -> u64 {
+        self.live_orders
     }
 }
 
@@ -138,10 +312,10 @@ pub struct LevelSnapshot {
 pub struct LimitOrderBook {
     symbol: Symbol,
     /// Ask levels: price ascending (first = best ask).
-    asks: BTreeMap<u64, VecDeque<OrderId>>,
+    asks: BTreeMap<u64, ChannelQueue>,
     /// Bid levels keyed by `INVERT - price` so the *first* entry is the best
     /// (highest) bid. Avoids `range(..).rev()` iteration cost on every match.
-    bids_inverted: BTreeMap<u64, VecDeque<OrderId>>,
+    bids_inverted: BTreeMap<u64, ChannelQueue>,
     /// All resting orders (deterministic iteration by id).
     orders: BTreeMap<OrderId, RestingOrder>,
     /// Auction mode (G-12): orders accumulate without matching and may
@@ -229,22 +403,24 @@ impl LimitOrderBook {
     /// Resting size at the best bid and ask (lots) — the surface's
     /// touch-size gate (`(0, 0)` when a side is empty). Displays the
     /// *visible* slice only (G-06).
+    ///
+    /// O(1): the level's channel chain caches the visible aggregate, so
+    /// the vol-surface per-tick observation never scans orders.
     #[must_use]
     pub fn best_touch_sizes(&self) -> (u64, u64) {
-        let bid = self.best_bid();
-        let ask = self.best_ask();
-        let mut sizes = (0_u64, 0_u64);
-        for resting in self.resting_orders() {
-            if let Some(p) = resting.order.price_ticks {
-                if Some(p) == bid {
-                    sizes.0 = sizes.0.saturating_add(resting.visible_lots);
-                }
-                if Some(p) == ask {
-                    sizes.1 = sizes.1.saturating_add(resting.visible_lots);
-                }
-            }
-        }
-        sizes
+        let bid = self
+            .bids_inverted
+            .keys()
+            .next()
+            .and_then(|k| self.bids_inverted.get(k))
+            .map_or(0, ChannelQueue::total_visible);
+        let ask = self
+            .asks
+            .keys()
+            .next()
+            .and_then(|k| self.asks.get(k))
+            .map_or(0, ChannelQueue::total_visible);
+        (bid, ask)
     }
 
     /// Top-of-book snapshot `(bid, ask)` in ticks.
@@ -279,7 +455,7 @@ impl LimitOrderBook {
             Side::Bid => invert_bid(price_ticks),
             Side::Ask => price_ticks,
         };
-        side_levels.entry(key).or_default().push_back(order.id);
+        side_levels.entry(key).or_default().push(order.id, visible);
         self.orders.insert(
             order.id,
             RestingOrder {
@@ -299,8 +475,8 @@ impl LimitOrderBook {
             Side::Ask => (&mut self.asks, resting.price_ticks),
         };
         if let Some(queue) = side_levels.get_mut(&key) {
-            queue.retain(|&qid| qid != id);
-            if queue.is_empty() {
+            queue.remove(id, resting.visible_lots);
+            if queue.live_orders() == 0 {
                 side_levels.remove(&key);
             }
         }
@@ -335,26 +511,38 @@ impl LimitOrderBook {
             return self.cancel(id);
         }
         let open = resting.order.open_qty();
+        let side_levels = match side {
+            Side::Bid => &mut self.bids_inverted,
+            Side::Ask => &mut self.asks,
+        };
         match display {
             Some(display) if display > 0 => {
                 let slice_left = was_visible.saturating_sub(lots);
                 if slice_left == 0 {
-                    // Slice exhausted: reveal the next slice and re-queue.
-                    resting.visible_lots = open.min(display).max(1);
-                    let side_levels = match side {
-                        Side::Bid => &mut self.bids_inverted,
-                        Side::Ask => &mut self.asks,
-                    };
+                    // Slice exhausted: reveal the next slice and re-queue at
+                    // the back of the level (Deribit iceberg rule).
+                    let new_visible = open.min(display).max(1);
+                    resting.visible_lots = new_visible;
                     if let Some(queue) = side_levels.get_mut(&level_key) {
-                        queue.retain(|&qid| qid != id);
-                        queue.push_back(id);
+                        queue.remove(id, was_visible);
+                        queue.push(id, new_visible);
                     }
                 } else {
+                    // Partial slice consumption: shrink the aggregate in
+                    // place — queue position is untouched.
                     resting.visible_lots = slice_left;
+                    if let Some(queue) = side_levels.get_mut(&level_key) {
+                        queue.adjust_visible(id, was_visible - slice_left);
+                    }
                 }
             }
             _ => {
-                resting.visible_lots = open;
+                // Plain order: visible always equals the open quantity.
+                let new_visible = open;
+                resting.visible_lots = new_visible;
+                if let Some(queue) = side_levels.get_mut(&level_key) {
+                    queue.adjust_visible(id, was_visible.saturating_sub(new_visible));
+                }
             }
         }
         self.orders.get(&id).map(|r| r.order.clone())
@@ -380,40 +568,28 @@ impl LimitOrderBook {
 
     /// Depth snapshot: up to `levels` per side, bids descending, asks
     /// ascending. Aggregates the *visible* slice only (G-06).
+    ///
+    /// O(levels): each level answers from its cached channel aggregate.
     #[must_use]
     pub fn depth(&self, levels: usize) -> (Vec<LevelSnapshot>, Vec<LevelSnapshot>) {
         let bids = self
             .bids_inverted
             .iter()
             .take(levels)
-            .map(|(&inv, queue)| {
-                let total: u64 = queue
-                    .iter()
-                    .filter_map(|id| self.orders.get(id))
-                    .map(|r| r.visible_lots)
-                    .sum();
-                LevelSnapshot {
-                    price_ticks: INVERT - inv,
-                    total_qty_lots: total,
-                    order_count: queue.len(),
-                }
+            .map(|(&inv, queue)| LevelSnapshot {
+                price_ticks: INVERT - inv,
+                total_qty_lots: queue.total_visible(),
+                order_count: usize::try_from(queue.live_orders()).unwrap_or(usize::MAX),
             })
             .collect();
         let asks = self
             .asks
             .iter()
             .take(levels)
-            .map(|(&price, queue)| {
-                let total: u64 = queue
-                    .iter()
-                    .filter_map(|id| self.orders.get(id))
-                    .map(|r| r.visible_lots)
-                    .sum();
-                LevelSnapshot {
-                    price_ticks: price,
-                    total_qty_lots: total,
-                    order_count: queue.len(),
-                }
+            .map(|(&price, queue)| LevelSnapshot {
+                price_ticks: price,
+                total_qty_lots: queue.total_visible(),
+                order_count: usize::try_from(queue.live_orders()).unwrap_or(usize::MAX),
             })
             .collect();
         (bids, asks)
@@ -421,6 +597,8 @@ impl LimitOrderBook {
 
     /// Total *visible* quantity within `price_limit` on the opposite side
     /// of `side` (the volume a limit taker could reach).
+    ///
+    /// O(levels within the limit): level aggregates, no per-order scan.
     #[must_use]
     pub fn available_within(&self, side: Side, price_limit: Option<u64>) -> u64 {
         let mut total = 0_u64;
@@ -432,13 +610,7 @@ impl LimitOrderBook {
                             break;
                         }
                     }
-                    total = total.saturating_add(
-                        queue
-                            .iter()
-                            .filter_map(|id| self.orders.get(id))
-                            .map(|r| r.visible_lots)
-                            .sum::<u64>(),
-                    );
+                    total = total.saturating_add(queue.total_visible());
                 }
             }
             Side::Ask => {
@@ -449,24 +621,21 @@ impl LimitOrderBook {
                             break;
                         }
                     }
-                    total = total.saturating_add(
-                        queue
-                            .iter()
-                            .filter_map(|id| self.orders.get(id))
-                            .map(|r| r.visible_lots)
-                            .sum::<u64>(),
-                    );
+                    total = total.saturating_add(queue.total_visible());
                 }
             }
         }
         total
     }
+}
 
+impl LimitOrderBook {
     /// Uncross an auction book at a uniform clearing price (G-12).
     ///
     /// The algorithm is the classic uniform-price call auction (NYSE /
     /// Deutsche Börse opening-auction shape, the one Derive V3 opens new
-    /// markets with):
+    /// markets with), cleared through **prefix-sum supply and demand
+    /// curves** so each candidate price evaluates in O(log L):
     ///
     /// 1. Candidate prices are every resting bid and ask level.
     /// 2. At each candidate `P`, the executable volume is
@@ -497,10 +666,10 @@ impl LimitOrderBook {
             return outcome; // nothing crosses: no auction print
         }
 
-        // Eligible queues in price-time order (full open quantity).
+        // Eligible orders in price-time order (full open quantity).
         let mut bids: Vec<(OrderId, SubaccountId, u64, u64)> = Vec::new();
         for (&inv, queue) in self.bids_inverted.iter() {
-            for &id in queue {
+            for id in queue.iter_live() {
                 if let Some(r) = self.orders.get(&id) {
                     bids.push((id, r.order.subaccount, INVERT - inv, r.order.open_qty()));
                 }
@@ -508,25 +677,65 @@ impl LimitOrderBook {
         }
         let mut asks: Vec<(OrderId, SubaccountId, u64, u64)> = Vec::new();
         for (&price, queue) in &self.asks {
-            for &id in queue {
+            for id in queue.iter_live() {
                 if let Some(r) = self.orders.get(&id) {
                     asks.push((id, r.order.subaccount, price, r.order.open_qty()));
                 }
             }
         }
 
-        // Volume-maximizing clearing price over candidate levels.
-        let mut candidates: Vec<u64> = bids.iter().map(|b| b.2).collect();
-        candidates.extend(asks.iter().map(|a| a.2));
+        // Prefix-sum curves. Bid prices are already descending (bids_inverted
+        // ascending key = descending price); asks ascending. cum[i] = total
+        // quantity at prices at-or-better-than level i.
+        let bid_prices: Vec<u64> = bids.iter().map(|b| b.2).collect();
+        let ask_prices: Vec<u64> = asks.iter().map(|a| a.2).collect();
+        let mut bid_prefix: Vec<u64> = Vec::with_capacity(bids.len());
+        {
+            let mut acc = 0_u64;
+            for &(_, _, _, q) in &bids {
+                acc = acc.saturating_add(q);
+                bid_prefix.push(acc);
+            }
+        }
+        let mut ask_prefix: Vec<u64> = Vec::with_capacity(asks.len());
+        {
+            let mut acc = 0_u64;
+            for &(_, _, _, q) in &asks {
+                acc = acc.saturating_add(q);
+                ask_prefix.push(acc);
+            }
+        }
+
+        // Quantity of bids at price >= p (binary search on the descending
+        // price vector) and asks at price <= p (ascending vector).
+        let bid_qty_at = |p: u64| -> u64 {
+            // prices descending: first index with price < p is the cutoff.
+            let n = bid_prices.partition_point(|&x| x >= p);
+            if n == 0 {
+                0
+            } else {
+                bid_prefix[n - 1]
+            }
+        };
+        let ask_qty_at = |p: u64| -> u64 {
+            // prices ascending: first index with price > p is the cutoff.
+            let n = ask_prices.partition_point(|&x| x <= p);
+            if n == 0 {
+                0
+            } else {
+                ask_prefix[n - 1]
+            }
+        };
+
+        let mut candidates: Vec<u64> = bid_prices.clone();
+        candidates.extend_from_slice(&ask_prices);
         candidates.sort_unstable();
         candidates.dedup();
         let mid = (best_bid + best_ask) / 2;
         let mut best_price = 0_u64;
         let mut best_volume = 0_u64;
         for &p in &candidates {
-            let bid_qty: u64 = bids.iter().filter(|b| b.2 >= p).map(|b| b.3).sum();
-            let ask_qty: u64 = asks.iter().filter(|a| a.2 <= p).map(|a| a.3).sum();
-            let volume = bid_qty.min(ask_qty);
+            let volume = bid_qty_at(p).min(ask_qty_at(p));
             let better = volume > best_volume
                 || (volume == best_volume
                     && volume > 0
@@ -599,6 +808,12 @@ impl LimitOrderBook {
     /// * `fok` requests all-or-nothing semantics: if the reachable volume
     ///   (accounting for STP consumption) cannot fill the order, no fills
     ///   are produced.
+    ///
+    /// zkLighter-style laziness: candidates are pulled level-by-level
+    /// through the channel chains and the walk **stops the moment the
+    /// taker is filled** — a top-of-book fill never pays for the deep
+    /// levels behind it. The reachable volume for FOK is summed from the
+    /// levels' cached aggregates, not from per-order scans.
     #[must_use]
     pub fn match_taker(
         &self,
@@ -613,121 +828,108 @@ impl LimitOrderBook {
             taker_remaining_lots: taker.open_qty(),
         };
 
-        // Collect candidate maker ids in execution order.
-        let candidates: Vec<(OrderId, u64)> = self.execution_queue(taker.side, price_limit);
-
-        // FOK feasibility: volume reachable within the price limit.
+        // FOK feasibility from level aggregates (O(levels within limit)).
         if fok {
-            let reachable: u64 = candidates
-                .iter()
-                .filter_map(|&(id, _)| self.orders.get(&id))
-                .map(|r| r.visible_lots)
-                .sum();
+            let reachable = self.available_within(taker.side, price_limit);
             if reachable < taker.open_qty() {
                 return outcome; // nothing fills, taker cancels with full remainder
             }
         }
 
-        let mut taker_remaining = taker.open_qty();
-        'levels: for (maker_id, _maker_price) in candidates {
-            if taker_remaining == 0 || outcome.stp.taker_canceled {
-                break;
-            }
-            // The maker may have been canceled by an earlier STP decision in
-            // this same match — `candidates` ids are unique per resting order
-            // so at most one STP action applies per id.
-            let (maker_open, maker_price) = match self.orders.get(&maker_id) {
-                Some(r) => (r.visible_lots, r.price_ticks),
-                None => continue,
-            };
+        // Level iteration in execution order.
+        macro_rules! walk_side {
+            ($levels:expr, $price_of:expr, $within_limit:expr) => {{
+                let mut levels = $levels.iter();
+                'levels: while let Some((&key, queue)) = levels.next() {
+                    let price = $price_of(key);
+                    if !$within_limit(price) {
+                        break 'levels;
+                    }
+                    // Pull orders through the channel chain; skip
+                    // tombstoned slots without touching them.
+                    let mut channel_iter = queue.iter_live();
+                    while let Some(maker_id) = channel_iter.next() {
+                        if outcome.stp.taker_canceled {
+                            break 'levels;
+                        }
+                        if outcome.taker_remaining_lots == 0 {
+                            break 'levels;
+                        }
+                        let (maker_open, maker_price, maker_sub) = match self.orders.get(&maker_id)
+                        {
+                            Some(r) => (r.visible_lots, r.price_ticks, r.order.subaccount),
+                            None => continue, // stale slot: skipped lazily
+                        };
+                        let _ = maker_price;
 
-            if self.orders[&maker_id].order.subaccount == taker.subaccount {
-                match stp {
-                    SelfTradePrevention::CancelNewest => {
-                        // Taker dies; maker stays resting.
-                        outcome.stp.taker_canceled = true;
-                        break 'levels;
-                    }
-                    SelfTradePrevention::CancelOldest => {
-                        outcome.stp.canceled_makers.push(maker_id);
-                        continue;
-                    }
-                    SelfTradePrevention::CancelBoth => {
-                        outcome.stp.canceled_makers.push(maker_id);
-                        outcome.stp.taker_canceled = true;
-                        break 'levels;
-                    }
-                    SelfTradePrevention::DecrementAndCancel => {
-                        let overlap = taker_remaining.min(maker_open);
-                        outcome.stp.decrements.push((maker_id, overlap));
-                        outcome.stp.taker_consumed_lots =
-                            outcome.stp.taker_consumed_lots.saturating_add(overlap);
-                        taker_remaining = taker_remaining.saturating_sub(overlap);
-                        continue;
+                        if maker_sub == taker.subaccount {
+                            match stp {
+                                SelfTradePrevention::CancelNewest => {
+                                    // Taker dies; maker stays resting.
+                                    outcome.stp.taker_canceled = true;
+                                    break 'levels;
+                                }
+                                SelfTradePrevention::CancelOldest => {
+                                    outcome.stp.canceled_makers.push(maker_id);
+                                    continue;
+                                }
+                                SelfTradePrevention::CancelBoth => {
+                                    outcome.stp.canceled_makers.push(maker_id);
+                                    outcome.stp.taker_canceled = true;
+                                    break 'levels;
+                                }
+                                SelfTradePrevention::DecrementAndCancel => {
+                                    let overlap = outcome.taker_remaining_lots.min(maker_open);
+                                    outcome.stp.decrements.push((maker_id, overlap));
+                                    outcome.stp.taker_consumed_lots =
+                                        outcome.stp.taker_consumed_lots.saturating_add(overlap);
+                                    outcome.taker_remaining_lots =
+                                        outcome.taker_remaining_lots.saturating_sub(overlap);
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let fill_qty = outcome.taker_remaining_lots.min(maker_open);
+                        if fill_qty == 0 {
+                            continue;
+                        }
+                        outcome.fills.push(Fill {
+                            taker_order_id: taker.id,
+                            maker_order_id: maker_id,
+                            taker_subaccount: taker.subaccount,
+                            maker_subaccount: maker_sub,
+                            maker_side: taker.side.opposite(),
+                            price_ticks: maker_price,
+                            qty_lots: fill_qty,
+                        });
+                        outcome.taker_remaining_lots -= fill_qty;
                     }
                 }
-            }
-
-            let fill_qty = taker_remaining.min(maker_open);
-            if fill_qty == 0 {
-                continue;
-            }
-            outcome.fills.push(Fill {
-                taker_order_id: taker.id,
-                maker_order_id: maker_id,
-                taker_subaccount: taker.subaccount,
-                maker_subaccount: self.orders[&maker_id].order.subaccount,
-                maker_side: taker.side.opposite(),
-                price_ticks: maker_price,
-                qty_lots: fill_qty,
-            });
-            taker_remaining -= fill_qty;
+            }};
         }
 
-        outcome.taker_remaining_lots = taker_remaining;
+        match taker.side {
+            Side::Bid => walk_side!(self.asks, |key: u64| key, |price: u64| price_limit
+                .map_or(true, |limit| price <= limit)),
+            Side::Ask => walk_side!(self.bids_inverted, |key: u64| INVERT - key, |price: u64| {
+                price_limit.map_or(true, |limit| price >= limit)
+            }),
+        }
+
         outcome
-    }
-
-    /// Maker ids in price-time execution order reachable from `side`.
-    fn execution_queue(&self, side: Side, price_limit: Option<u64>) -> Vec<(OrderId, u64)> {
-        let mut out = Vec::new();
-        match side {
-            Side::Bid => {
-                for (&ask_price, queue) in &self.asks {
-                    if let Some(limit) = price_limit {
-                        if ask_price > limit {
-                            break;
-                        }
-                    }
-                    for &id in queue {
-                        out.push((id, ask_price));
-                    }
-                }
-            }
-            Side::Ask => {
-                for (&inv, queue) in &self.bids_inverted {
-                    let bid_price = INVERT - inv;
-                    if let Some(limit) = price_limit {
-                        if bid_price < limit {
-                            break;
-                        }
-                    }
-                    for &id in queue {
-                        out.push((id, bid_price));
-                    }
-                }
-            }
-        }
-        out
     }
 
     /// Assert structural invariants (used in tests and debug builds).
     ///
     /// * no crossed book (unless auction mode is accumulating, G-12);
     /// * no empty level buckets;
-    /// * every queued id exists in `orders` and sits at its level price;
-    /// * resting orders have positive open quantity and a visible slice
-    ///   that never exceeds the open quantity (G-06).
+    /// * every live channel slot references an order in `orders`, at the
+    ///   right level and side, with positive open quantity and a visible
+    ///   slice that never exceeds it (G-06);
+    /// * every channel's cached aggregate equals the sum of its live
+    ///   orders' visible lots, and every level's cached aggregate equals
+    ///   the sum of its channels' (the zkLighter channel contract).
     pub fn invariants_hold(&self) -> Result<(), String> {
         if let (Some(bid), Some(ask)) = (self.best_bid(), self.best_ask()) {
             if bid >= ask && !self.auction {
@@ -736,38 +938,82 @@ impl LimitOrderBook {
         }
         for (levels, side) in [(&self.bids_inverted, Side::Bid), (&self.asks, Side::Ask)] {
             for (key, queue) in levels {
-                if queue.is_empty() {
+                if queue.channels.is_empty() || queue.live_orders() == 0 {
                     return Err("empty level bucket".into());
                 }
-                for id in queue {
-                    match self.orders.get(id) {
-                        None => return Err(format!("dangling queue id {id}")),
-                        Some(r) => {
-                            if r.order.side != side {
-                                return Err(format!("side mismatch for order {id}"));
+                let mut live_seen = 0_u64;
+                let mut visible_seen = 0_u64;
+                for ch in &queue.channels {
+                    if ch.live_count() > CHANNEL_CAPACITY {
+                        return Err("channel over capacity".into());
+                    }
+                    let mut ch_live = 0_u64;
+                    let mut ch_visible = 0_u64;
+                    for &id in ch.slots.iter().filter(|&&i| i != 0) {
+                        match self.orders.get(&id) {
+                            None => return Err(format!("dangling channel slot {id}")),
+                            Some(r) => {
+                                if r.order.side != side {
+                                    return Err(format!("side mismatch for order {id}"));
+                                }
+                                let expected = match side {
+                                    Side::Bid => invert_bid(r.price_ticks),
+                                    Side::Ask => r.price_ticks,
+                                };
+                                if *key != expected {
+                                    return Err(format!("order {id} queued at wrong level"));
+                                }
+                                if r.order.open_qty() == 0 {
+                                    return Err(format!("zero-qty resting order {id}"));
+                                }
+                                if r.visible_lots == 0 || r.visible_lots > r.order.open_qty() {
+                                    return Err(format!("bad visible slice for order {id}"));
+                                }
+                                ch_live += 1;
+                                ch_visible = ch_visible.saturating_add(r.visible_lots);
                             }
-                            let expected = match side {
-                                Side::Bid => invert_bid(r.price_ticks),
-                                Side::Ask => r.price_ticks,
-                            };
-                            if *key != expected {
-                                return Err(format!("order {id} queued at wrong level"));
-                            }
-                            if r.order.open_qty() == 0 {
-                                return Err(format!("zero-qty resting order {id}"));
-                            }
-                            if r.visible_lots == 0 || r.visible_lots > r.order.open_qty() {
-                                return Err(format!("bad visible slice for order {id}"));
-                            }
+                        }
+                    }
+                    if ch_live != u64::from(ch.live) {
+                        return Err("channel live-count aggregate drifted".into());
+                    }
+                    if ch_visible != ch.visible_total {
+                        return Err("channel visible aggregate drifted".into());
+                    }
+                    live_seen = live_seen.saturating_add(ch_live);
+                    visible_seen = visible_seen.saturating_add(ch_visible);
+                }
+                if live_seen != queue.live_orders() {
+                    return Err("level live-count aggregate drifted".into());
+                }
+                if visible_seen != queue.total_visible() {
+                    return Err("level visible aggregate drifted".into());
+                }
+            }
+        }
+        // Every resting order must appear in exactly one channel slot.
+        let mut slots_seen = std::collections::BTreeMap::new();
+        for (levels, _) in [(&self.bids_inverted, Side::Bid), (&self.asks, Side::Ask)] {
+            for queue in levels.values() {
+                for ch in &queue.channels {
+                    for &id in ch.slots.iter().filter(|&&i| i != 0) {
+                        if slots_seen.insert(id, ()).is_some() {
+                            return Err(format!("order {id} occupies two slots"));
                         }
                     }
                 }
             }
         }
+        if slots_seen.len() != self.orders.len() {
+            return Err(format!(
+                "orders without a slot: {} resting, {} slotted",
+                self.orders.len(),
+                slots_seen.len()
+            ));
+        }
         Ok(())
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1189,5 +1435,309 @@ mod tests {
         assert!(!b.insert_resting(order(2, 11, Side::Bid, 101, 5), 101));
         b.set_auction_mode(true);
         assert!(b.insert_resting(order(3, 12, Side::Bid, 102, 5), 102));
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    //! zkLighter channel-layout tests: aggregate caching, tombstone
+    //! cancels, bounded channel capacity, and lazy matching behavior.
+    use super::*;
+
+    fn order(id: OrderId, sub: SubaccountId, side: Side, price: u64, qty: u64) -> Order {
+        use poc_core::{OrderType, TimeInForce};
+        Order {
+            id,
+            subaccount: sub,
+            symbol: "X".into(),
+            side,
+            order_type: OrderType::Limit,
+            price_ticks: Some(price),
+            qty_lots: qty,
+            filled_lots: 0,
+            tif: TimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
+            stp: SelfTradePrevention::CancelNewest,
+            display_lots: None,
+            trailing_extreme_quote_minor: None,
+            oco_group: None,
+            client_ts: 0,
+            engine_ts: 0,
+        }
+    }
+
+    /// Fill one price level with `n` orders.
+    fn level_with(n: u64) -> LimitOrderBook {
+        let mut b = LimitOrderBook::new("X".into());
+        for i in 1..=n {
+            b.insert_resting(order(i, i, Side::Ask, 100, 2), 100);
+        }
+        b
+    }
+
+    #[test]
+    fn channels_pack_eight_deep() {
+        let b = level_with(20);
+        let queue = b.asks.get(&100).expect("level exists");
+        // 20 orders pack into ceil(20/8) = 3 channels.
+        assert_eq!(queue.channels.len(), 3);
+        // Cached aggregates answer without scanning.
+        assert_eq!(queue.total_visible(), 40);
+        assert_eq!(queue.live_orders(), 20);
+        assert!(b.invariants_hold().is_ok());
+    }
+
+    #[test]
+    fn tombstone_cancel_keeps_aggregates_honest() {
+        let mut b = level_with(10);
+        assert!(b.cancel(4).is_some());
+        let queue = b.asks.get(&100).expect("level remains");
+        assert_eq!(queue.live_orders(), 9);
+        assert_eq!(queue.total_visible(), 18);
+        // FIFO order of the survivors is untouched.
+        let ids: Vec<OrderId> = queue.iter_live().collect();
+        assert_eq!(ids, vec![1, 2, 3, 5, 6, 7, 8, 9, 10]);
+        assert!(b.invariants_hold().is_ok());
+        // Canceling everything drops the level entirely.
+        for i in [1_u64, 2, 3, 5, 6, 7, 8, 9, 10] {
+            assert!(b.cancel(i).is_some());
+        }
+        assert!(b.best_ask().is_none());
+        assert!(b.invariants_hold().is_ok());
+    }
+
+    #[test]
+    fn touch_sizes_are_constant_time_and_correct() {
+        let mut b = level_with(9);
+        b.insert_resting(order(50, 9, Side::Bid, 99, 7), 99);
+        // Best ask level aggregates 9 x 2.
+        assert_eq!(b.best_touch_sizes(), (7, 18));
+        b.cancel(5);
+        assert_eq!(b.best_touch_sizes(), (7, 16));
+        assert!(b.invariants_hold().is_ok());
+    }
+
+    #[test]
+    fn lazy_match_stops_at_first_level() {
+        // A taker that fills entirely at level 100 must not walk 101/102.
+        let mut b = LimitOrderBook::new("X".into());
+        b.insert_resting(order(1, 10, Side::Ask, 100, 5), 100);
+        b.insert_resting(order(2, 11, Side::Ask, 101, 5), 101);
+        b.insert_resting(order(3, 12, Side::Ask, 102, 5), 102);
+        let taker = order(9, 99, Side::Bid, 100, 5);
+        let out = b.match_taker(&taker, Some(102), false, SelfTradePrevention::CancelNewest);
+        assert_eq!(out.fills.len(), 1);
+        assert_eq!(out.fills[0].maker_order_id, 1);
+        assert_eq!(out.fills[0].qty_lots, 5);
+        assert_eq!(out.taker_remaining_lots, 0);
+    }
+
+    #[test]
+    fn partial_fill_shrinks_aggregate_in_place() {
+        let mut b = level_with(4);
+        let taker = order(9, 99, Side::Bid, 100, 3);
+        let out = b.match_taker(&taker, Some(100), false, SelfTradePrevention::CancelNewest);
+        for f in &out.fills {
+            b.apply_fill(f);
+        }
+        let queue = b.asks.get(&100).expect("level remains");
+        // 8 lots across 4 orders, 3 filled: order 1 fully filled and
+        // canceled, order 2 half-filled. 5 visible, 3 live.
+        assert_eq!(queue.total_visible(), 5);
+        assert_eq!(queue.live_orders(), 3);
+        let ids: Vec<OrderId> = queue.iter_live().collect();
+        assert_eq!(
+            ids,
+            vec![2, 3, 4],
+            "partial fills never requeue plain orders"
+        );
+        assert!(b.invariants_hold().is_ok());
+    }
+
+    #[test]
+    fn depth_uses_cached_aggregates() {
+        let mut b = LimitOrderBook::new("X".into());
+        for i in 0..10_u64 {
+            b.insert_resting(order(i + 1, i + 1, Side::Ask, 100 + i, 3), 100 + i);
+        }
+        let (_, asks) = b.depth(4);
+        assert_eq!(asks.len(), 4);
+        assert!(asks
+            .iter()
+            .all(|l| l.total_qty_lots == 3 && l.order_count == 1));
+        assert_eq!(asks[0].price_ticks, 100);
+        assert_eq!(asks[3].price_ticks, 103);
+    }
+
+    #[test]
+    fn available_within_sums_level_aggregates() {
+        let mut b = LimitOrderBook::new("X".into());
+        for i in 0..5_u64 {
+            b.insert_resting(order(i + 1, 1, Side::Ask, 100 + i, 10), 100 + i);
+        }
+        assert_eq!(b.available_within(Side::Bid, Some(102)), 30);
+        assert_eq!(b.available_within(Side::Bid, None), 50);
+        assert_eq!(b.available_within(Side::Bid, Some(99)), 0);
+    }
+
+    #[test]
+    fn interleaved_cancel_fill_churn_keeps_channels_tight() {
+        // Adversarial churn: cancel and fill across the channel chain,
+        // verifying aggregates and FIFO order after every step.
+        let mut b = level_with(16);
+        let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut live: Vec<u64> = (1..=16).collect();
+        for step in 0..40 {
+            // xorshift64*
+            rng_state ^= rng_state >> 12;
+            rng_state ^= rng_state << 25;
+            rng_state ^= rng_state >> 27;
+            let r = rng_state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            if live.is_empty() {
+                break;
+            }
+            let idx = (r >> 32) as usize % live.len();
+            let victim = live[idx];
+            if step % 3 == 0 {
+                // Cancel one order.
+                assert!(b.cancel(victim).is_some());
+                live.remove(idx);
+            } else {
+                // Partially fill the head order (1 lot per step; two
+                // consecutive fills close it and cancel it).
+                let taker = order(900 + step, 99, Side::Bid, 100, 1);
+                let out =
+                    b.match_taker(&taker, Some(100), false, SelfTradePrevention::CancelNewest);
+                for f in &out.fills {
+                    b.apply_fill(f);
+                }
+                live.retain(|&id| b.get(id).is_some());
+            }
+            // Resync both directions: the model must equal the book.
+            live.retain(|&id| b.get(id).is_some());
+            if live.is_empty() {
+                break; // the level (correctly) dropped with its last order
+            }
+            let queue = b.asks.get(&100).expect("level alive while orders remain");
+            assert_eq!(
+                queue.live_orders(),
+                live.len().try_into().unwrap(),
+                "step {step}"
+            );
+            let expected: Vec<OrderId> = live.clone();
+            assert_eq!(
+                queue.iter_live().collect::<Vec<_>>(),
+                expected,
+                "step {step}"
+            );
+            assert!(b.invariants_hold().is_ok(), "step {step}");
+        }
+    }
+
+    #[test]
+    fn iceberg_requeue_moves_to_channel_back() {
+        use poc_core::{OrderType, TimeInForce};
+        let mut o = order(1, 10, Side::Ask, 100, 10);
+        o.order_type = OrderType::Limit;
+        o.tif = TimeInForce::Gtc;
+        o.display_lots = Some(4);
+        let mut b = LimitOrderBook::new("X".into());
+        b.insert_resting(o, 100);
+        for id in 2..=3_u64 {
+            b.insert_resting(order(id, id, Side::Ask, 100, 2), 100);
+        }
+        // Queue starts [1, 2, 3] with order 1 displaying 4.
+        let taker = order(9, 99, Side::Bid, 100, 4);
+        let out = b.match_taker(&taker, Some(100), false, SelfTradePrevention::CancelNewest);
+        for f in &out.fills {
+            b.apply_fill(f);
+        }
+        // Order 1's slice is exhausted: it requeues behind 2 and 3 with a
+        // fresh slice of min(6, 4) = 4.
+        let queue = b.asks.get(&100).expect("level remains");
+        let ids: Vec<OrderId> = queue.iter_live().collect();
+        assert_eq!(ids, vec![2, 3, 1]);
+        assert_eq!(queue.total_visible(), 2 + 2 + 4);
+        assert!(b.invariants_hold().is_ok());
+    }
+
+    #[test]
+    fn uncross_prefix_sums_match_naive_clearing() {
+        // Randomized differential test: the prefix-sum clearing price must
+        // agree with a naive candidate-scan implementation on a random
+        // auction book.
+        let mut rng_state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = move || {
+            rng_state ^= rng_state >> 12;
+            rng_state ^= rng_state << 25;
+            rng_state ^= rng_state >> 27;
+            rng_state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for case in 0..25_u64 {
+            let mut b = LimitOrderBook::new("X".into());
+            b.set_auction_mode(true);
+            let n = 4 + (next() % 8);
+            for id in (1_u64..).take(n as usize) {
+                let side = if next() & 1 == 0 {
+                    Side::Bid
+                } else {
+                    Side::Ask
+                };
+                let price = 95 + (next() % 11);
+                let qty = 1 + (next() % 5);
+                b.insert_resting(order(id, id, side, price, qty), price);
+            }
+            let got = b.uncross();
+
+            // Naive reference: candidate scan.
+            let naive_volume = |p: u64| -> u64 {
+                let bid: u64 = b
+                    .resting_orders()
+                    .filter(|r| r.order.side == Side::Bid)
+                    .filter(|r| r.price_ticks >= p)
+                    .map(|r| r.order.open_qty())
+                    .sum();
+                let ask: u64 = b
+                    .resting_orders()
+                    .filter(|r| r.order.side == Side::Ask)
+                    .filter(|r| r.price_ticks <= p)
+                    .map(|r| r.order.open_qty())
+                    .sum();
+                bid.min(ask)
+            };
+            let mid = {
+                let (bb, ba) = b.bbo();
+                match (bb, ba) {
+                    (Some(x), Some(y)) => (x + y) / 2,
+                    _ => 100,
+                }
+            };
+            let mut level_prices: Vec<u64> = b.resting_orders().map(|r| r.price_ticks).collect();
+            level_prices.sort_unstable();
+            level_prices.dedup();
+            let naive_best = level_prices
+                .into_iter()
+                .map(|p| (p, naive_volume(p)))
+                .filter(|&(_, v)| v > 0)
+                .min_by(|&(pa, va), &(pb, vb)| {
+                    vb.cmp(&va)
+                        .then(pa.abs_diff(mid).cmp(&pb.abs_diff(mid)))
+                        .then(pa.cmp(&pb))
+                });
+            match naive_best {
+                Some((p, v)) => {
+                    assert_eq!(
+                        got.clearing_price_ticks,
+                        Some(p),
+                        "case {case}: clearing price"
+                    );
+                    assert_eq!(got.matched_lots, v, "case {case}: volume");
+                }
+                None => {
+                    assert_eq!(got.clearing_price_ticks, None, "case {case}: no cross");
+                }
+            }
+        }
     }
 }

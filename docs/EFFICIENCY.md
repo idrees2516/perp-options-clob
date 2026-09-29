@@ -88,3 +88,50 @@ public command log and compare roots (I-3 + I-4). The
    but not optimal on Linux.
 4. **Sharded settlement captures** — diff computation parallelizes
    trivially per account range.
+
+## v0.3 addendum: the channel layout, realized
+
+The earlier section below ("what we would take from Lighter when the
+matching core needs it") is no longer hypothetical — v0.3 took it, with
+one addition the original notes undersold:
+
+**Channels (the zkLighter data structure).** Every price level is now
+a `VecDeque` of 8-slot `Channel`s, each caching its live order count
+and visible-quantity sum, with the sums cached again per level. The
+payoffs, measured (`docs/BENCHMARKS.md`):
+
+1. **Aggregate queries dropped a complexity class.** `best_touch_sizes`
+   — the vol-surface gate that runs per option market per tick — went
+   from O(resting orders) to **O(1)**. `depth(n)` went from O(orders in
+   top n levels) to O(n). `available_within` (FOK feasibility) went
+   from O(orders within limit) to O(levels within limit).
+2. **Matching became lazy.** The old `match_taker` materialized the
+   full reachable-candidate list before walking it; the new one pulls
+   through the channel chain and stops when the taker fills. A taker
+   that fills at the touch of a 2,000-order book now costs **485 ns
+   p50 — less than the old eager walk against 200 orders (506 ns)**:
+   depth behind the touch is free until you reach it.
+3. **Cancels tombstone.** A cancel touches the order's slot and the two
+   cached aggregates, then drops the channel if it empties. Survivors
+   never move — price-time priority is stable under churn, which is
+   exactly what the replay/audit guarantees need.
+4. **The uncross went from O(L²) to O(L log L).** Prefix-sum
+   supply/demand curves evaluate each candidate price by binary
+   search; 10,000 auction orders across 121 levels uncross (with full
+   event journaling) in 9.1 ms.
+
+**The rule that makes it correct** (and the bug the first
+implementation shipped): arrivals append strictly *after the last live
+slot* — never into an earlier tombstone gap. Filling gaps would let an
+iceberg reslice resurrect inside its old slot and leapfrog live orders.
+The tail-append rule, the aggregate invariants, and the churn
+differential test pin this (`docs/INVARIANTS.md` I-26..I-29).
+
+**Provable book state.** zkLighter's deepest idea — that the book
+itself should be a provable object — now has a concrete analog:
+`poc-settlement::BookCommitment` hash-chains every resting order in
+canonical order (1.2 ms per 1,000 orders, batch-window cost), so any
+verifier can check the book it is shown against the published root,
+and replayed engines must agree bit-for-bit. That is the zk-*ready*
+line we chose to stop at: the same deterministic transition function
+a circuit would prove, delivered as a hash commitment today.

@@ -215,6 +215,48 @@ pub struct OptionSettled {
     pub payout_quote_minor: i128,
 }
 
+/// One pro-rata short assignment of an American early exercise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExerciseAssignment {
+    /// The assigned short.
+    pub subaccount: SubaccountId,
+    /// Lots closed on this short by the assignment.
+    pub lots: u64,
+    /// Intrinsic charged to this short (per-lot intrinsic × lots).
+    pub charge_quote_minor: u128,
+}
+
+/// An American early-exercise settlement (long side + assignments).
+///
+/// The long closes `settled_lots` at TWAP intrinsic and pays the exercise
+/// fee out of proceeds; every assignment closes the matching short lots
+/// at the same intrinsic. `Σ assignment.lots == settled_lots`, so the
+/// position ledger stays zero-sum through settlement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionExercised {
+    /// The exercise request id.
+    pub request_id: u64,
+    /// The exercising long.
+    pub subaccount: SubaccountId,
+    /// American option market.
+    pub symbol: Symbol,
+    /// Lots requested.
+    pub requested_lots: u64,
+    /// Lots actually settled (`min(requested, position at settle)`).
+    pub settled_lots: u64,
+    /// TWAP settlement price (quote minor per base).
+    pub settlement_quote_minor: u128,
+    /// Intrinsic per lot (quote minor).
+    pub intrinsic_per_lot_quote_minor: u128,
+    /// Gross intrinsic proceeds to the long (before fee).
+    pub gross_payout_quote_minor: i128,
+    /// Exercise fee charged to the long (routed to revenue).
+    pub exercise_fee_quote_minor: u128,
+    /// Pro-rata short assignments.
+    pub assignments: Vec<ExerciseAssignment>,
+    /// Settlement time.
+    pub ts: TimestampMs,
+}
 /// One liquidation closure execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiquidationExecuted {
@@ -373,6 +415,46 @@ pub enum Event {
     FundingFlow(Box<FundingPaid>),
     /// One account's option settlement.
     OptionExpiry(Box<OptionSettled>),
+    /// An American early-exercise request parked for TWAP settlement.
+    ExerciseQueued {
+        /// Engine-assigned request id.
+        request_id: u64,
+        /// The tendering long.
+        subaccount: SubaccountId,
+        /// American option market.
+        symbol: Symbol,
+        /// Requested lots.
+        lots: u64,
+        /// Request acceptance time.
+        requested_at: TimestampMs,
+        /// Settlement (TWAP window end) time.
+        settle_at: TimestampMs,
+    },
+    /// An exercise request settled: long closed at TWAP intrinsic,
+    /// shorts assigned pro-rata, fee routed to revenue.
+    OptionExercised(Box<OptionExercised>),
+    /// An exercise request was rejected at the plan gate (no state
+    /// change; journal for clients).
+    ExerciseRejected {
+        /// The requesting account.
+        subaccount: SubaccountId,
+        /// The market.
+        symbol: Symbol,
+        /// Lots requested.
+        requested_lots: u64,
+        /// Why.
+        reason: &'static str,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// An exercise request deferred: the TWAP was not yet computable,
+    /// so settlement moves one window out (fail-safe, never a bad price).
+    ExerciseDeferred {
+        /// The request id.
+        request_id: u64,
+        /// The new settlement time.
+        new_settle_at: TimestampMs,
+    },
     /// An option instrument settled and delisted.
     OptionDelisted {
         /// The instrument symbol.
@@ -876,6 +958,8 @@ pub struct SurfaceObservation {
     pub bid_lots: u64,
     /// Resting size at best ask, lots.
     pub ask_lots: u64,
+    /// Exercise style: American quotes invert through the BAW curve.
+    pub american: bool,
     /// Engine wall-clock.
     pub ts: TimestampMs,
 }

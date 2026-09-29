@@ -82,6 +82,66 @@ impl Default for PerpMarket {
     }
 }
 
+/// Option exercise style.
+///
+/// European options settle once, at expiry (dated) or continuously
+/// through the everlasting roll. American options add the **early
+/// exercise right**: the holder may tender any portion of a long
+/// position for settlement at intrinsic value at any time before
+/// expiry — the Deribit-listed and OTC-dominant convention, and the
+/// style everlasting-option venues (Everstrike et al.) use to keep
+/// deep-ITM contracts anchored to parity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ExerciseStyle {
+    /// Exercise only at expiry / through the roll.
+    European,
+    /// Early exercise: tenderable any time before expiry.
+    American,
+}
+
+impl ExerciseStyle {
+    /// Lower-case tag for symbols and journals.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            ExerciseStyle::European => "EUR",
+            ExerciseStyle::American => "AMER",
+        }
+    }
+}
+
+/// American-exercise settlement parameters (read for
+/// [`ExerciseStyle::American`] markets only).
+///
+/// The two-knob design mirrors how venues with American products
+/// neutralize oracle-sniping and spam:
+///
+/// * **TWAP settlement** — intrinsic is struck on the underlying's
+///   time-weighted average over the window ending at settlement, not
+///   on a spot print, so a single wick cannot manufacture an exercise
+///   gain (the same defense the dated-expiry settlement uses).
+/// * **Exercise fee** — charged on the intrinsic proceeds (bps),
+///   routing through the venue revenue split like trading fees; it
+///   prices the operational cost of forced assignment and deters
+///   zero-value exercise spam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmericanParams {
+    /// TWAP window for striking early-exercise settlements (ms).
+    /// Deribit-shape default: 30 minutes.
+    pub settlement_twap_ms: TimestampMs,
+    /// Fee on intrinsic proceeds, bps. Default: 5 bp.
+    pub exercise_fee_bps: u64,
+}
+
+impl Default for AmericanParams {
+    fn default() -> Self {
+        Self {
+            settlement_twap_ms: 30 * 60 * 1000,
+            exercise_fee_bps: 5,
+        }
+    }
+}
+
 /// European option flavor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum OptionKind {
@@ -171,6 +231,10 @@ pub struct OptionMarket {
     pub expiry_ts_ms: TimestampMs,
     /// Lifecycle variant: dated or everlasting.
     pub variant: OptionVariant,
+    /// Exercise style (European or American).
+    pub exercise_style: ExerciseStyle,
+    /// American early-exercise parameters (unused for European style).
+    pub american: AmericanParams,
     /// Everlasting roll parameters (unused for dated options).
     pub everlasting: EverlastingParams,
     /// Quote currency precision (minor units per major).
@@ -208,6 +272,8 @@ impl Default for OptionMarket {
             strike_quote_minor: 8_000_000,
             expiry_ts_ms: 0,
             variant: OptionVariant::Dated,
+            exercise_style: ExerciseStyle::European,
+            american: AmericanParams::default(),
             everlasting: EverlastingParams::default(),
             quote_decimals: 2,
             base_decimals: 5,
@@ -245,6 +311,12 @@ impl OptionMarket {
             OptionVariant::Dated => 0,
             OptionVariant::Everlasting => self.everlasting.interval_ms,
         }
+    }
+
+    /// Whether this market can be tendered for early exercise.
+    #[must_use]
+    pub fn is_american(&self) -> bool {
+        self.exercise_style == ExerciseStyle::American
     }
 }
 
@@ -518,5 +590,18 @@ mod tests {
         assert_eq!(inst.ticks_from_quote_minor(6_500_000), Some(65_000));
         // Half-tick prices are off-grid.
         assert_eq!(inst.ticks_from_quote_minor(6_500_050), None);
+    }
+
+    #[test]
+    fn exercise_style_defaults_and_flags() {
+        let mut m = OptionMarket::default();
+        assert_eq!(m.exercise_style, ExerciseStyle::European);
+        assert!(!m.is_american());
+        assert_eq!(m.american.settlement_twap_ms, 1_800_000);
+        assert_eq!(m.american.exercise_fee_bps, 5);
+        m.exercise_style = ExerciseStyle::American;
+        assert!(m.is_american());
+        assert_eq!(ExerciseStyle::American.tag(), "AMER");
+        assert_eq!(ExerciseStyle::European.tag(), "EUR");
     }
 }

@@ -285,6 +285,15 @@ impl PortfolioMarginEngine {
                                 OptionKind::Call => Flavour::Call,
                                 OptionKind::Put => Flavour::Put,
                             },
+                            // American legs reprice through the full
+                            // early-exercise premium: under every grid
+                            // shock the BAW value bounds the assignment
+                            // payout (assignment settles at TWAP
+                            // intrinsic, never above the American mark),
+                            // so the scenario worst-case is a sound
+                            // upper bound on assignment risk without a
+                            // separate add-on charge.
+                            american: market.is_american(),
                         },
                         mark: *premium_quote_minor_per_base as f64,
                         short_base: if position.signed_lots < 0 {

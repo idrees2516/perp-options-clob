@@ -69,7 +69,28 @@ venue charges the microseconds where it buys a guarantee.
 | PoR build + prove all (64 accounts) | 2.78 ms | 3.08 ms | Liability-tree construction over 64 accounts plus verification of every account's inclusion proof |
 | FIX session lifecycle (logon + order + logout) | 6.2 µs | 11.6 µs | Full session choreography over the in-memory duplex: framing, sequence assignment, checksums, logout exchange |
 
-## Reproducing
+
+## v0.6 — American exercise & the channel book (2026-09, same container)
+
+| Benchmark | p50 | p99 | Interpretation |
+|---|---|---|---|
+| **taker vs 2,000-order deep book (lazy)** | **485 ns** | 637 ns | channel-lazy walk: depth behind the touch is free |
+| **auction uncross (10k orders, 121 levels)** | — | — | 9.1 ms total, O(L log L) prefix-sum clearing (incl. journaling) |
+| **BAW American mark (put, r=3%)** | 10.7 µs | 15.5 µs | boundary bisection included; **81 ns at the venue's r=0 default** (collapses to European) |
+| European BSM mark (reference) | 81 ns | 89 ns | the pricing floor |
+| **Merton perpetual American** | 23 ns | 24 ns | closed form — the everlasting τ→∞ anchor |
+| **exercise settlement sweep (63 shorts)** | 119 µs | — | TWAP strike + pro-rata assignment + fee routing, once per window |
+| **book commitment (1,000 resting orders)** | 1.2 ms | 1.4 ms | provable-book hash chain, batch-window cost |
+
+Reading the two headline rows together: the channel rewrite made depth
+free — the deep-book taker (485 ns) is *faster* than the eager walk
+against a tenth of the liquidity, because the lazy walk terminates at
+the first level that fills it. And American pricing costs nothing under
+the venue's zero-rate default (BAW ≡ BSM, asserted by test), engaging
+its ~130× premium only when `risk_free_rate > 0` is configured — a full
+200-market American mark pass is ~2 ms, batch-window territory.
+
+## Reproducing (v0.6 additions)
 
 ```bash
 cargo run --release -p poc-bench -- micro

@@ -39,10 +39,12 @@
 //! ```
 
 pub mod account;
+pub mod american;
 pub mod blackscholes;
 pub mod portfolio;
 
 pub use account::{Health, MarginAccount, MarginSummary, OpenOrderInfo, Position};
+pub use american::AmericanAnalytics;
 pub use blackscholes::{Flavour, ImpliedVolError, OptionAnalytics, OptionLegView};
 pub use portfolio::{
     Mark, MarkSet, PortfolioMarginEngine, UnderlyingMargin, UnderlyingMarginParams,

@@ -13,15 +13,22 @@ of patterns proven at scale, not invention for its own sake.
 4. [Order lifecycle](#order-lifecycle)
 5. [Marks](#marks)
 6. [Margin](#margin)
-7. [Risk & liquidation](#risk--liquidation)
-8. [Funding](#funding)
-9. [Fees, revenue, incentives](#fees-revenue-incentives)
-10. [Oracle defense](#oracle-defense)
-11. [Settlement layer (on-chain)](#settlement-layer-on-chain)
-12. [Persistence (WAL + checkpoints)](#persistence-wal--checkpoints)
-13. [Gateway (API, sessions, withdrawals)](#gateway-api-sessions-withdrawals)
-14. [Governance](#governance)
-15. [Known simplifications](#known-simplifications)
+7. [Options: exercise styles & early exercise](#options-exercise-styles--early-exercise)
+9. [Risk & liquidation](#risk--liquidation)
+9. [Funding](#funding)
+10. [Fees, revenue, incentives](#fees-revenue-incentives)
+11. [Oracle defense](#oracle-defense)
+12. [Settlement layer (on-chain)](#settlement-layer-on-chain)
+13. [Persistence (WAL + checkpoints)](#persistence-wal--checkpoints)
+14. [Gateway (API, sessions, withdrawals)](#gateway-api-sessions-withdrawals)
+15. [Governance](#governance)
+16. [Known simplifications](#known-simplifications)
+
+> Deep dives: the matching engine internals live in
+> [`docs/CLOB_ENGINE.md`](docs/CLOB_ENGINE.md) (channel layout, lazy
+> matching, auctions, provability); the option product family in
+> [`docs/OPTIONS.md`](docs/OPTIONS.md) (pricing models, exercise
+> lifecycle, assignment).
 
 ## Design sources
 
@@ -82,6 +89,16 @@ integer lots. `Instrument::notional_quote_minor` is the single place the
 tick × lot → money conversion happens.
 
 ## Order lifecycle
+
+The book itself is the zkLighter channel layout: price levels keyed in
+`BTreeMap`s (bids by inverted price so best-first is forward
+iteration), each level a chain of 8-slot channels with cached
+live-count and visible-quantity aggregates. Matching is **pure** and
+**lazy** — it walks channel chains level-by-level and terminates the
+moment the taker fills, so depth behind the touch is never paid for
+(benchmarks: a taker vs a 2,000-order deep book at 485 ns p50).
+Cancels tombstone slots and decrement aggregates; survivors never move.
+Full internals: [`docs/CLOB_ENGINE.md`](docs/CLOB_ENGINE.md).
 
 ```
 Command::Place
@@ -154,6 +171,40 @@ settlement, fees, and liquidation. One identity covers everything:
 hedge separately — paying margin twice for offsetting risk. Every
 production derivatives venue with an options complex (Deribit, Derive,
 CME) is portfolio-margined for the same reason.
+
+## Options: exercise styles & early exercise
+
+Every option market carries `ExerciseStyle` — European (default) or
+American — orthogonal to the dated/everlasting lifecycle variant.
+
+**Pricing.** European marks price through Black-Scholes at the governed
+surface IV; American marks through the Barone-Adesi-Whaley quadratic
+approximation (finite maturity) with Merton's perpetual closed form as
+the τ→∞ validation anchor. All American pricers take an explicit cost
+of carry `b` (venue convention `b = r`), which gives Merton's theorems
+as code behavior: at the default `r = 0` the American and European
+marks are *equal exactly* (asserted by test), so flipping a market's
+style under default config moves nothing. The SFPM scenario grid
+reprices American legs through BAW — the early-exercise premium lives
+inside the scenarios, which is why no separate assignment add-on is
+charged (assignment settles at TWAP intrinsic ≤ American mark, so the
+grid's worst case upper-bounds assignment risk).
+
+**Early exercise lifecycle (American only).** `Command::Exercise`
+validates the tender (American market, live long position, healthy
+oracle) and parks an `ExerciseQueued` request for a TWAP window
+(30-minute default). At settlement the sweep strikes intrinsic on the
+window's TWAP, closes the long at that value against entry (the same
+`apply_fill` primitive expiry uses), charges a 5 bp exercise fee
+through the revenue router, and assigns the matching shorts **pro-rata
+by short size with exact largest-remainder completion** — `Σ assigned
+== settled`, keeping the position ledger zero-sum. The requested lots
+are not locked (settlement takes `min(requested, position)`), degraded
+oracles defer rather than mis-price, and assigned shorts that breach
+maintenance are handled by the same sweep's liquidation cascade —
+exercise settles before liquidation by ordering, and this is tested.
+
+**Full design detail:** [`docs/OPTIONS.md`](docs/OPTIONS.md).
 
 ## Risk & liquidation
 
