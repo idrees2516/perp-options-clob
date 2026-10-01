@@ -1,0 +1,39 @@
+{
+  "name": "perp-options-clob-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-grade trading frontend for the perp-options-clob protocol — Turborepo monorepo",
+  "packageManager": "bun@1.3.14",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "dev": "cd apps/web && bun run dev",
+    "dev:web": "turbo run dev --filter=@perp/web",
+    "build": "turbo run build",
+    "start": "cd apps/web && bun run start",
+    "lint": "eslint .",
+    "typecheck": "turbo run typecheck",
+    "clean": "turbo run clean && rm -rf node_modules",
+    "db:push": "prisma db push --accept-data-loss",
+    "db:generate": "prisma generate"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "bun-types": "^1.3.4",
+    "eslint": "^9",
+    "eslint-config-next": "^16.3.4",
+    "prisma": "^6.11.1",
+    "turbo": "^2.11.6",
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@perp/api-client",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Venue connection layer: market-data sessions (snapshot/delta + gap detection), HMAC-SHA256 request signing, in-process sim worker + remote gateway transports",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf .turbo node_modules"
+  },
+  "dependencies": {
+    "@perp/types": "workspace:*",
+    "@perp/sim-engine": "workspace:*"
+  },
+  "devDependencies": {
+    "@perp/typescript-config": "workspace:*"
+  }
+}

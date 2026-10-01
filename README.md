@@ -23,6 +23,42 @@ rather than socialized losses. This workspace implements that stack
 end-to-end, with the design choices that dominate production — and the
 reasons for each — documented where they are made.
 
+## Web frontend — the trading terminal
+
+This repository now ships a **production-grade trading terminal** in
+[`apps/web`](apps/web/README.md) — a Turborepo monorepo:
+
+```
+bun install && bun run dev      # from the repo root → http://localhost:3000
+```
+
+- **Next.js 16.3.4** (App Router, single-route terminal), TypeScript strict,
+  Tailwind 4, Turborepo 2.
+- **`@perp/types`** — the domain mirrored 1:1 from the Rust engine: all 28
+  `Command`s, all 57 `Event`s, exact `bigint` money (u128 minor units).
+- **`@perp/sim-engine`** — a deterministic TypeScript venue simulator running
+  in a Web Worker: channel orderbook, SFPM portfolio margin, the fee ladder
+  with maker rebates and the 60/30/10 revenue router, premium+interest
+  funding, everlasting rolls, American exercise with pro-rata assignment,
+  the liquidation cascade (book → insurance → ADL), circuit breakers, LP
+  vaults, the MM tier program, PoR merkle trees, governance, and the
+  time-locked withdrawal pipeline.
+- **`@perp/api-client`** — the gateway contract: snapshot/delta market-data
+  sessions with sequence gap detection and resync, HMAC-SHA256 request
+  signing (`key|nonce|method|path|body_hash`), rate-limit backoff.
+
+The terminal renders every subsystem: book ladder + canvas chart + the full
+order-type ticket (stops, trailing, icebergs, OCO, TWAP), the options chain
+matrix, portfolio margin and greeks, funding, the risk desk (insurance
+coverage, liquidation feed, breakers), incentives (revenue router, MM
+tiers), LP vaults, the RFQ desk, governance (multisig → timelock → veto),
+proof-of-reserves with **in-browser merkle proof verification**, the live
+event journal, and a raw command console over the full `Command` surface.
+
+The same message contract drives both the embedded simulator (demo mode —
+zero backend) and a remote gateway (production path). Deep dive:
+[`apps/web/README.md`](apps/web/README.md).
+
 ## The crates
 
 | Crate | Role | The one design decision that defines it |

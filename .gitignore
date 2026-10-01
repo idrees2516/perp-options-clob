@@ -1,4 +1,23 @@
+# Rust
 /target
-/Cargo.lock.bak
-*.swp
+**/*.rs.bk
+Cargo.lock.orig
+
+# Node / Turborepo
+node_modules/
+.next/
+.turbo/
+out/
+build/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+
+# env & logs
+.env
+.env.*
+dev.log
+*.log
+
+# OS
 .DS_Store

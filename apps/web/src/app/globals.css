@@ -1,0 +1,276 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-up: var(--up);
+  --color-down: var(--down);
+  --color-glow: var(--glow);
+  --color-panel: var(--panel);
+  --color-panel-2: var(--panel-2);
+  --color-hairline: var(--hairline);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* ────────────────────────────────────────────────────────────────
+   Light theme — paper terminal (bright desk, high contrast)
+   ──────────────────────────────────────────────────────────────── */
+:root {
+  --radius: 0.625rem;
+  --background: oklch(0.984 0.003 240);
+  --foreground: oklch(0.18 0.012 250);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.18 0.012 250);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.18 0.012 250);
+  --primary: oklch(0.55 0.11 185);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.955 0.004 240);
+  --secondary-foreground: oklch(0.25 0.012 250);
+  --muted: oklch(0.955 0.004 240);
+  --muted-foreground: oklch(0.5 0.015 250);
+  --accent: oklch(0.94 0.02 185);
+  --accent-foreground: oklch(0.3 0.06 185);
+  --destructive: oklch(0.58 0.21 22);
+  --border: oklch(0.9 0.005 250);
+  --input: oklch(0.9 0.005 250);
+  --ring: oklch(0.55 0.11 185);
+  --up: oklch(0.6 0.14 165);
+  --down: oklch(0.58 0.2 22);
+  --glow: oklch(0.55 0.11 185);
+  --panel: oklch(0.975 0.003 240);
+  --panel-2: oklch(0.99 0 0);
+  --hairline: oklch(0.9 0.005 250);
+  --chart-1: oklch(0.55 0.11 185);
+  --chart-2: oklch(0.6 0.14 165);
+  --chart-3: oklch(0.75 0.15 85);
+  --chart-4: oklch(0.55 0.16 300);
+  --chart-5: oklch(0.65 0.18 30);
+  --sidebar: oklch(0.975 0.003 240);
+  --sidebar-foreground: oklch(0.18 0.012 250);
+  --sidebar-primary: oklch(0.55 0.11 185);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.94 0.02 185);
+  --sidebar-accent-foreground: oklch(0.3 0.06 185);
+  --sidebar-border: oklch(0.9 0.005 250);
+  --sidebar-ring: oklch(0.55 0.11 185);
+  --grid-line: oklch(0.93 0.004 250);
+}
+
+/* ────────────────────────────────────────────────────────────────
+   Dark theme — the quant terminal (default)
+   ──────────────────────────────────────────────────────────────── */
+.dark {
+  --background: oklch(0.13 0.012 250);
+  --foreground: oklch(0.93 0.004 250);
+  --card: oklch(0.16 0.013 250);
+  --card-foreground: oklch(0.93 0.004 250);
+  --popover: oklch(0.17 0.013 250);
+  --popover-foreground: oklch(0.93 0.004 250);
+  --primary: oklch(0.79 0.12 175);
+  --primary-foreground: oklch(0.15 0.02 250);
+  --secondary: oklch(0.21 0.014 250);
+  --secondary-foreground: oklch(0.93 0.004 250);
+  --muted: oklch(0.21 0.014 250);
+  --muted-foreground: oklch(0.62 0.012 250);
+  --accent: oklch(0.24 0.02 175);
+  --accent-foreground: oklch(0.85 0.08 175);
+  --destructive: oklch(0.66 0.19 22);
+  --border: oklch(0.24 0.014 250);
+  --input: oklch(0.24 0.014 250);
+  --ring: oklch(0.79 0.12 175);
+  --up: oklch(0.77 0.15 165);
+  --down: oklch(0.68 0.19 20);
+  --glow: oklch(0.79 0.12 175);
+  --panel: oklch(0.15 0.013 250);
+  --panel-2: oklch(0.18 0.014 250);
+  --hairline: oklch(0.24 0.014 250);
+  --chart-1: oklch(0.79 0.12 175);
+  --chart-2: oklch(0.77 0.15 165);
+  --chart-3: oklch(0.8 0.14 85);
+  --chart-4: oklch(0.65 0.15 300);
+  --chart-5: oklch(0.7 0.17 30);
+  --sidebar: oklch(0.145 0.012 250);
+  --sidebar-foreground: oklch(0.93 0.004 250);
+  --sidebar-primary: oklch(0.79 0.12 175);
+  --sidebar-primary-foreground: oklch(0.15 0.02 250);
+  --sidebar-accent: oklch(0.24 0.02 175);
+  --sidebar-accent-foreground: oklch(0.85 0.08 175);
+  --sidebar-border: oklch(0.22 0.014 250);
+  --sidebar-ring: oklch(0.79 0.12 175);
+  --grid-line: oklch(0.2 0.013 250);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+  ::selection {
+    background: color-mix(in oklab, var(--primary) 30%, transparent);
+  }
+}
+
+/* ── Terminal texture: faint grid + vignette ─────────────────── */
+.venue-bg {
+  background-color: var(--background);
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 44px 44px;
+  background-position: -1px -1px;
+}
+.dark .venue-bg {
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, color-mix(in oklab, var(--primary) 7%, transparent), transparent),
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+}
+
+/* ── Panels ───────────────────────────────────────────────────── */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-lg);
+}
+.panel-2 {
+  background: var(--panel-2);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-lg);
+}
+.panel-glow {
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--primary) 18%, transparent),
+    0 0 32px -8px color-mix(in oklab, var(--primary) 25%, transparent);
+}
+
+/* ── Numerics: every number in the terminal is monospaced tabular ─ */
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* ── Price flash animations ─────────────────────────────────── */
+@keyframes flash-up {
+  0% { background-color: color-mix(in oklab, var(--up) 22%, transparent); }
+  100% { background-color: transparent; }
+}
+@keyframes flash-down {
+  0% { background-color: color-mix(in oklab, var(--down) 22%, transparent); }
+  100% { background-color: transparent; }
+}
+.flash-up { animation: flash-up 0.55s ease-out; }
+.flash-down { animation: flash-down 0.55s ease-out; }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
+
+/* ── Custom scrollbars (terminal-grade, thin) ────────────────── */
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--hairline) transparent;
+}
+.scroll-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: var(--hairline);
+  border-radius: 3px;
+}
+.scroll-thin::-webkit-scrollbar-thumb:hover {
+  background: var(--muted-foreground);
+}
+
+/* ── Depth bars (book + table heat) ──────────────────────────── */
+.depth-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  pointer-events: none;
+  opacity: 0.85;
+  transition: width 150ms ease-out;
+}
+
+/* ── Ticker marquee ──────────────────────────────────────────── */
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.marquee-track {
+  animation: marquee 46s linear infinite;
+}
+.marquee-track:hover {
+  animation-play-state: paused;
+}
+
+/* ── Hairline dividers with gradient fade ───────────────────── */
+.hairline-grad {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--hairline) 15%, var(--hairline) 85%, transparent);
+}
+
+/* ── Focus ring: terminal glow ───────────────────────────────── */
+.focus-glow:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--primary) 60%, transparent),
+    0 0 18px -4px color-mix(in oklab, var(--primary) 45%, transparent);
+}
+
+/* ── Shimmer for skeletons ───────────────────────────────────── */
+@keyframes shimmer {
+  0% { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, var(--panel) 25%, var(--panel-2) 50%, var(--panel) 75%);
+  background-size: 800px 100%;
+  animation: shimmer 1.6s infinite linear;
+}

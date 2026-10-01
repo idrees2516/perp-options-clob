@@ -1,0 +1,36 @@
+{
+  "name": "@perp/ui",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Shared terminal UI components: book ladder, depth chart, stat tiles, sparklines, event journal rows",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf .turbo node_modules"
+  },
+  "dependencies": {
+    "@perp/types": "workspace:*",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.525.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "tailwind-merge": "^3.3.1"
+  },
+  "devDependencies": {
+    "@perp/typescript-config": "workspace:*",
+    "@types/react": "^19"
+  },
+  "peerDependencies": {
+    "framer-motion": "^12"
+  },
+  "peerDependenciesMeta": {
+    "framer-motion": {
+      "optional": true
+    }
+  }
+}
