@@ -4,7 +4,8 @@
  * Two transports, one contract (VenueControl / VenueMessage):
  *  - SimWorkerConnection: the embedded deterministic simulator in a Web
  *    Worker (demo mode — zero backend, works anywhere the app is hosted).
- *  - RemoteConnection: the production socket.io gateway. Same frames.
+ *  - RemoteConnection (./remote): the production socket.io gateway with
+ *    G-25 auth, heartbeats and reconnection.
  *
  * The market-data session (snapshot/delta + gap detection + resync) applies
  * regardless of transport — it is the protocol, not the pipe.
@@ -15,6 +16,7 @@ import type {
   BookUpdateTagged,
   JournalEntry,
   MarketRow,
+  Trade,
   TradePrintLike,
   VenueControl,
   VenueMessage,
@@ -32,6 +34,7 @@ export interface VenueEvents {
   prints: (prints: TradePrintLike[]) => void;
   account: (view: AccountDelta) => void;
   markets: (rows: MarketRow[]) => void;
+  trade_fill: (fill: { trade: Trade; taker: boolean; maker: boolean }) => void;
   error: (message: string) => void;
 }
 
@@ -64,32 +67,6 @@ export class SimWorkerConnection implements VenueTransport {
 
   terminate(): void {
     this.worker.terminate();
-  }
-}
-
-/* ─────────────────────────── remote gateway ─────────────────────────── */
-
-/**
- * Production transport over socket.io. Constructed with a pre-connected
- * socket so the client package stays framework- and transport-agnostic.
- */
-export class RemoteConnection implements VenueTransport {
-  readonly kind = "remote" as const;
-
-  constructor(
-    private socket: {
-      emit(event: "venue-control", msg: VenueControl): void;
-      on(event: "venue-message", cb: (msg: VenueMessage) => void): void;
-      disconnect(): void;
-    },
-  ) {}
-
-  send(msg: VenueControl): void {
-    this.socket.emit("venue-control", msg);
-  }
-
-  terminate(): void {
-    this.socket.disconnect();
   }
 }
 
@@ -169,10 +146,12 @@ export class VenueClient {
       case "markets":
         this.emit("markets", msg.rows);
         break;
+      case "trade_fill":
+        this.emit("trade_fill", { trade: msg.trade, taker: msg.taker, maker: msg.maker });
+        break;
       case "error":
         this.emit("error", msg.message);
         break;
-      case "trade_fill":
       case "pong":
         break;
     }

@@ -1,0 +1,24 @@
+# Edge router for the docker-compose stack — one origin, two upstreams.
+# The gateway is reached under /gateway/*: the terminal's RemoteConnection
+# rewrites socket.io URLs to the /gateway/socket.io engine path.
+
+:8080 {
+	# Venue gateway: socket.io engine + signed REST
+	handle /gateway/* {
+		uri strip_prefix /gateway
+		reverse_proxy gateway:3031 {
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# Terminal UI
+	handle {
+		reverse_proxy web:3000 {
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+}

@@ -32,6 +32,7 @@ export * from "./merkle";
 export * from "./pricing";
 export * from "./accounts";
 export * from "./fees";
+export * from "./stream";
 export { OracleEngine } from "./oracle";
 export { GovernanceEngine } from "./governance";
 export { WithdrawalPipeline } from "./withdrawals";
@@ -77,6 +78,12 @@ export class SimVenue {
 
   resume(): void {
     this.engine.running = true;
+  }
+
+  /** Advance the clock manually while paused (console power feature). */
+  step(ms: number): void {
+    this.engine.running = false;
+    this.ticker.step(ms);
   }
 
   command(cmd: Command): void {

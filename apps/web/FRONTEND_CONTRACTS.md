@@ -16,6 +16,24 @@ switches `view` in the store. Your view file is lazy-loaded from
 `src/views/<name>/<name>-view.tsx` exporting a named component (check the exact name in
 terminal-app.tsx).
 
+## Transports — sim worker or live gateway (same contract)
+
+The store's `mode` is `"sim"` (embedded Web Worker, zero backend) or `"remote"`
+(`apps/gateway` — the production socket.io venue). Both speak the identical
+`VenueControl` / `VenueMessage` contract; views never know which one is active.
+
+- Switch transports: status bar `SIM`/`GATEWAY` chip or the cable icon (top bar) →
+  connection dialog (`components/shell/connection-dialog.tsx`). Origin may carry a
+  mount path (`https://host/gateway`); empty origin = same-origin `XTransformPort`
+  proxy. Credentials (G-25 HMAC) are optional — demo gateways run auth-off.
+- Remote-only store slices: `mode`, `gateway` (`{status, latencyMs, reconnects, error,
+  label}`), `credentials`, `connectionOpen` + actions `connectSim()`,
+  `connectRemote(endpoint?, creds?)`, `disconnectVenue()`, `setConnectionOpen(bool)`.
+- `trade_fill` receipts arrive for commands your active account participated in —
+  the store toasts them automatically.
+- Over the network, frames are wire-encoded (bigint → `{"$bigint":"…"}` markers in
+  `@perp/types`); transports encode/decode transparently.
+
 ## Store — `src/lib/venue-store.ts` (read it first)
 
 ```ts

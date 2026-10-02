@@ -243,6 +243,7 @@ export class VenueTicker {
 
   private mmRefresh(): void {
     const e = this.engine;
+    this.mmLiquidityProgram();
     const mark = e.spot_quote_minor;
     const markTicks = Number(mark / 100n); // $1 ticks
 
@@ -260,6 +261,29 @@ export class VenueTicker {
       if (i % 2 === 0) this.quoteAround(1, sym, markTicksOpt, 100, 120);
       this.quoteAround(2, sym, markTicksOpt, 60, 150);
       i += 1;
+    }
+  }
+
+  /**
+   * Liquidity program — long-running venues keep their makers capitalized.
+   *
+   * A demo venue that runs for wall-hours at high speed grinds the MMs down
+   * (inventory marks, funding, fees); once their quotes stop passing the
+   * margin gate the book goes dark and every terminal view empties. This is
+   * the venue-side MM incentive program: when a maker's equity dips under
+   * half its initial allocation, credit it back up to the program level.
+   * The deposits journal explicitly, so the flow stays auditable.
+   */
+  private mmLiquidityProgram(): void {
+    const e = this.engine;
+    const target = 5_000_000_00n;
+    const floor = 2_500_000_00n;
+    for (const sub of [1, 2] as const) {
+      const equity = e.marginOf(sub).equity;
+      if (equity >= floor) continue;
+      const topUp = target - equity;
+      if (topUp <= 0n) continue;
+      e.process({ type: "deposit", subaccount: sub, amount_quote_minor: topUp });
     }
   }
 
@@ -984,6 +1008,14 @@ export class VenueTicker {
     for (const [sym, book] of e.books) {
       const inst = e.instruments.get(sym);
       if (!inst) continue;
+      // Release expired breakers FIRST — a halted market's book is empty
+      // (makers are rejected while halted), so the release check must not
+      // sit behind the two-sided-book guard below or halts become permanent.
+      const existing = e.breakers.get(sym);
+      if (existing && e.now >= existing.until) {
+        e.breakers.delete(sym);
+        e.journalEvent({ type: "breaker_released", kind: existing.kind, symbol: sym, ts: e.now });
+      }
       const bb = book.bestBid();
       const ba = book.bestAsk();
       if (bb == null || ba == null) {
@@ -991,7 +1023,15 @@ export class VenueTicker {
         continue;
       }
       const mid = (BigInt(bb) + BigInt(ba)) * inst.tick_size_quote_minor / 2n;
-      const dislocation = Number(((mid - e.spot_quote_minor) * 10_000n) / e.spot_quote_minor);
+      // Dislocation is measured against the instrument's OWN fair value:
+      // perp mid vs spot; option mid vs its model mark. (Comparing an
+      // option premium against spot would trip every chain instantly.)
+      const ref = inst.kind === "option" ? e.markOf(sym) : e.spot_quote_minor;
+      if (ref <= 0n) {
+        this.breakerWatch.delete(sym);
+        continue;
+      }
+      const dislocation = Number(((mid - ref) * 10_000n) / ref);
       if (Math.abs(dislocation) > 500) {
         const since = this.breakerWatch.get(sym) ?? e.now;
         this.breakerWatch.set(sym, since);
@@ -1001,11 +1041,6 @@ export class VenueTicker {
         }
       } else {
         this.breakerWatch.delete(sym);
-      }
-      const br = e.breakers.get(sym);
-      if (br && e.now >= br.until) {
-        e.breakers.delete(sym);
-        e.journalEvent({ type: "breaker_released", kind: br.kind, symbol: sym, ts: e.now });
       }
     }
   }

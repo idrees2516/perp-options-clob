@@ -33,6 +33,7 @@ export type VenueControl =
   | { type: "por_build" }
   | { type: "oracle_inject"; provider: string; price_quote_minor: bigint }
   | { type: "oracle_toggle_quarantine"; provider: string }
+  | { type: "ping"; id: number; ts: number }
   | { type: "request_snapshot" };
 
 /** ─────────── Venue → Main ─────────── */

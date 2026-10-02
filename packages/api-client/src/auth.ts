@@ -6,6 +6,10 @@
  * Rate limiting is a token bucket — clients back off on 429-equivalents.
  */
 
+/** FNV-1a based body hash — canonical G-25 form, shared via @perp/types. */
+export { bodyHashHex } from "@perp/types";
+import { bodyHashHex } from "@perp/types";
+
 /** Web Crypto HMAC-SHA256, hex output. SSR-safe (lazy import). */
 export async function hmacSha256Hex(secret: string, message: string): Promise<string> {
   const crypto = globalThis.crypto;
@@ -22,17 +26,6 @@ export async function hmacSha256Hex(secret: string, message: string): Promise<st
   return Array.from(new Uint8Array(sig))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
-}
-
-/** FNV-1a based body hash — deterministic, dependency-free. */
-export function bodyHashHex(body: string): string {
-  let h1 = 0x811c9dc5;
-  let h2 = 0x01000193;
-  for (let i = 0; i < body.length; i++) {
-    h1 = Math.imul(h1 ^ body.charCodeAt(i), 0x85ebca6b) >>> 0;
-    h2 = Math.imul(h2 + body.charCodeAt(i), 0xc2b2ae35) >>> 0;
-  }
-  return (h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0")).padEnd(64, "0");
 }
 
 export interface ApiCredentials {

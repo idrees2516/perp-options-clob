@@ -89,9 +89,13 @@ describe("sim engine", () => {
     }
     const sources = DEPOSITS + e.config.insurance_seed_quote_minor;
     const uses = cash + upnl + vaultNav + routed + e.insurance_balance + inventoryValue;
-    // Exact to the minor unit except for single-truncation division dust
-    // (independent PnL divisions on both sides of a fill round separately).
-    expect(uses - sources >= -1n && uses - sources <= 1n).toBe(true);
+    // Exact to the minor unit except single-truncation division dust: each
+    // fill rounds PnL/premium divisions independently on both sides of the
+    // trade, so the bound scales with the fill count (≤1 minor unit per fill
+    // plus a small constant). With the option chain actually quoting, the
+    // fill count — and therefore the dust — is larger than in a dead market.
+    const dust = BigInt(e.stats.trades) + 2n;
+    expect(uses - sources >= -dust && uses - sources <= dust).toBe(true);
   });
 
   test("user order flows through the matching path", () => {

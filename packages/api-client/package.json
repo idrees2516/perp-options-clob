@@ -15,7 +15,8 @@
   },
   "dependencies": {
     "@perp/types": "workspace:*",
-    "@perp/sim-engine": "workspace:*"
+    "@perp/sim-engine": "workspace:*",
+    "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
     "@perp/typescript-config": "workspace:*"

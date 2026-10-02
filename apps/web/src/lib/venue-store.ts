@@ -4,6 +4,11 @@
  * The venue store — the single reactive bridge between the VenueClient
  * stream and the UI. Fine-grained slices keep re-renders surgical:
  * the book ladder never re-renders because the journal grew.
+ *
+ * Two transports, one store:
+ *  - "sim"     the embedded deterministic simulator (Web Worker)
+ *  - "remote"  the production gateway over socket.io (G-25 auth, heartbeat,
+ *              reconnection; latency + reconnect counters surfaced here)
  */
 
 import { create } from "zustand";
@@ -16,7 +21,20 @@ import type {
   TradePrintLike,
   VenueSnapshot,
 } from "@perp/types";
-import { getVenueClient, SimWorkerConnection } from "@perp/api-client";
+import {
+  getVenueClient,
+  SimWorkerConnection,
+  RemoteConnection,
+  loadGatewayConfig,
+  saveTransportMode,
+  saveEndpoint,
+  saveCredentials,
+  type RemoteEndpoint,
+  type RemoteStatus,
+  type TransportMode,
+} from "@perp/api-client";
+import type { ApiCredentials } from "@perp/api-client";
+import { toast } from "sonner";
 
 export type ViewId =
   | "terminal"
@@ -35,6 +53,15 @@ export type ViewId =
 const JOURNAL_CAP = 600;
 const PRINTS_CAP = 160;
 
+export interface GatewayState {
+  status: RemoteStatus | "idle";
+  latencyMs: number | null;
+  reconnects: number;
+  error: string | null;
+  /** Human-readable endpoint for display. */
+  label: string;
+}
+
 export interface VenueStoreState {
   connected: boolean;
   snapshot: VenueSnapshot | null;
@@ -51,6 +78,12 @@ export interface VenueStoreState {
   lastError: string | null;
   notifCount: number;
 
+  /* transport */
+  mode: TransportMode;
+  gateway: GatewayState;
+  credentials: ApiCredentials | null;
+  connectionOpen: boolean;
+
   setView: (v: ViewId) => void;
   setActiveSymbol: (s: string) => void;
   setActiveAccount: (id: number) => void;
@@ -58,6 +91,25 @@ export interface VenueStoreState {
   resetVenue: (seed?: number) => void;
   markErrorSeen: () => void;
   refresh: () => void;
+
+  setConnectionOpen: (open: boolean) => void;
+  connectSim: () => void;
+  connectRemote: (endpoint?: RemoteEndpoint, credentials?: ApiCredentials | null) => void;
+  disconnectVenue: () => void;
+  setCredentials: (creds: ApiCredentials | null) => void;
+}
+
+const GATEWAY_IDLE: GatewayState = {
+  status: "idle",
+  latencyMs: null,
+  reconnects: 0,
+  error: null,
+  label: "—",
+};
+
+function endpointLabel(endpoint: RemoteEndpoint): string {
+  if (endpoint.origin) return endpoint.origin;
+  return `same-origin :${endpoint.port ?? 3031}`;
 }
 
 export const useVenueStore = create<VenueStoreState>((set, get) => ({
@@ -74,6 +126,11 @@ export const useVenueStore = create<VenueStoreState>((set, get) => ({
   speed: 600,
   lastError: null,
   notifCount: 0,
+
+  mode: "sim",
+  gateway: GATEWAY_IDLE,
+  credentials: null,
+  connectionOpen: false,
 
   setView: (v) => set({ view: v }),
   setActiveSymbol: (s) => {
@@ -92,6 +149,85 @@ export const useVenueStore = create<VenueStoreState>((set, get) => ({
   markErrorSeen: () => set({ lastError: null, notifCount: 0 }),
   refresh: () => {
     getVenueClient().send({ type: "request_snapshot" });
+  },
+
+  setConnectionOpen: (open) => set({ connectionOpen: open }),
+
+  connectSim: () => {
+    const client = getVenueClient();
+    saveTransportMode("sim");
+    set({ mode: "sim", gateway: GATEWAY_IDLE });
+    client.connect(
+      new SimWorkerConnection(
+        (msg) => client.receive(msg),
+        (message) => useVenueStore.setState({ lastError: message }),
+      ),
+    );
+  },
+
+  connectRemote: (endpoint, credentials) => {
+    const client = getVenueClient();
+    const cfg = loadGatewayConfig();
+    const ep = endpoint ?? cfg.endpoint;
+    const creds = credentials !== undefined ? credentials : cfg.credentials;
+    saveTransportMode("remote");
+    saveEndpoint(ep);
+    saveCredentials(creds);
+    set({
+      mode: "remote",
+      credentials: creds,
+      connected: false,
+      gateway: { ...GATEWAY_IDLE, status: "connecting", label: endpointLabel(ep) },
+    });
+    void RemoteConnection.create({
+      endpoint: ep,
+      credentials: creds,
+      onMessage: (msg) => client.receive(msg),
+      onError: (message) => useVenueStore.setState({ lastError: message }),
+      onStatus: (status, detail) => {
+        const g = useVenueStore.getState().gateway;
+        useVenueStore.setState({
+          gateway: {
+            ...g,
+            status,
+            error: detail ?? g.error,
+            reconnects: status === "reconnecting" && g.status !== "reconnecting" ? g.reconnects + 1 : g.reconnects,
+          },
+        });
+      },
+      onLatency: (ms) => {
+        const g = useVenueStore.getState().gateway;
+        useVenueStore.setState({ gateway: { ...g, latencyMs: ms } });
+      },
+      onResubscribe: () => {
+        const st = useVenueStore.getState();
+        client.subscribe([st.activeSymbol]);
+        client.send({ type: "request_snapshot" });
+      },
+    })
+      .then((conn) => {
+        // The transport may have been swapped while the handshake was in flight.
+        if (useVenueStore.getState().mode !== "remote") {
+          conn.terminate();
+          return;
+        }
+        client.connect(conn);
+      })
+      .catch((err) => {
+        useVenueStore.setState({
+          gateway: { ...useVenueStore.getState().gateway, status: "error", error: String(err) },
+        });
+      });
+  },
+
+  disconnectVenue: () => {
+    getVenueClient().terminate();
+    set({ connected: false, snapshot: null, books: {}, markets: [], gateway: GATEWAY_IDLE });
+  },
+
+  setCredentials: (creds) => {
+    saveCredentials(creds);
+    set({ credentials: creds });
   },
 }));
 
@@ -141,14 +277,26 @@ export function connectVenue(): void {
   client.on("markets", (rows) => {
     useVenueStore.setState({ markets: rows });
   });
+  client.on("trade_fill", ({ trade, taker, maker }) => {
+    const me = useVenueStore.getState().activeAccount;
+    if (trade.taker_subaccount !== me && trade.maker_subaccount !== me) return;
+    const side = taker ? "TAKER" : maker ? "MAKER" : "";
+    const lots = trade.qty_lots;
+    toast.success(`Fill · ${trade.symbol}`, {
+      description: `${lots} lots @ tick ${trade.price_ticks.toLocaleString()} — you were the ${side.toLowerCase()}`,
+    });
+  });
   client.on("error", (message) => {
     useVenueStore.setState({ lastError: message, notifCount: useVenueStore.getState().notifCount + 1 });
   });
 
-  client.connect(new SimWorkerConnection(
-    (msg) => client.receive(msg),
-    (message) => useVenueStore.setState({ lastError: message }),
-  ));
+  // Route to the persisted transport choice (defaults to the embedded sim).
+  const cfg = loadGatewayConfig();
+  if (cfg.mode === "remote") {
+    useVenueStore.getState().connectRemote(cfg.endpoint, cfg.credentials);
+  } else {
+    useVenueStore.getState().connectSim();
+  }
 }
 
 function applyBook(

@@ -1,0 +1,65 @@
+# perp-options-clob terminal — full production stack.
+#
+#   caddy :80 ──┬─ /            → web:3000      (Next.js terminal)
+#               └─ /gateway/*   → gateway:3031  (socket.io + REST)
+#
+# The browser talks to ONE origin; the gateway socket and signed REST both
+# ride the same host — no CORS, no cross-origin cookies.
+#
+#   docker compose up --build
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: apps/gateway/Dockerfile
+    environment:
+      GATEWAY_HOST: 0.0.0.0
+      GATEWAY_PORT: 3031
+      # Production profile — flip to true for signed-everything:
+      # GATEWAY_AUTH_REQUIRED: "true"
+      # GATEWAY_CORS_ORIGINS: http://localhost:8080
+      GATEWAY_VENUE_SEED: 42
+      GATEWAY_VENUE_SPEED: 600
+      GATEWAY_DATA_DIR: /data
+    volumes:
+      - gateway-data:/data
+    expose:
+      - "3031"
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Inlined into the client bundle at build time — same-origin gateway
+        # under the edge router's /gateway prefix.
+        NEXT_PUBLIC_VENUE_GATEWAY_URL: "/gateway"
+    environment:
+      NEXT_TELEMETRY_DISABLED: 1
+    depends_on:
+      - gateway
+    expose:
+      - "3000"
+    restart: unless-stopped
+
+  edge:
+    image: caddy:2
+    depends_on:
+      - web
+      - gateway
+    ports:
+      - "8080:8080"
+    command:
+      - caddy
+      - run
+      - --config
+      - /etc/caddy/Caddyfile
+      - --adapter
+      - caddyfile
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+
+volumes:
+  gateway-data:

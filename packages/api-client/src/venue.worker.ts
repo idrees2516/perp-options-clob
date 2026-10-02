@@ -4,12 +4,13 @@
  * to the production socket.io gateway (VenueControl / VenueMessage).
  */
 
-import type { VenueControl, VenueMessage } from "@perp/types";
-import { SimVenue, buildMarketRows } from "@perp/sim-engine";
-import type { Trade } from "@perp/types";
+import type { Command, VenueControl, VenueMessage } from "@perp/types";
+import { SimVenue, buildMarketRows, BookFrameSequencer } from "@perp/sim-engine";
+import type { BookUpdateTagged, Trade } from "@perp/types";
 
 let venue: SimVenue | null = null;
 let subscribed: string[] = [];
+const seq = new BookFrameSequencer();
 let drainTimer: ReturnType<typeof setInterval> | null = null;
 let marketTimer: ReturnType<typeof setInterval> | null = null;
 let snapshotTimer: ReturnType<typeof setInterval> | null = null;
@@ -30,11 +31,26 @@ function post(msg: VenueMessage): void {
   (self as unknown as Worker).postMessage(msg);
 }
 
+/** Relabel book frames with stream seqs — G-27 wire discipline. */
+function relabel(updates: Record<string, BookUpdateTagged>): Record<string, BookUpdateTagged> {
+  const out: Record<string, BookUpdateTagged> = {};
+  for (const [symbol, u] of Object.entries(updates)) {
+    out[symbol] = u.kind === "snapshot" ? seq.snapshot(symbol, u.bids, u.asks) : seq.delta(symbol, u);
+  }
+  return out;
+}
+
 function drain(): void {
   if (!venue) return;
   const out: ReturnType<SimVenue["drain"]> = venue.drain();
+  emitOutputs(out);
+}
+
+/** Post drain outputs over the worker channel. */
+function emitOutputs(out: ReturnType<SimVenue["drain"]>): void {
+  if (!venue) return;
   if (Object.keys(out.books).length > 0) {
-    post({ channel: "books", updates: out.books });
+    post({ channel: "books", updates: relabel(out.books) });
   }
   if (out.prints.length > 0) {
     post({
@@ -77,6 +93,28 @@ function drain(): void {
   }
 }
 
+/** Accounts a command touches — used to route trade_fill receipts. */
+function commandAccounts(cmd: VenueControl & { command?: Command }): Set<number> {
+  const out = new Set<number>();
+  const c = cmd.command as unknown as Record<string, unknown> | undefined;
+  if (!c) return out;
+  const add = (v: unknown): void => {
+    if (typeof v === "number") out.add(v);
+  };
+  add(c.subaccount);
+  add(c.from);
+  add(c.taker);
+  const req = c.request as Record<string, unknown> | undefined;
+  if (req) add(req.subaccount);
+  for (const key of ["first", "second"] as const) {
+    const r = c[key] as Record<string, unknown> | undefined;
+    if (r) add(r.subaccount);
+  }
+  const reqs = c.requests as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(reqs)) for (const r of reqs) add(r?.subaccount);
+  return out;
+}
+
 self.onmessage = (ev: MessageEvent<VenueControl>) => {
   const msg = ev.data;
   switch (msg.type) {
@@ -84,7 +122,7 @@ self.onmessage = (ev: MessageEvent<VenueControl>) => {
       ensureVenue(msg.seed);
       subscribed = ["BTC-PERP"];
       post({ channel: "bootstrap", snapshot: venue!.snapshot() });
-      post({ channel: "books", updates: venue!.bookSnapshots(subscribed) });
+      post({ channel: "books", updates: relabel(venue!.bookSnapshots(subscribed)) });
       startDrain();
       break;
     }
@@ -95,7 +133,7 @@ self.onmessage = (ev: MessageEvent<VenueControl>) => {
         ensureVenue(msg.seed);
       }
       post({ channel: "bootstrap", snapshot: venue!.snapshot() });
-      post({ channel: "books", updates: venue!.bookSnapshots(subscribed) });
+      post({ channel: "books", updates: relabel(venue!.bookSnapshots(subscribed)) });
       break;
     }
     case "set_speed": {
@@ -113,9 +151,7 @@ self.onmessage = (ev: MessageEvent<VenueControl>) => {
     }
     case "step": {
       // Manual stepping is a console power feature: advance one step.
-      const v = ensureVenue();
-      v.pause();
-      (v as unknown as { ticker: { step(ms: number): void } }).ticker.step(msg.ms ?? 250);
+      ensureVenue().step(msg.ms ?? 250);
       drain();
       break;
     }
@@ -123,13 +159,25 @@ self.onmessage = (ev: MessageEvent<VenueControl>) => {
       const v = ensureVenue();
       subscribed = msg.symbols;
       v.subscribe(msg.symbols);
-      post({ channel: "books", updates: v.bookSnapshots(msg.symbols) });
+      post({ channel: "books", updates: relabel(v.bookSnapshots(msg.symbols)) });
       break;
     }
     case "command": {
       const v = ensureVenue();
+      const accounts = commandAccounts(msg);
       v.command(msg.command);
-      drain();
+      const out = v.drain();
+      // Fill receipts for the commanding accounts — the venue answers you.
+      for (const t of out.prints as Trade[]) {
+        const taker = accounts.has(t.taker_subaccount);
+        const maker = accounts.has(t.maker_subaccount);
+        if (taker || maker) post({ channel: "trade_fill", trade: t, taker, maker });
+      }
+      emitOutputs(out);
+      break;
+    }
+    case "ping": {
+      post({ channel: "pong", id: msg.id, ts: Date.now() });
       break;
     }
     case "governance": {
@@ -166,7 +214,7 @@ self.onmessage = (ev: MessageEvent<VenueControl>) => {
     case "request_snapshot": {
       const v = ensureVenue();
       post({ channel: "snapshot", snapshot: v.snapshot() });
-      post({ channel: "books", updates: v.bookSnapshots(subscribed) });
+      post({ channel: "books", updates: relabel(v.bookSnapshots(subscribed)) });
       break;
     }
   }

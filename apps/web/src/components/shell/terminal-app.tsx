@@ -10,6 +10,7 @@ import { connectVenue, useVenueStore } from "@/lib/venue-store";
 import { LeftRail } from "./left-rail";
 import { TopBar } from "./top-bar";
 import { StatusBar } from "./status-bar";
+import { ConnectionDialog } from "./connection-dialog";
 import { TerminalView } from "@/views/terminal/terminal-view";
 import { MarketsSkeleton } from "./skeletons";
 
@@ -49,6 +50,7 @@ export function TerminalApp() {
         </main>
       </div>
       <StatusBar />
+      <ConnectionDialog />
     </div>
   );
 }

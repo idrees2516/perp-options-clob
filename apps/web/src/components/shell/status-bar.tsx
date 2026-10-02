@@ -2,7 +2,8 @@
 
 /**
  * Status bar — the venue's heartbeat at the bottom edge:
- * engine stats, revenue router split, journal cursor, market-data health.
+ * transport + latency, engine stats, revenue router split, journal cursor,
+ * market-data health.
  */
 
 import { memo } from "react";
@@ -14,6 +15,9 @@ export const StatusBar = memo(function StatusBar() {
   const journalLen = useVenueStore((s) => s.journal.length);
   const books = useVenueStore((s) => s.books);
   const activeSymbol = useVenueStore((s) => s.activeSymbol);
+  const mode = useVenueStore((s) => s.mode);
+  const gateway = useVenueStore((s) => s.gateway);
+  const setConnectionOpen = useVenueStore((s) => s.setConnectionOpen);
 
   const stats = snapshot?.stats;
   const meta = snapshot?.meta;
@@ -27,10 +31,34 @@ export const StatusBar = memo(function StatusBar() {
 
   return (
     <footer className="h-7 shrink-0 border-t border-hairline bg-card/60 backdrop-blur-md flex items-center gap-3 px-3 text-[10.5px] text-muted-foreground z-20">
-      <span className="flex items-center gap-1.5">
-        <span className={`w-1.5 h-1.5 rounded-full ${meta?.connected ? "bg-up" : "bg-down"} ${meta?.connected ? "pulse-dot" : ""}`} />
-        <span className="font-mono">{meta?.transport === "sim-worker" ? "SIM" : "GATEWAY"}</span>
-      </span>
+      <button
+        type="button"
+        onClick={() => setConnectionOpen(true)}
+        aria-label="Venue connection settings"
+        className="flex items-center gap-1.5 hover:text-foreground transition-colors"
+        title="Connection settings"
+      >
+        <span
+          className={`w-1.5 h-1.5 rounded-full ${
+            mode === "sim"
+              ? meta?.connected
+                ? "bg-up pulse-dot"
+                : "bg-down"
+              : gateway.status === "live"
+                ? "bg-up pulse-dot"
+                : gateway.status === "error"
+                  ? "bg-down"
+                  : "bg-amber-400"
+          }`}
+        />
+        <span className="font-mono">{mode === "sim" ? "SIM" : "GATEWAY"}</span>
+      </button>
+      {mode === "remote" && (
+        <Stat
+          label="rtt"
+          value={gateway.latencyMs != null ? `${gateway.latencyMs}ms` : "—"}
+        />
+      )}
       <Divider />
       <Stat label="events" value={stats ? stats.events.toLocaleString() : "—"} />
       <Stat label="trades" value={stats ? stats.trades.toLocaleString() : "—"} />

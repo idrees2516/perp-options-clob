@@ -25,7 +25,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Pause, Play, Gauge, Moon, Sun, RefreshCw, RotateCcw } from "lucide-react";
+import { Pause, Play, Gauge, Moon, Sun, RefreshCw, RotateCcw, Cable } from "lucide-react";
 import { toast } from "sonner";
 
 const SPEEDS = [
@@ -54,6 +54,9 @@ export const TopBar = memo(function TopBar() {
   const setSpeed = useVenueStore((s) => s.setSpeed);
   const resetVenue = useVenueStore((s) => s.resetVenue);
   const refresh = useVenueStore((s) => s.refresh);
+  const mode = useVenueStore((s) => s.mode);
+  const gateway = useVenueStore((s) => s.gateway);
+  const setConnectionOpen = useVenueStore((s) => s.setConnectionOpen);
   const [clock, setClock] = useState<number>(0);
   const { theme, setTheme } = useTheme();
 
@@ -195,6 +198,20 @@ export const TopBar = memo(function TopBar() {
 
       {/* Controls */}
       <div className="flex items-center">
+        <button
+          onClick={() => setConnectionOpen(true)}
+          className={`w-7 h-7 rounded-md flex items-center justify-center transition-colors focus-glow ${
+            mode === "remote"
+              ? gateway.status === "live"
+                ? "text-primary bg-primary/10"
+                : "text-amber-400 bg-amber-400/10"
+              : "text-muted-foreground hover:text-foreground hover:bg-muted/70"
+          }`}
+          aria-label="Venue connection settings"
+          title={mode === "remote" ? `Gateway · ${gateway.status}` : "Connection — embedded sim"}
+        >
+          <Cable className="w-3.5 h-3.5" />
+        </button>
         <button
           onClick={() => refresh()}
           className="w-7 h-7 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted/70 transition-colors focus-glow"

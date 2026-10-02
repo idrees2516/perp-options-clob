@@ -59,6 +59,43 @@ The same message contract drives both the embedded simulator (demo mode —
 zero backend) and a remote gateway (production path). Deep dive:
 [`apps/web/README.md`](apps/web/README.md).
 
+### The live venue gateway
+
+[`apps/gateway`](apps/gateway/README.md) is the production transport: one
+HTTP server, two planes — a **socket.io venue stream** (bootstrap →
+snapshot/delta books with per-session sequencing → prints → journal →
+account deltas) and a **signed REST surface**. It runs the same
+`@perp/sim-engine` venue server-side as the authoritative book, so the
+terminal, the contract and the economics stay identical whether the venue
+lives in a Web Worker (demo) or behind the gateway (live).
+
+- **G-25 auth**: HMAC-SHA256 over `key_id|nonce|method|path|body_hash`,
+  strictly-increasing per-key nonces (replays → `409`), ±30s timestamps,
+  AES-256-GCM-encrypted secrets at rest under a server pepper, key
+  provisioning endpoint, trader/admin roles.
+- **Market data**: per-connection subscriptions, per-connection `G-27`
+  book sequencer (a visible seq gap is a real drop — the client resyncs),
+  2.5s full snapshots, 80ms delta drain, 700ms market rows.
+- **Order entry**: commands over the socket with synchronous drain so the
+  issuer sees its own fills immediately (`trade_fill` receipts routed to
+  every session that owns a leg of the trade).
+- **Abuse controls**: token-bucket rate limits per key / per socket / per
+  IP with `Retry-After`, request body caps, client caps.
+- **Ops**: `/healthz` + `/readyz`, structured JSON logs, graceful drain on
+  shutdown, env-driven frozen config; `bun test` boots real gateways and
+  exercises the whole surface (auth, sockets, replays, rate limits).
+
+Run the full stack (edge router on `:8080`, web on `/`, gateway under
+`/gateway/*` — one origin, no CORS):
+
+```
+docker compose up --build
+```
+
+Or standalone: `bun run dev:gateway` → `:3031`, then point the terminal's
+connection dialog at it (direct origin, same-origin proxy port, or a
+mounted path prefix — all three are supported by `RemoteConnection`).
+
 ## The crates
 
 | Crate | Role | The one design decision that defines it |

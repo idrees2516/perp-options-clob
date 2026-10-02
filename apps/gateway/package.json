@@ -1,0 +1,26 @@
+{
+  "name": "@perp/gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production venue gateway for perp-options-clob — authoritative market data + order entry over socket.io and signed REST (G-25)",
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "start": "bun src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf .turbo node_modules"
+  },
+  "dependencies": {
+    "@perp/sim-engine": "workspace:*",
+    "@perp/types": "workspace:*",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "@perp/typescript-config": "workspace:*",
+    "@types/bun": "^1.3.4",
+    "@types/node": "^22.10.0",
+    "socket.io-client": "^4.8.3"
+  }
+}
