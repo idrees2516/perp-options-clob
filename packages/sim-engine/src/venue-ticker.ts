@@ -197,6 +197,7 @@ export class VenueTicker {
     this.autoList();
     this.rfqAutoQuote();
     this.rfqAutoExecute();
+    this.rfqSweep();
     this.pruneVolumes();
   }
 
@@ -1134,6 +1135,25 @@ export class VenueTicker {
       }
     }
     this.rfqQueue = keep;
+  }
+
+  /**
+   * A user-created RFQ (gateway / sim command path). Dealers auto-quote it
+   * after a human-realistic delay — but never auto-execute: accepting a
+   * quote is the taker's decision, not the venue's.
+   */
+  noteUserRfq(id: number): void {
+    this.rfqQueue.push({ id, respondAtWall: Date.now() + 800 });
+  }
+
+  /** Wall-clock expiry sweep for open/quoted RFQs (ttl semantics are real seconds). */
+  private rfqSweep(): void {
+    const e = this.engine;
+    for (const id of [...e.rfqs.keys()]) {
+      const rfq = e.rfqs.get(id);
+      if (!rfq || (rfq.status !== "open" && rfq.status !== "quoted")) continue;
+      if (Date.now() >= rfq.expires_at) e.rfqExpire(id);
+    }
   }
 
   private rfqAutoExecute(): void {

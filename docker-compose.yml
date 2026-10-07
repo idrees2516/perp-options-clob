@@ -38,6 +38,10 @@ services:
         NEXT_PUBLIC_VENUE_GATEWAY_URL: "/gateway"
     environment:
       NEXT_TELEMETRY_DISABLED: 1
+      # The dedicated gateway service owns :3031 in this stack — suppress the
+      # web container's in-process embedded gateway (docker networks isolate
+      # them, so both would otherwise run independent venues).
+      VENUE_GATEWAY_EMBED: "0"
     depends_on:
       - gateway
     expose:

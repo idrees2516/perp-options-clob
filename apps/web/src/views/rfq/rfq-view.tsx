@@ -51,6 +51,9 @@ export const RfqView = memo(function RfqView() {
   const account = useVenueStore((s) => s.activeAccount);
 
   const now = snapshot?.meta.now ?? Date.now();
+  // RFQ/quote lifetimes run on the wall clock (interactive TTLs) — venue
+  // time is only used for trade/broadcast timestamps from the event stream.
+  const wallNow = Date.now();
   const descriptors = snapshot?.accountDescriptors ?? [];
 
   const [expanded, setExpanded] = useState<number | null>(null);
@@ -501,7 +504,7 @@ export const RfqView = memo(function RfqView() {
                                 <span className="text-muted-foreground/50">—</span>
                               )}
                             </Td>
-                            <Td right className="text-muted-foreground">{relTime(r.expires_at, now)}</Td>
+                            <Td right className="text-muted-foreground">{relTime(r.expires_at, wallNow)}</Td>
                             <Td>
                               <StatusBadge status={r.status} />
                             </Td>
@@ -525,7 +528,7 @@ export const RfqView = memo(function RfqView() {
                                   rfq={r}
                                   instMap={instMap}
                                   nameFor={nameFor}
-                                  now={now}
+                                  now={wallNow}
                                   canAct={mine && (r.status === "open" || r.status === "quoted")}
                                   onExecute={executeQuote}
                                   onCancel={cancelRfq}

@@ -35,7 +35,7 @@ const securityHeaders = [
 const nextConfig: NextConfig = {
   output: "standalone",
   reactStrictMode: true,
-  transpilePackages: ["@perp/types", "@perp/sim-engine", "@perp/api-client", "@perp/ui"],
+  transpilePackages: ["@perp/types", "@perp/sim-engine", "@perp/api-client", "@perp/ui", "@perp/gateway"],
   poweredByHeader: false,
   async headers() {
     return [

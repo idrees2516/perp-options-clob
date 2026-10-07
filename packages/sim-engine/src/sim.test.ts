@@ -118,6 +118,84 @@ describe("sim engine", () => {
     expect(you.positions.get("BTC-PERP")?.signed_lots ?? 0).toBe(0);
   });
 
+  test("user RFQ auto-quotes, executes and expires on the wall clock", () => {
+    const v = runVenue(5);
+    const e = v.engine;
+
+    // ── a user-created RFQ receives dealer quotes (ticker-driven) ──
+    v.command({
+      type: "rfq_create",
+      taker: 7,
+      legs: [{ symbol: "BTC-PERP", side: "bid", qty_lots: 5 }],
+      counterparties: [1, 2],
+      min_total_cost_quote_minor: null,
+      max_total_cost_quote_minor: null,
+      ttl_ms: 30_000,
+      now: e.now,
+    });
+    const rfqId = e.nextRfqIdPeek() - 1;
+    // The dealer delay is wall-clock 800ms — actually wait it out.
+    const waitWall = (ms: number) => { const t0 = Date.now(); while (Date.now() < t0 + ms) { /* spin */ } };
+    waitWall(850);
+    v["ticker"].step(1000);
+    const rfq = e.rfqs.get(rfqId)!;
+    expect(rfq.status).toBe("quoted");
+    expect(rfq.quotes.length).toBe(2); // MM-1 and MM-2 both quote
+    // TTLs are wall-clock interactive seconds, independent of venue speed.
+    expect(rfq.expires_at).toBeGreaterThan(Date.now());
+
+    // ── executing a live quote settles with trades + fill journal events ──
+    const quote = rfq.quotes[0]!;
+    v.command({ type: "rfq_execute", taker: 7, rfq_id: rfqId, quote_id: quote.quote_id, now: e.now });
+    expect(rfq.status).toBe("executed");
+    expect(rfq.trades?.length).toBe(1);
+    const fillEvents = e.journal.filter((j) => j.event.type === "trade_executed").length;
+    expect(fillEvents).toBeGreaterThanOrEqual(1);
+    // Fills live in the durable fill log — visible even after journal churn.
+    expect(e.fillLog.some((t) => t.taker_subaccount === 7 && t.symbol === "BTC-PERP")).toBe(true);
+
+    // ── an unexecuted RFQ expires via the wall-clock sweep ──
+    v.command({
+      type: "rfq_create",
+      taker: 7,
+      legs: [{ symbol: "BTC-PERP", side: "ask", qty_lots: 3 }],
+      counterparties: [1, 2],
+      min_total_cost_quote_minor: null,
+      max_total_cost_quote_minor: null,
+      ttl_ms: 5, // 5ms — the sweep fires on the next ticker step
+      now: e.now,
+    });
+    const dying = e.nextRfqIdPeek() - 1;
+    expect(e.rfqs.get(dying)!.status).toBe("open");
+    waitWall(20);
+    v["ticker"].step(1000);
+    expect(e.rfqs.get(dying)!.status).toBe("expired");
+    const closed = e.journal.filter((j) => j.event.type === "rfq_closed");
+    expect(closed.some((j) => (j.event as { reason?: string }).reason === "expired")).toBe(true);
+
+    // ── accepting a dead quote is a visible rejection, not a silent no-op ──
+    v.command({
+      type: "rfq_create",
+      taker: 7,
+      legs: [{ symbol: "BTC-PERP", side: "bid", qty_lots: 2 }],
+      counterparties: [1, 2],
+      min_total_cost_quote_minor: null,
+      max_total_cost_quote_minor: null,
+      ttl_ms: 20_000,
+      now: e.now,
+    });
+    const stale = e.nextRfqIdPeek() - 1;
+    waitWall(850);
+    v["ticker"].step(1000);
+    const staleRfq = e.rfqs.get(stale)!;
+    // Force-age the quote, then try to execute it.
+    staleRfq.quotes[0]!.expires_at = Date.now() - 1;
+    const rejections = e.journal.filter((j) => j.event.type === "rfq_rejected").length;
+    v.command({ type: "rfq_execute", taker: 7, rfq_id: stale, quote_id: staleRfq.quotes[0]!.quote_id, now: e.now });
+    expect(e.journal.filter((j) => j.event.type === "rfq_rejected").length).toBe(rejections + 1);
+    expect(staleRfq.status).toBe("quoted"); // not executed
+  });
+
   test("snapshot builds a full venue view", () => {
     const v = runVenue(8);
     const snap = v.snapshot();

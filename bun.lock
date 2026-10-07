@@ -41,6 +41,7 @@
       "dependencies": {
         "@hookform/resolvers": "^5.1.1",
         "@perp/api-client": "workspace:*",
+        "@perp/gateway": "workspace:*",
         "@perp/sim-engine": "workspace:*",
         "@perp/types": "workspace:*",
         "@perp/ui": "workspace:*",

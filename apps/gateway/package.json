@@ -5,6 +5,10 @@
   "description": "Production venue gateway for perp-options-clob — authoritative market data + order entry over socket.io and signed REST (G-25)",
   "type": "module",
   "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./embed": "./src/embed.ts"
+  },
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "start": "bun src/index.ts",

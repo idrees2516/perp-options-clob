@@ -144,6 +144,7 @@ const MAX_POSITION_LOTS = 10_000;
 const PRICE_BAND_BPS_PERP = 1_000;
 const PRICE_BAND_BPS_OPTION = 2_000;
 const JOURNAL_CAP = 4000;
+const FILL_LOG_CAP = 1500;
 const TAKER_ARRIVAL_PER_SEC = 1.1;
 const EXERCISE_TWAP_MS = 30 * 60 * 1000;
 
@@ -170,6 +171,8 @@ export class SimEngine {
   ivs = new Map<Symbol, number>();
 
   journal: JournalEntry[] = [];
+  /** Durable per-account fill source — survives journal churn at high speeds. */
+  fillLog: Trade[] = [];
   stats: EngineStats;
   revenue = newRevenueLedger();
   insurance_balance: bigint;
@@ -1072,6 +1075,8 @@ export class SimEngine {
     this.journalEvent({ type: "trade_executed", payload: trade });
     this.out.prints.push(trade);
     if (this.out.prints.length > 300) this.out.prints.splice(0, this.out.prints.length - 300);
+    this.fillLog.push(trade);
+    if (this.fillLog.length > FILL_LOG_CAP) this.fillLog.splice(0, this.fillLog.length - FILL_LOG_CAP);
 
     this.out.bookDirty.add(takerReq.symbol);
     this.out.accountDirty.add(takerReq.subaccount);
@@ -1332,8 +1337,11 @@ export class SimEngine {
       counterparties: cmd.counterparties.length ? cmd.counterparties : [1, 2],
       min_total_cost_quote_minor: cmd.min_total_cost_quote_minor,
       max_total_cost_quote_minor: cmd.max_total_cost_quote_minor,
-      created_at: this.now,
-      expires_at: this.now + cmd.ttl_ms,
+      // RFQ/quote TTLs are interactive (wall-clock) lifetimes — the taker
+      // is a human deciding in real seconds, independent of venue speed.
+      // The ticker drives dealer cadences on the same wall clock.
+      created_at: Date.now(),
+      expires_at: Date.now() + cmd.ttl_ms,
       status: "open",
       quotes: [],
       executed_quote_id: null,
@@ -1374,7 +1382,7 @@ export class SimEngine {
       leg_prices_ticks: cmd.leg_prices_ticks,
       total_cost_quote_minor: total,
       ttl_ms: cmd.ttl_ms,
-      expires_at: this.now + cmd.ttl_ms,
+      expires_at: Date.now() + cmd.ttl_ms,
     });
     this.journalEvent({
       type: "rfq_quoted",
@@ -1390,7 +1398,12 @@ export class SimEngine {
     const rfq = this.rfqs.get(rfq_id);
     const quote = rfq?.quotes.find((q) => q.quote_id === quote_id);
     if (!rfq || !quote || rfq.status === "executed" || rfq.status === "expired" || rfq.status === "cancelled") return;
-    if (this.now > quote.expires_at) return;
+    if (Date.now() > quote.expires_at) {
+      // Visible rejection — a silent no-op leaves the taker staring at a
+      // dead Accept button with no feedback.
+      this.journalEvent({ type: "rfq_rejected", subaccount: taker, reason: `quote ${quote_id} expired`, ts: this.now });
+      return;
+    }
     rfq.status = "executed";
     rfq.executed_quote_id = quote_id;
 
@@ -1433,6 +1446,11 @@ export class SimEngine {
       trades.push(trade);
       fees.push(fee.fee_quote_minor);
       this.out.prints.push(trade);
+      this.fillLog.push(trade);
+      if (this.fillLog.length > FILL_LOG_CAP) this.fillLog.splice(0, this.fillLog.length - FILL_LOG_CAP);
+      // RFQ legs are trades too — journal them as trade_executed so fills,
+      // tape and account history see the same picture as CLOB prints.
+      this.journalEvent({ type: "trade_executed", payload: trade });
       this.out.accountDirty.add(taker);
       this.out.accountDirty.add(quote.maker);
     });
@@ -1448,6 +1466,15 @@ export class SimEngine {
         this.journalEvent({ type: "rfq_closed", rfq_id, quote_id, reason: "cancelled" });
       }
     }
+  }
+
+  /** Wall-clock expiry sweep target — called from the venue ticker. */
+  rfqExpire(rfq_id: number): void {
+    const rfq = this.rfqs.get(rfq_id);
+    if (!rfq || (rfq.status !== "open" && rfq.status !== "quoted")) return;
+    if (Date.now() < rfq.expires_at) return;
+    rfq.status = "expired";
+    this.journalEvent({ type: "rfq_closed", rfq_id, quote_id: null, reason: "expired" });
   }
 
   registerBlock(cmd: Extract<Command, { type: "block_trade" }>): void {

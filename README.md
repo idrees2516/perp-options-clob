@@ -96,6 +96,13 @@ Or standalone: `bun run dev:gateway` → `:3031`, then point the terminal's
 connection dialog at it (direct origin, same-origin proxy port, or a
 mounted path prefix — all three are supported by `RemoteConnection`).
 
+**Embedded mode (default).** The web app boots the gateway *in-process*
+through `apps/web/src/instrumentation.ts` → `@perp/gateway/embed`: the
+Next.js server itself listens on `:3031` next to the terminal, so dev and
+single-container deploys get the live venue with zero external supervision
+(idempotent boot — an already-serving gateway is detected and reused;
+`VENUE_GATEWAY_EMBED=0` opts out).
+
 ## The crates
 
 | Crate | Role | The one design decision that defines it |

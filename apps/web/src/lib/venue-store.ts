@@ -246,7 +246,11 @@ export function connectVenue(): void {
       connected: true,
       snapshot,
       markets: snapshot.markets,
-      journal: snapshot ? useVenueStore.getState().journal : [],
+      // Bootstrap = a (re)connect to a venue generation whose journal seq
+      // starts over — stale entries from a previous generation would collide
+      // on the same keys. Fresh generation, fresh feed.
+      journal: [],
+      prints: [],
     });
     client.subscribe([useVenueStore.getState().activeSymbol]);
   });

@@ -32,7 +32,24 @@ or the cable icon in the top bar) → **Live gateway** → *Connect*.
 Default demo profile: auth off, CORS `*`, anonymous sessions get
 admin-equivalent rights — the sandbox/local profile.
 
-## Production profile
+## Embedded mode (default for the web app)
+
+The web app boots the gateway **in-process** via `apps/web/src/instrumentation.ts`
+→ `@perp/gateway/embed` (`bootEmbeddedGateway`): one Next.js server process
+serves both the terminal and the venue on `:3031`. No external supervision
+needed — the gateway lives exactly as long as the web server:
+
+- dev: `bun run dev` (the sandbox/dev-server topology) — the browser reaches
+  it same-origin through the edge proxy (`/?XTransformPort=3031`);
+- production: the standalone Next server (`next start` / container) boots it
+  on startup — deploy stacks need no second process;
+- standalone mode below is still available for dedicated deployments.
+
+The boot is idempotent (an already-serving gateway on `:3031` is detected via
+`/healthz` and reused) and retries while a predecessor drains. Set
+`VENUE_GATEWAY_EMBED=0` to disable embedding.
+
+## Standalone / production profile
 
 ```bash
 GATEWAY_AUTH_REQUIRED=true \

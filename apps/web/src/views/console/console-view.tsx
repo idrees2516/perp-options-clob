@@ -952,7 +952,9 @@ export const ConsoleView = memo(function ConsoleView() {
       subaccount: activeAccount,
       symbol: activeSymbol,
       side: "bid",
-      total_lots: 100,
+      // 50 lots ≈ $192K initial margin at 5% — sized for the $250K demo
+      // account so every slice clears the margin gate and completes.
+      total_lots: 50,
       slices: 10,
       slice_interval_ms: 30_000,
       limit_ticks: null,
@@ -991,9 +993,9 @@ export const ConsoleView = memo(function ConsoleView() {
           size="sm"
           className="h-7 text-[10px] shrink-0"
           onClick={presetTwap}
-          title="100 lots bid · 10 slices · 30s apart (5 min)"
+          title="50 lots bid · 10 slices · 30s apart (5 min)"
         >
-          TWAP buy 100 · 10 slices · 5min
+          TWAP buy 50 · 10 slices · 5min
         </Button>
       </div>
 

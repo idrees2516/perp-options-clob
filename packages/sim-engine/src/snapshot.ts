@@ -194,11 +194,10 @@ function tifLabel(tif: import("@perp/types").TimeInForce): string {
 
 export function buildFills(e: SimEngine, limit = 300): FillRow[] {
   const out: FillRow[] = [];
-  const journalTail = e.journal.slice(-limit * 2);
-  for (const entry of journalTail) {
-    const ev = entry.event;
-    if (ev.type !== "trade_executed") continue;
-    const t = ev.payload;
+  // The durable fill log (CLOB matches + RFQ legs) — unlike the journal
+  // tail, a user's fills don't scroll out of view at high venue speeds.
+  const trades = e.fillLog.slice(-Math.ceil(limit / 2));
+  for (const t of trades) {
     out.push({
       seq: t.seq,
       ts: t.ts,

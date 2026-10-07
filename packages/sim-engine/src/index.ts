@@ -88,6 +88,12 @@ export class SimVenue {
 
   command(cmd: Command): void {
     this.engine.process(cmd);
+    // User-created RFQs join the dealer auto-quote queue — the same market
+    // makers that quote scripted flow respond after a human-realistic delay
+    // (but never auto-execute; that choice belongs to the taker).
+    if (cmd.type === "rfq_create") {
+      this.ticker.noteUserRfq(this.engine.nextRfqIdPeek() - 1);
+    }
   }
 
   governance(action: GovernanceAction): string | null {

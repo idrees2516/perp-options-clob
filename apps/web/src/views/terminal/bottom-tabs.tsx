@@ -187,6 +187,9 @@ export const BottomTabs = memo(function BottomTabs() {
               {fills.length === 0 && <EmptyRow cols={7} text="No fills yet." />}
               {fills.map((f, i) => {
                 const inst = insts.get(f.symbol);
+                // maker_side describes the MAKER's side — the taker's side is
+                // its mirror (a taker buying lifts an ask).
+                const youBought = f.role === "taker" ? f.maker_side === "ask" : f.maker_side === "bid";
                 return (
                   <tr key={`${f.seq}-${f.role}-${i}`} className="hover:bg-muted/30">
                     <Td className="font-mono text-[11px]">{shortSymbol(f.symbol)}</Td>
@@ -195,8 +198,8 @@ export const BottomTabs = memo(function BottomTabs() {
                         {f.liquidity_label === "T" ? "Taker" : "Maker"}
                       </span>
                     </Td>
-                    <Td className={f.maker_side === "bid" ? "text-up" : "text-down"}>
-                      {f.maker_side === "bid" ? "Buy" : "Sell"}
+                    <Td className={youBought ? "text-up" : "text-down"}>
+                      {youBought ? "Buy" : "Sell"}
                     </Td>
                     <Td right>{ticksToPrice(f.price_ticks, inst ?? null)}</Td>
                     <Td right>{inst ? sizeBase(f.qty_lots, inst) : f.qty_lots}</Td>
