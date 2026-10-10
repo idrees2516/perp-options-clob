@@ -203,7 +203,7 @@ impl AmericanAnalytics {
         };
 
         let bisect = |mut lo: f64, mut hi: f64| -> f64 {
-            let (mut flo, mut fhi) = (residual(lo), residual(hi));
+            let (mut flo, fhi) = (residual(lo), residual(hi));
             if !flo.is_finite() || !fhi.is_finite() {
                 return f64::INFINITY;
             }

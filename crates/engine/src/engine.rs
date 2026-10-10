@@ -954,6 +954,7 @@ impl Engine {
             }];
         };
         vec![Event::RfqCreated {
+            rfq_id: self.rfq_book.next_rfq_id(),
             taker,
             legs: built,
             counterparties: counterparties.to_vec(),
@@ -1036,6 +1037,7 @@ impl Engine {
         }
         vec![Event::RfqQuoted {
             rfq_id,
+            quote_id: self.rfq_book.next_quote_id(),
             maker,
             leg_prices_ticks: leg_prices.to_vec(),
             qty_lots: qty_lots.to_vec(),
@@ -2074,6 +2076,7 @@ impl Engine {
                 self.halted.insert(base_symbol.clone(), false);
             }
             Event::RfqCreated {
+                rfq_id: _predicted,
                 taker,
                 legs,
                 counterparties,
@@ -2101,6 +2104,7 @@ impl Engine {
             }
             Event::RfqQuoted {
                 rfq_id,
+                quote_id: _predicted,
                 maker,
                 leg_prices_ticks,
                 qty_lots,

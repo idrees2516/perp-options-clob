@@ -119,6 +119,7 @@ single-container deploys get the live venue with zero external supervision
 | [`poc-settlement`](crates/settlement) | On-chain layer | **State-diff settlement** (Lighter/dYdX pattern): merkleized account commitments, hash-chained batches, a conservation validator, the withdrawal escape hatch (G-30), and **proof-of-reserves**: nonce-bound liability trees over cash + collateral + vault claims, per-account inclusion proofs, a monotonic publication ledger, and a pluggable `ReserveAttestor` integration point (G-35) |
 | [`poc-persist`](crates/persist) | Durability | A **framed, CRC'd, chain-hashed command WAL** with segment rotation, atomic checkpoints, and torn-tail-safe crash recovery (G-24) |
 | [`poc-api`](crates/api) | Gateway protocol | Snapshot+delta market-data sessions with gap detection, **per-key monotonic nonces**, token-bucket rate limits, the time-locked withdrawal pipeline (G-25/27/32), and the full **FIX 4.4 stack**: wire codec + typed subset *plus* the session state machine — sequence integrity, resend with PossDup, admin GapFills, heartbeats/TestRequest enforcement, and a real TCP acceptor behind the `Wire` trait (G-26) |
+| [`poc-fix`](crates/fix) | The legacy desk bridge | A complete **FIX 4.4 acceptor** that turns a bank's OMS/EMS into a venue client: strict `tag=value` codec with BodyLength/CheckSum, the session protocol (logon, heartbeats, sequence gaps → ResendRequest, store-and-forward with PossDup + GapFill), and the application layer — order routing, ExecutionReports to **both** counterparties, market data, and the **RFQ dealer rails**: `QuoteRequest` (including multi-leg `NoLegs` structures — spreads, straddles, collars) → competitive firm quotes with per-leg prices and working sizes → `QuoteStatusReport` acks → partial lifts via `NewOrderSingle(117)`. The whole-system wiring proof ([`e2e_wiring.rs`](crates/fix/tests/e2e_wiring.rs)) lives here |
 | [`poc-governance`](crates/governance) | Parameter safety | **Weighted multisig → timelock → grace** with an instant guardian veto; every transition is a journalable event (G-33) |
 | [`poc-bench`](crates/bench) | Evidence | Deterministic benchmarks + whole-architecture stress scenarios (flash crash, vol spike, spam, cascade, oracle split, crash recovery) |
 | [`poc-demo`](crates/demo) | Proof of life | A scripted session exercising every subsystem, ending with a journal-replay audit |
@@ -212,6 +213,32 @@ off-chain matching auditable, and it is asserted by test:
   three must agree.
 - `engine::tests::conservation_across_trades_and_funding` — cash leaves
   the system only through routed fees; funding is zero-sum.
+
+## October 2026 — The Wiring Release (v0.7)
+
+The components became **one system**:
+
+- **Event ids wired out**: `RfqCreated`/`RfqQuoted` now carry the
+  engine-assigned `rfq_id`/`quote_id` (predicted at plan from the
+  book's counters) — external consumers map their references
+  deterministically, no state scanning.
+- **Multi-leg option structures over FIX**: `QuoteRequest` accepts a
+  `NoLegs (555)` repeating group (`LegSymbol/LegSide/LegQty`) — a
+  spread, a straddle, a collar is ONE request; dealers answer with
+  per-leg `LegPrice (686)`s and committed `LegOrderQty (685)` working
+  sizes; partial lifts take `qty` lots on **every wing at once**.
+- **Quote acks**: every quote lands a `QuoteStatusReport (i)` —
+  accepted (firm), rejected (with the gate's reason), canceled.
+- **Fills reach both desks**: RFQ executions emit ExecutionReports to
+  the taker's *and* the quoting dealer's sessions, per leg.
+- **The whole-stack wiring proof**: `crates/fix/tests/e2e_wiring.rs`
+  walks instruments → CLOB cross over FIX → spread RFQ → partial
+  execution → American exercise → settlement book + proof-of-reserves
+  → conservation, **twice, bit-identically**.
+- The demo grew the dealer-network section: a live call-spread RFQ
+  with partial lift and firmness on the remainder.
+
+Test suite: **420 passing**.
 
 ## Status
 
@@ -367,12 +394,13 @@ asserting conservation, replay determinism, and tier legality (I-27).
 | Doc | Contents |
 |---|---|
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | The full system: determinism model, order lifecycle, marks, margin, liquidations, funding, fees, settlement, persistence, gateway, governance, and the fourth-wave subsystems |
+| [`docs/WIRING.md`](docs/WIRING.md) | **The wiring diagram**: how every component connects — both execution paths (CLOB + RFQ dealer network), the FIX field map for options structures, and the whole-stack wiring proof |
 | [`docs/CLOB_ENGINE.md`](docs/CLOB_ENGINE.md) | **Deep dive**: the channel-layout matching engine — data structures, algorithms, auction uncrossing, determinism/provability, performance |
 | [`docs/OPTIONS.md`](docs/OPTIONS.md) | **Deep dive**: the option family — European/American × dated/everlasting, BAW/Merton pricing, the exercise lifecycle, assignment, margin treatment |
 | [`docs/research/ZKLIGHTER.md`](docs/research/ZKLIGHTER.md) | zkLighter research: what we adopted (channels, bounded work, provable state), adapted, and deferred |
 | [`docs/research/DERIVE_V3.md`](docs/research/DERIVE_V3.md) | Derive V3: the journal/replay discipline, sub-account margin, MMP/CoD, exercise-margin interaction |
 | [`docs/research/TRADE_PARADIGM_PARADEX.md`](docs/research/TRADE_PARADIGM_PARADEX.md) | Paradigm's RFQ network + Paradex's everlasting/margin design and how they compose here |
-| [`docs/INVARIANTS.md`](docs/INVARIANTS.md) | The invariant catalog (I-1..I-45) with enforcement points and the tests that guard each |
+| [`docs/INVARIANTS.md`](docs/INVARIANTS.md) | The invariant catalog (I-1..I-53) with enforcement points and the tests that guard each |
 | [`docs/ECONOMICS.md`](docs/ECONOMICS.md) | The complete economic incentive design: who pays whom, why, and under which caps |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Deployment shape, monitoring surfaces, runbooks, and the safety-parameter reference |
 | [`docs/FUZZING.md`](docs/FUZZING.md) | Property + fuzz strategy, and the three real defects it found (oracle liveness, ADL inversion, fee-routing leak) |

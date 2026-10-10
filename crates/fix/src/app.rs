@@ -81,6 +81,19 @@ mod exec_type {
     pub const REJECTED: &str = "8";
 }
 
+/// QuoteStatus(297) values for the QuoteStatusReport ("i") frames this
+/// gateway emits as quote acks.
+mod quote_status {
+    /// Accepted — the quote is live and firm.
+    pub const ACCEPTED: &str = "0";
+    /// Canceled (withdrawn or expired).
+    pub const CANCELED: &str = "7";
+    /// Rejected at the plan gate.
+    pub const REJECTED: &str = "5";
+    /// Expired (TTL lapsed).
+    pub const EXPIRED: &str = "9";
+}
+
 /// The gateway's view of one order, keyed by the desk's ClOrdID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackedOrder {
@@ -671,46 +684,95 @@ impl FixGateway {
     fn on_quote_request(&mut self, session_id: u64, msg: &FixMessage, now: u64) -> Vec<Vec<u8>> {
         let sub = self.sub_of(session_id);
         let req_id = msg.get(tag::QUOTE_REQ_ID).unwrap_or_default().to_string();
-        let symbol = msg.get(tag::SYMBOL).unwrap_or_default().to_string();
-        let side = match msg.get(tag::SIDE).unwrap_or("1") {
-            "2" => Side::Ask,
-            _ => Side::Bid,
-        };
-        let qty = msg.get_u64(tag::ORDER_QTY).unwrap_or(0);
-        if req_id.is_empty() || symbol.is_empty() || qty == 0 {
+        // A QuoteRequest is either single-symbol (55/54/38 — the plain
+        // flow) or a structured package: NoLegs(555) with per-leg
+        // LegSymbol(600)/LegSide(624)/LegQty(687) — the spread/straddle
+        // desk flow (G-11 "instrument or structure").
+        let mut legs = self.parse_legs(msg);
+        if legs.is_empty() {
+            let symbol = msg.get(tag::SYMBOL).unwrap_or_default().to_string();
+            let side = match msg.get(tag::SIDE).unwrap_or("1") {
+                "2" => Side::Ask,
+                _ => Side::Bid,
+            };
+            let qty = msg.get_u64(tag::ORDER_QTY).unwrap_or(0);
+            if symbol.is_empty() || qty == 0 {
+                return vec![self.execution_reject_simple(
+                    session_id,
+                    &req_id,
+                    "malformed quote request",
+                    now,
+                )];
+            }
+            legs = vec![RfqLegCommand {
+                symbol,
+                side,
+                qty_lots: qty,
+            }];
+        }
+        if req_id.is_empty() {
             return vec![self.execution_reject_simple(
                 session_id,
                 &req_id,
-                "malformed quote request",
+                "missing quote req id",
                 now,
             )];
         }
         let events = self.engine.process(Command::RfqCreate {
             taker: sub,
-            legs: vec![RfqLegCommand {
-                symbol,
-                side,
-                qty_lots: qty,
-            }],
+            legs,
             counterparties: vec![],
             min_total_cost_quote_minor: None,
             max_total_cost_quote_minor: None,
             ttl_ms: 600_000,
             now,
         });
-        let mut out = Vec::new();
-        for ev in events {
-            if let Event::RfqCreated { .. } = ev {
-                // Assign the mapping: the engine assigns ids from 1.
-                let mut id = 1;
-                while self.engine.rfq_view().rfq(id).is_some() {
-                    id += 1;
-                }
-                self.rfq_by_req_id.insert(req_id.clone(), id - 1);
+        // Map the desk's QuoteReqID to the engine's RFQ id straight off
+        // the event — no state scanning, deterministic under concurrent
+        // requests from multiple sessions.
+        for ev in &events {
+            if let Event::RfqCreated { rfq_id, .. } = ev {
+                self.rfq_by_req_id.insert(req_id.clone(), *rfq_id);
             }
         }
-        let _ = &mut out;
-        out
+        Vec::new()
+    }
+
+    /// Parse a FIX `NoLegs` repeating group (555/600/624/687) into engine
+    /// RFQ legs. Order is preserved: leg i in the group is leg i of the
+    /// package. Returns an empty vector when no well-formed group is
+    /// present.
+    fn parse_legs(&self, msg: &FixMessage) -> Vec<RfqLegCommand> {
+        let Some(n) = msg.get_u64(tag::NO_LEGS) else {
+            return Vec::new();
+        };
+        if n == 0 || n > 64 {
+            return Vec::new();
+        }
+        let symbols = msg.get_all(tag::LEG_SYMBOL);
+        let sides = msg.get_all(tag::LEG_SIDE);
+        let qtys = msg.get_all(tag::LEG_QTY);
+        let n = n as usize;
+        if symbols.len() != n || sides.len() != n || qtys.len() != n {
+            return Vec::new();
+        }
+        (0..n)
+            .filter_map(|i| {
+                let qty = qtys[i].parse::<u64>().ok()?;
+                if qty == 0 {
+                    return None;
+                }
+                let side = match sides[i] {
+                    "2" => Side::Ask,
+                    _ => Side::Bid,
+                };
+                Some(RfqLegCommand {
+                    symbol: symbols[i].to_string(),
+                    side,
+                    qty_lots: qty,
+                })
+            })
+            .collect()
     }
 
     fn on_quote(&mut self, session_id: u64, msg: &FixMessage, now: u64) -> Vec<Vec<u8>> {
@@ -720,55 +782,100 @@ impl FixGateway {
         let Some(rfq_id) = self.rfq_by_req_id.get(&req_id).copied() else {
             return Vec::new();
         };
-        // Two-sided quotes: the dealer's side is opposite the RFQ leg's
-        // taker side; a dealer buying quotes on BidPx/BidSize, selling
-        // on OfferPx/OfferSize.
-        let (price, size) = if let (Some(bpx), Some(bsz)) =
-            (msg.get_u64(tag::BID_PX), msg.get_u64(tag::BID_SIZE))
-        {
-            (Some(bpx), Some(bsz))
-        } else if let (Some(opx), Some(osz)) =
-            (msg.get_u64(tag::OFFER_PX), msg.get_u64(tag::OFFER_SIZE))
-        {
-            (Some(opx), Some(osz))
+        // Multi-leg quotes: the dealer's prices ride in the NoLegs group
+        // as LegPrice(686) per leg (aligned with the request's legs);
+        // the optional LegOrderQty(685) gives the committed working size
+        // (Paradigm-style partial-size quoting).
+        let leg_prices: Vec<u64> = msg
+            .get_all(tag::LEG_PRICE)
+            .iter()
+            .filter_map(|p| p.parse::<u64>().ok())
+            .collect();
+        let (prices, sized_qty) = if !leg_prices.is_empty() {
+            let sizes: Vec<u64> = msg
+                .get_all(tag::LEG_ORDER_QTY)
+                .iter()
+                .filter_map(|q| q.parse::<u64>().ok())
+                .collect();
+            let sz = if sizes.is_empty() { None } else { Some(sizes) };
+            (leg_prices, sz)
         } else {
-            (msg.get_u64(tag::PRICE), None)
+            // Two-sided single-leg quotes: the dealer's side is opposite
+            // the RFQ leg's taker side; a dealer buying quotes on
+            // BidPx/BidSize, selling on OfferPx/OfferSize.
+            let (price, size) = if let (Some(bpx), Some(bsz)) =
+                (msg.get_u64(tag::BID_PX), msg.get_u64(tag::BID_SIZE))
+            {
+                (Some(bpx), Some(bsz))
+            } else if let (Some(opx), Some(osz)) =
+                (msg.get_u64(tag::OFFER_PX), msg.get_u64(tag::OFFER_SIZE))
+            {
+                (Some(opx), Some(osz))
+            } else {
+                (msg.get_u64(tag::PRICE), None)
+            };
+            match price {
+                Some(p) => (vec![p], size.map(|s| vec![s])),
+                None => return Vec::new(),
+            }
         };
-        let Some(price) = price else {
-            return Vec::new();
-        };
-        let events = if let Some(sz) = size {
-            self.engine.process(Command::RfqQuoteSized {
+        let events = match sized_qty {
+            Some(qty) => self.engine.process(Command::RfqQuoteSized {
                 maker: sub,
                 rfq_id,
-                leg_prices_ticks: vec![price],
-                qty_lots: vec![sz],
+                leg_prices_ticks: prices,
+                qty_lots: qty,
                 ttl_ms: 600_000,
                 now,
-            })
-        } else {
-            self.engine.process(Command::RfqQuote {
+            }),
+            None => self.engine.process(Command::RfqQuote {
                 maker: sub,
                 rfq_id,
-                leg_prices_ticks: vec![price],
+                leg_prices_ticks: prices,
                 ttl_ms: 600_000,
                 now,
-            })
+            }),
         };
-        // Record the desk's QuoteID → engine quote id.
+        let mut out = Vec::new();
         for ev in &events {
-            if matches!(ev, Event::RfqQuoted { .. }) {
-                let mut qid = 1;
-                while self.engine.rfq_view().quote(qid).is_some() {
-                    qid += 1;
+            match ev {
+                // Map the desk's QuoteID to the engine's quote id straight
+                // off the event — the deterministic wiring.
+                Event::RfqQuoted {
+                    quote_id: engine_quote_id,
+                    ..
+                } => {
+                    self.quote_by_id
+                        .insert((sub, quote_id.clone()), *engine_quote_id);
+                    self.live_quote_ids
+                        .insert((req_id.clone(), sub), quote_id.clone());
                 }
-                let engine_qid = qid - 1;
-                self.quote_by_id.insert((sub, quote_id.clone()), engine_qid);
-                self.live_quote_ids
-                    .insert((req_id.clone(), sub), quote_id.clone());
+                Event::RfqRejected { reason, .. } => {
+                    out.push(self.quote_status_report(
+                        session_id,
+                        &req_id,
+                        Some(&quote_id),
+                        quote_status::REJECTED,
+                        reason,
+                        now,
+                    ));
+                }
+                _ => {}
             }
         }
-        Vec::new()
+        // Ack every accepted quote with a QuoteStatusReport so the desk
+        // knows its price is live and firm; rejections already carry one.
+        if events.iter().any(|e| matches!(e, Event::RfqQuoted { .. })) {
+            out.push(self.quote_status_report(
+                session_id,
+                &req_id,
+                Some(&quote_id),
+                quote_status::ACCEPTED,
+                "firm while it lives",
+                now,
+            ));
+        }
+        out
     }
 
     /// A taker's NewOrderSingle carrying `117=QuoteID` — the standard
@@ -805,13 +912,23 @@ impl FixGateway {
         };
         let want = msg.get_u64(tag::ORDER_QTY);
         let events = match want {
-            Some(qty) => self.engine.process(Command::RfqExecutePartial {
-                taker,
-                rfq_id,
-                quote_id: engine_qid,
-                take_per_leg: vec![qty],
-                now,
-            }),
+            Some(qty) => {
+                // A multi-leg quote takes `qty` lots on EVERY leg: the
+                // take vector is per-leg aligned (a spread lifts both
+                // wings at once — that is the point of a package).
+                let n_legs = self
+                    .engine
+                    .rfq_view()
+                    .rfq(rfq_id)
+                    .map_or(1, |r| r.legs.len());
+                self.engine.process(Command::RfqExecutePartial {
+                    taker,
+                    rfq_id,
+                    quote_id: engine_qid,
+                    take_per_leg: vec![qty; n_legs.max(1)],
+                    now,
+                })
+            }
             None => self.engine.process(Command::RfqExecute {
                 taker,
                 rfq_id,
@@ -822,14 +939,28 @@ impl FixGateway {
         let mut out = Vec::new();
         for ev in events {
             if let Event::RfqSettled {
+                rfq_id: settled_rfq,
+                quote_id: settled_quote,
                 trades,
                 taker,
                 maker,
-                ..
+                taker_fees_quote_minor,
             } = ev
             {
-                for t in &trades {
+                for (i, t) in trades.iter().enumerate() {
+                    // The taker's desk sees its side of every leg...
                     out.push(self.rfq_fill_report(session_id, &cl_ord_id, t, taker, maker));
+                    // ...and the quoting dealer's desk sees its side too
+                    // (a fill you cannot see is a fill you cannot hedge).
+                    if let Some(maker_session) = self.session_of_sub(maker) {
+                        out.push(self.maker_fill_report(
+                            maker_session,
+                            settled_rfq,
+                            settled_quote,
+                            t,
+                            taker_fees_quote_minor.get(i).copied().unwrap_or_default(),
+                        ));
+                    }
                 }
             }
         }
@@ -839,6 +970,7 @@ impl FixGateway {
     fn on_quote_cancel(&mut self, session_id: u64, msg: &FixMessage, now: u64) -> Vec<Vec<u8>> {
         let sub = self.sub_of(session_id);
         let quote_id = msg.get(tag::QUOTE_ID).map(|q| q.to_string());
+        let req_id = msg.get(tag::QUOTE_REQ_ID).unwrap_or_default().to_string();
         let events = self.engine.process(Command::RfqCancel {
             subaccount: sub,
             rfq_id: None,
@@ -847,8 +979,35 @@ impl FixGateway {
                 .and_then(|q| self.quote_by_id.get(&(sub, q.to_string())).copied()),
             now,
         });
-        let _ = events;
-        Vec::new()
+        // Acknowledge the withdrawal: accepted cancels get CANCELED, a
+        // pull the plan gate blocked (G-15 discipline on firm quotes)
+        // gets REJECTED so the desk knows the quote still lives.
+        let mut out = Vec::new();
+        let closed = events.iter().any(|e| matches!(e, Event::RfqClosed { .. }));
+        let rejected = events
+            .iter()
+            .any(|e| matches!(e, Event::RfqRejected { .. }));
+        if closed || rejected {
+            let status = if rejected {
+                quote_status::REJECTED
+            } else {
+                quote_status::CANCELED
+            };
+            let text = if rejected {
+                "quote is firm while it lives (G-15)"
+            } else {
+                "quote withdrawn"
+            };
+            out.push(self.quote_status_report(
+                session_id,
+                &req_id,
+                quote_id.as_deref(),
+                status,
+                text,
+                now,
+            ));
+        }
+        out
     }
 
     // -- Report builders -----------------------------------------------------------
@@ -941,8 +1100,79 @@ impl FixGateway {
         self.emit(session_id, MsgType::OrderCancelReject, body)
     }
 
-    /// An RFQ fill as an ExecutionReport (both counterparties get one;
-    /// this builds the one for `session_id`'s desk).
+    /// Find the live session (if any) of a subaccount — the reverse of
+    /// `sub_of`. Used to route maker-side fill reports to the desk that
+    /// quoted.
+    fn session_of_sub(&self, sub: SubaccountId) -> Option<u64> {
+        self.sessions
+            .iter()
+            .find(|(_, s)| s.subaccount == sub)
+            .map(|(id, _)| *id)
+    }
+
+    /// The quoting dealer's side of an RFQ fill: an ExecutionReport on
+    /// the maker's session, referencing the engine's RFQ and quote ids
+    /// (the desk's QuoteID string is not visible to the venue here).
+    fn maker_fill_report(
+        &mut self,
+        session_id: u64,
+        rfq_id: u64,
+        quote_id: u64,
+        t: &poc_engine::Trade,
+        taker_fee_quote_minor: i128,
+    ) -> Vec<u8> {
+        let mut body = FixMessage::new();
+        body.push(tag::ORDER_ID, format!("RFQ-{rfq_id}"));
+        body.push(tag::CL_ORD_ID, format!("QUOTE-{quote_id}"));
+        let exec_id = self.router.next_exec_id();
+        body.push(tag::EXEC_ID, exec_id.to_string());
+        body.push(tag::EXEC_TYPE, exec_type::TRADE);
+        body.push(tag::ORD_STATUS, ord_status::FILLED);
+        body.push(tag::SYMBOL, t.symbol.clone());
+        // The dealer is on the opposite side of the trade's maker side:
+        // engine `Side` on a trade names the MAKER's side.
+        body.push(tag::SIDE, if t.maker_side == Side::Ask { "2" } else { "1" });
+        body.push(tag::ORDER_QTY, t.qty_lots.to_string());
+        body.push(tag::CUM_QTY, t.qty_lots.to_string());
+        body.push(tag::LEAVES_QTY, "0");
+        body.push(tag::AVG_PX, t.price_ticks.to_string());
+        body.push(tag::LAST_PX, t.price_ticks.to_string());
+        body.push(tag::LAST_QTY, t.qty_lots.to_string());
+        body.push(tag::TRANSACT_TIME, t.ts.to_string());
+        // Maker pays zero on RFQ prints (Paradigm economics); the field
+        // still travels so the desk's fee engine stays uniform.
+        let _ = taker_fee_quote_minor;
+        self.emit(session_id, MsgType::ExecutionReport, body)
+    }
+
+    /// QuoteStatusReport ("i") — the venue's ack of a dealer quote:
+    /// accepted (live and firm), rejected, or canceled.
+    fn quote_status_report(
+        &mut self,
+        session_id: u64,
+        req_id: &str,
+        quote_id: Option<&str>,
+        status: &'static str,
+        text: &str,
+        now: u64,
+    ) -> Vec<u8> {
+        let mut body = FixMessage::new();
+        body.push(tag::QUOTE_REQ_ID, req_id.to_string());
+        if let Some(q) = quote_id {
+            body.push(tag::QUOTE_ID, q.to_string());
+        }
+        let resp_id = self.router.next_exec_id();
+        body.push(tag::QUOTE_RESP_ID, format!("QR-{resp_id}"));
+        // QuoteRespType(694): 1 = accept the counterparty's quote.
+        body.push(tag::QUOTE_RESP_TYPE, "1");
+        // QuoteType(537): 1 = tradable (firm).
+        body.push(tag::QUOTE_TYPE, "1");
+        body.push(tag::QUOTE_STATUS, status);
+        body.push(tag::TEXT, text.to_string());
+        body.push(tag::TRANSACT_TIME, now.to_string());
+        self.emit(session_id, MsgType::QuoteStatusReport, body)
+    }
+
     fn rfq_fill_report(
         &mut self,
         session_id: u64,
@@ -1270,7 +1500,14 @@ mod tests {
             ],
         );
         let out = gw.on_frame(dealer, &quote, NOW).unwrap();
-        assert!(out.is_empty());
+        // The dealer now gets a QuoteStatusReport ack: the price is
+        // live and firm (G-11's two disciplines, made visible).
+        assert_eq!(out.len(), 1, "quote ack: {out:?}");
+        let qack = decoded(&out[0]);
+        assert_eq!(qack.msg_type(), Some(MsgType::QuoteStatusReport));
+        assert_eq!(qack.get(tag::QUOTE_REQ_ID), Some("Q-1"));
+        assert_eq!(qack.get(tag::QUOTE_ID), Some("D-1"));
+        assert_eq!(qack.get(tag::QUOTE_STATUS), Some(quote_status::ACCEPTED));
         // The quote is live in the engine book.
         let q = gw.engine().rfq_view().quote(1).cloned().unwrap();
         assert_eq!(q.maker, 2);

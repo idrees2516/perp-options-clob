@@ -99,3 +99,21 @@ cargo run --release -p poc-bench -- stress   # docs/STRESS_TESTING.md
 
 Run on a quiet machine; the container's p99s include scheduler noise
 (the p50s are the trustworthy signal).
+++ b/perp-options-clob/docs/BENCHMARKS.md
+
+## The RFQ network and the FIX gateway
+
+| Operation | p50 | p99 | max |
+|---|---|---|---|
+| RFQ round trip (create + quote + execute, margin-checked) | 3,858 ns | 10,430 ns | 3.31 ms |
+| FIX encode + decode round trip (wire codec) | 1,012 ns | 2,077 ns | 247 µs |
+| FIX gateway `on_frame` (NewOrderSingle: wire → session → app → engine → ExecutionReport) | 3,911 ns | 8,830 ns | 487 µs |
+
+The RFQ round trip is the full dealer-network negotiation cycle:
+unsigned intent publication, a firm quote with frozen flow, and a
+margin-checked atomic execution through the venue path (fees,
+journal, delayed-tape registration). The gateway number is the
+complete legacy-stack round trip — sequence bookkeeping, ClOrdID
+routing, engine placement, and the ExecutionReport emission, i.e.
+roughly the cost of the RFQ cycle itself plus a wire codec round
+trip.

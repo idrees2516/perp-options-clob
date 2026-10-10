@@ -154,12 +154,22 @@ fn main() {
     let perp = PerpMarket::default(); // $1 ticks, 0.001 BTC lots, 8h funding
                                       // 80k call, 0.01 lots, $0.50 ticks, expiring in 30 days.
     let call = OptionMarket {
+        symbol: "BTC-80000-C".into(),
+        expiry_ts_ms: T0 + 30 * 24 * HOUR,
+        ..OptionMarket::default()
+    };
+    // The upper wing for the dealer-network spread: same shape, $85k strike.
+    let wing = OptionMarket {
+        symbol: "BTC-85000-C".into(),
+        strike_quote_minor: 8_500_000,
         expiry_ts_ms: T0 + 30 * 24 * HOUR,
         ..OptionMarket::default()
     };
     s.engine.register_instrument(Instrument::Perp(perp));
     s.engine
         .register_instrument(Instrument::Option(call.clone()));
+    s.engine
+        .register_instrument(Instrument::Option(wing.clone()));
 
     // Participants: 2 market makers, 3 directional traders, 1 degen.
     // Accounts (quote minor): MM=1,2 ($5M) T=3,4,5 ($2M) D=6 ($45k).
@@ -411,6 +421,129 @@ fn main() {
         stats.liquidations,
         stats.adls,
         usd(stats.insurance_balance)
+    );
+    println!();
+
+    // ------------------------------------------------------------------
+    // 7.5 The dealer network (G-11): a desk requests a call spread over
+    //     the RFQ rails — a package the CLOB cannot price without
+    //     moving the tape.
+    // ------------------------------------------------------------------
+    println!("[rfq]     T-4 requests a call spread: buy 25 BTC-80000-C / sell 25 BTC-85000-C...");
+    let rfq_events = s.engine.process(Command::RfqCreate {
+        taker: 4,
+        legs: vec![
+            poc_engine::RfqLegCommand {
+                symbol: call.symbol.clone(),
+                side: Side::Bid,
+                qty_lots: 25,
+            },
+            poc_engine::RfqLegCommand {
+                symbol: wing.symbol.clone(),
+                side: Side::Ask,
+                qty_lots: 25,
+            },
+        ],
+        counterparties: vec![],
+        min_total_cost_quote_minor: None,
+        max_total_cost_quote_minor: None,
+        ttl_ms: 60_000,
+        now: s.now,
+    });
+    let rfq_id = rfq_events
+        .iter()
+        .find_map(|e| match e {
+            Event::RfqCreated { rfq_id, .. } => Some(*rfq_id),
+            _ => None,
+        })
+        .unwrap_or(1);
+    println!("          rfq #{rfq_id} published: 2 legs, 25 lots each, 60s quote window");
+
+    // MM-1 answers with a firm two-sided package: $21,000/BTC for the
+    // 80k wing, $8,500/BTC for the 85k wing — committing a 15-lot
+    // working size per leg (Paradigm-style partial-size quoting).
+    let quote_events = s.engine.process(Command::RfqQuoteSized {
+        maker: 1,
+        rfq_id,
+        leg_prices_ticks: vec![2_100_000 / 50, 850_000 / 50],
+        qty_lots: vec![15, 15],
+        ttl_ms: 30_000,
+        now: s.now,
+    });
+    let quote_id = quote_events
+        .iter()
+        .find_map(|e| match e {
+            Event::RfqQuoted { quote_id, .. } => Some(*quote_id),
+            _ => None,
+        })
+        .unwrap_or(1);
+    println!(
+        "          MM-1 quoted firm: 80k wing ${}/BTC · 85k wing ${}/BTC · 15 lots working",
+        21_000, 8_500
+    );
+
+    // T-4 lifts a PARTIAL: 10 lots per wing, on the tape.
+    let take_events = s.engine.process(Command::RfqExecutePartial {
+        taker: 4,
+        rfq_id,
+        quote_id,
+        take_per_leg: vec![10, 10],
+        now: s.now,
+    });
+    let mut rfq_fills = 0_usize;
+    for e in &take_events {
+        if let Event::RfqSettled {
+            trades,
+            taker_fees_quote_minor,
+            rfq_id: rid,
+            quote_id: qid,
+            taker,
+            maker,
+        } = e
+        {
+            rfq_fills = trades.len();
+            println!(
+                "          rfq #{rid} settled vs quote #{qid}: taker {taker} vs dealer {maker}: {} legs, fees {} (prints on the delayed negotiated tape)",
+                trades.len(),
+                usd(taker_fees_quote_minor.iter().sum::<i128>())
+            );
+            for t in trades {
+                println!(
+                    "            leg {}×{} @ {}",
+                    t.symbol, t.qty_lots, t.price_ticks
+                );
+            }
+        }
+    }
+    let (t4_80, t4_85) = (
+        s.engine
+            .account(4)
+            .map(|a| a.lots_of("BTC-80000-C"))
+            .unwrap_or(0),
+        s.engine
+            .account(4)
+            .map(|a| a.lots_of("BTC-85000-C"))
+            .unwrap_or(0),
+    );
+    println!(
+        "          T-4 now holds the spread: {t4_80} lots of the 80k wing, {t4_85} of the 85k wing ({rfq_fills} legs settled)"
+    );
+    // The quote stays firm for its remainder; the RFQ stays open.
+    let quote_left = s
+        .engine
+        .rfq_view()
+        .quote(quote_id)
+        .map(|q| q.remaining_lots().to_vec())
+        .unwrap_or_default();
+    let rfq_left = s
+        .engine
+        .rfq_view()
+        .rfq(rfq_id)
+        .map(|r| r.remaining_lots.to_vec())
+        .unwrap_or_default();
+    println!(
+        "          quote still firm for {:?} lots/leg; rfq remains open for {:?} lots/leg",
+        quote_left, rfq_left
     );
     println!();
 

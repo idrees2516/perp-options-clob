@@ -74,6 +74,7 @@ dependencies = [
  "poc-engine",
  "poc-orderbook",
  "poc-rfq",
+ "poc-settlement",
 ]
 
 [[package]]

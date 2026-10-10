@@ -388,3 +388,102 @@ identical root, and any matching divergence changes it.
 domain-separated SHA-256 chain.
 *Tests:* `replayed_engines_agree_bit_for_bit`,
 `commitment_captures_fills_and_cancels`.
+
+### I-42 Quotes are private to the requesting account
+The RFQ's taker sees every live quote; a maker sees only their own;
+anyone else sees none — the engine's quote views are served
+exclusively through `RfqBook::quotes_for_viewer`.
+*Tests:* `quote_privacy_views` (poc-rfq),
+`engine_quote_privacy_views` (engine).
+
+### I-43 Partial executions conserve size
+Every executed lot is bounded by the quote's committed remainder and
+by the RFQ's remaining size at execution time; the RFQ's remaining
+never goes negative; the quote's filled never exceeds its
+commitment; the two ledgers agree per leg.
+*Tests:* `partial_acceptance_keeps_quote_firm`,
+`full_execute_honors_quote_size`, `partial_validation`,
+`sized_quote_commits_less_than_request`, `sized_quote_validation`,
+`rfq_flow_over_fix_end_to_end`.
+
+### I-44 Firmness: a live quote with a remaining size is executable
+A `Live` quote with positive remaining can be executed at its
+quoted prices until its own TTL (given an open, in-window RFQ); the
+only exits are execution, expiry, dealer cancel (a G-15 strike), or
+RFQ closure. A partial fill does not release the remainder.
+*Tests:* `partial_acceptance_keeps_quote_firm`,
+`pull_strikes_suspend_and_drop_dealer`.
+
+### I-45 The dealer program is replay-deterministic
+Replaying the journal reproduces every tier, strike, suspension
+timestamp, and drop bit for bit: `preview_pull` (plan) and
+`record_pull` (apply) share one pure evaluation function.
+*Tests:* `preview_matches_record` (every rung),
+`set_tier_and_determinism`, `rfq_v2_replays_bit_for_bit`,
+`suspension_echo_events_journaled`.
+
+### I-46 Every settled RFQ execution prints on the delayed tape exactly once
+Each execution registers one `BlockOrigin::Rfq` print at settle time
+that fires exactly once when its broadcast delay elapses; partials
+print independently per execution.
+*Tests:* `rfq_executions_print_on_the_delayed_tape`,
+`rfq_print_is_delayed_over_fix` (poc-fix).
+
+### I-47 RFQ trades consume the full venue path
+There is no settle path that skips bilateral margin (both
+counterparties simulated to maintenance), tiered fee pricing, and
+journaling — for native and FIX-originated executions alike.
+*Tests:* `partial_rfq_execution_settles_through_margin_fees_and_journal`,
+`rfq_flow_over_fix_end_to_end` (fee assertions included).
+
+## The FIX gateway (legacy connectivity)
+
+### I-48 Resent frames carry their original sequence numbers
+A store-and-forward resend re-emits stored application messages
+with `PossDupFlag=Y` at their original `MsgSeqNum`, collapses admin
+holes into `SequenceReset` gap fills with the replaced range's
+numbers, and never consumes fresh outbound sequence numbers.
+*Tests:* `resend_with_poss_dup_and_gap_fill`.
+
+### I-49 The wire codec is strict
+Every decoded frame has a `FIX.4.4` BeginString first, an agreeing
+`BodyLength`, and a matching `CheckSum`; encoding is canonical
+(re-encoding a decoded frame is byte-identical).
+*Tests:* `round_trip_preserves_fields`,
+`checksum_rejects_corruption`, `body_length_must_agree`,
+`structural_rejections`.
+
+### I-50 The gateway is replay-deterministic
+The same inbound frames at the same timestamps produce the same
+outbound bytes, through session, router, and engine.
+*Tests:* `gateway_is_deterministic`, `session_is_deterministic`.
+
+### I-51 RFQ ids are wired out deterministically
+`RfqCreated` carries the `rfq_id` the apply stage assigns and
+`RfqQuoted` the `quote_id` — both predicted at plan from the book's
+monotonic counters, so an external consumer (a FIX desk, the gateway)
+that replays the same commands derives the identical id mapping with
+zero state scanning.
+*Enforcement:* `RfqBook::next_rfq_id`/`next_quote_id` peeks at plan;
+the events carry them end to end.
+*Tests:* `full_stack_wiring_end_to_end` (e2e_wiring.rs — two lanes,
+identical id maps), `rfq_v2.rs`.
+
+### I-52 Fills reach both counterparties
+Every RFQ execution emits one fill report per leg to the executing
+taker's session AND one to the quoting dealer's session — a fill you
+cannot see is a fill you cannot hedge.
+*Enforcement:* `FixGateway::on_quote_hit` → `maker_fill_report` via
+`session_of_sub` reverse routing.
+*Tests:* `full_stack_wiring_end_to_end` (both desks' symbol/side
+vectors asserted).
+
+### I-53 The wired stack is replay-deterministic
+Replaying the identical FIX frame sequence on a fresh gateway lands
+on the identical account fingerprint: instrument registration,
+deposits, logons, orders, RFQ requests, quotes, partial lifts, and
+exercise settles all agree bit for bit.
+*Enforcement:* the plan/apply split + journal discipline underneath;
+the e2e script runs twice and compares.
+*Tests:* `full_stack_wiring_end_to_end` (lane A vs lane B
+fingerprint equality).

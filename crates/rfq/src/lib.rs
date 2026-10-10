@@ -383,6 +383,22 @@ impl RfqBook {
         }
     }
 
+    /// The id the next [`Self::create_rfq`] call will assign.
+    ///
+    /// Plan-stage peek: lets the engine stamp the *predicted* id onto the
+    /// `RfqCreated` event so external consumers (FIX desks, the gateway)
+    /// can map their requests to engine ids without scanning state.
+    /// Deterministic because plan and apply run against identical state.
+    pub fn next_rfq_id(&self) -> u64 {
+        self.next_rfq_id
+    }
+
+    /// The id the next quote submission will assign (plan-stage peek,
+    /// symmetric with [`Self::next_rfq_id`]).
+    pub fn next_quote_id(&self) -> u64 {
+        self.next_quote_id
+    }
+
     /// Taker publishes a request — an **unsigned intent**: no state mutates
     /// beyond recording it.
     ///

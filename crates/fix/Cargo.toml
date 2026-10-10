@@ -13,5 +13,8 @@ poc-orderbook = { path = "../orderbook" }
 poc-engine = { path = "../engine" }
 poc-rfq = { path = "../rfq" }
 
+[dev-dependencies]
+poc-settlement = { path = "../settlement" }
+
 [lints]
 workspace = true

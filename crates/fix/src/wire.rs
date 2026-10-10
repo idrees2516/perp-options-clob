@@ -151,6 +151,26 @@ pub mod tag {
     pub const OFFER_SIZE: u32 = 135;
     /// QuoteStatus.
     pub const QUOTE_STATUS: u32 = 297;
+
+    // -- multi-leg option structures (FIX 4.4 InstrumentLeg) --------------
+    /// NoLegs (count of legs in the repeating group).
+    pub const NO_LEGS: u32 = 555;
+    /// LegSymbol.
+    pub const LEG_SYMBOL: u32 = 600;
+    /// LegSide (1=Buy, 2=Sell).
+    pub const LEG_SIDE: u32 = 624;
+    /// LegQty (lots).
+    pub const LEG_QTY: u32 = 687;
+    /// LegPrice (ticks; the dealer's per-leg price inside a Quote).
+    pub const LEG_PRICE: u32 = 686;
+    /// LegOrderQty (working size the dealer commits on that leg).
+    pub const LEG_ORDER_QTY: u32 = 685;
+    /// QuoteRespID (venue-assigned quote ack reference).
+    pub const QUOTE_RESP_ID: u32 = 693;
+    /// QuoteRespType (1=Accept, 2=Cancel, 3=Counter).
+    pub const QUOTE_RESP_TYPE: u32 = 694;
+    /// QuoteType (0=Indicative, 1=Tradable).
+    pub const QUOTE_TYPE: u32 = 537;
 }
 
 /// FIX message types this gateway understands.
@@ -194,6 +214,8 @@ pub enum MsgType {
     QuoteCancel,
     /// QuoteStatusRequest.
     QuoteStatusRequest,
+    /// QuoteStatusReport ("i") — the venue's ack/status of a dealer quote.
+    QuoteStatusReport,
     /// Anything else (carries the raw code).
     Other(u32),
 }
@@ -222,6 +244,7 @@ impl MsgType {
             Self::Quote => "S",
             Self::QuoteCancel => "Z",
             Self::QuoteStatusRequest => "a",
+            Self::QuoteStatusReport => "i",
             Self::Other(c) => match c {
                 0x100 => "?",
                 _ => "?",
@@ -252,6 +275,7 @@ impl MsgType {
             "S" => Self::Quote,
             "Z" => Self::QuoteCancel,
             "a" => Self::QuoteStatusRequest,
+            "i" => Self::QuoteStatusReport,
             other => Self::Other(u32::from(other.as_bytes().first().copied().unwrap_or(0))),
         }
     }

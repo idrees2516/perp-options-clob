@@ -489,6 +489,9 @@ pub enum Event {
     },
     /// An RFQ was published (unsigned intent; id assigned at apply).
     RfqCreated {
+        /// The engine-assigned RFQ id (predicted at plan from the book's
+        /// id counter — deterministic under the plan/apply split).
+        rfq_id: u64,
         /// Requesting taker.
         taker: SubaccountId,
         /// The priced package legs.
@@ -508,6 +511,9 @@ pub enum Event {
     RfqQuoted {
         /// Target RFQ.
         rfq_id: u64,
+        /// The engine-assigned quote id (predicted at plan; lets FIX
+        /// desks map their `QuoteID` to the engine's quote).
+        quote_id: u64,
         /// Quoting maker.
         maker: SubaccountId,
         /// Per-leg prices, ticks.
