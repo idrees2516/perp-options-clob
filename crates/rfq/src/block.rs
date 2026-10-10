@@ -13,6 +13,17 @@ use poc_core::{Side, SubaccountId, Symbol, TimestampMs};
 
 use crate::RfqError;
 
+/// Where a delayed-tape print came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlockOrigin {
+    /// A privately negotiated block trade (the `BlockTrade` command).
+    Negotiated,
+    /// An RFQ execution printing on the same delayed negotiated tape —
+    /// the Transparency pattern (section 5.3): RFQ size must not leak to
+    /// the public book before the broadcast delay elapses.
+    Rfq,
+}
+
 /// A privately negotiated trade report awaiting its delayed public print.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockTrade {
@@ -32,6 +43,8 @@ pub struct BlockTrade {
     pub broadcast_ts: TimestampMs,
     /// Whether the public tape has printed this block.
     pub broadcast: bool,
+    /// Provenance of the print.
+    pub origin: BlockOrigin,
 }
 
 /// Ledger of negotiated blocks and their pending public prints.
@@ -73,6 +86,32 @@ impl BlockLedger {
         total_notional: u128,
         now: TimestampMs,
     ) -> Result<u64, RfqError> {
+        self.register_with_origin(a, b, legs, total_notional, now, BlockOrigin::Negotiated)
+    }
+
+    /// Register an RFQ execution's delayed print (same tape, different
+    /// origin marker). See [`BlockOrigin::Rfq`].
+    pub fn register_rfq(
+        &mut self,
+        a: SubaccountId,
+        b: SubaccountId,
+        legs: Vec<(Symbol, Side, u64, u64)>,
+        total_notional: u128,
+        now: TimestampMs,
+    ) -> Result<u64, RfqError> {
+        self.register_with_origin(a, b, legs, total_notional, now, BlockOrigin::Rfq)
+    }
+
+    /// Shared registration core.
+    fn register_with_origin(
+        &mut self,
+        a: SubaccountId,
+        b: SubaccountId,
+        legs: Vec<(Symbol, Side, u64, u64)>,
+        total_notional: u128,
+        now: TimestampMs,
+        origin: BlockOrigin,
+    ) -> Result<u64, RfqError> {
         if a == b {
             return Err(RfqError::SelfQuote);
         }
@@ -100,6 +139,7 @@ impl BlockLedger {
                 executed_ts: now,
                 broadcast_ts,
                 broadcast: false,
+                origin,
             },
         );
         Ok(block_id)

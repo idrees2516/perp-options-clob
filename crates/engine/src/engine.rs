@@ -121,6 +121,14 @@ pub struct EngineConfig {
     /// the *utilized* portion of positive quote cash. Default 0 — a
     /// governance decision to enable, never a default cost.
     pub quote_interest_bps_per_day: u64,
+    /// Dealer program policy (G-15): firm-quote strike ladder,
+    /// suspension lengths, promotion thresholds.
+    pub dealer_program: poc_rfq::ProgramConfig,
+    /// Whether quoting requires dealer-program membership. The program
+    /// always scores enrolled dealers; enforcement gates every
+    /// `RfqQuote`/`RfqQuoteSized` on enrollment + not-suspended. Rollout
+    /// default is open quoting (false).
+    pub enforce_dealer_program: bool,
 }
 
 /// Circuit-breaker parameters (G-21).
@@ -182,6 +190,8 @@ impl Default for EngineConfig {
             insurance_rebalance_edge_bps: 50,
             mm_program: poc_economics::MmTierProgram::mainnet(),
             quote_interest_bps_per_day: 0,
+            dealer_program: poc_rfq::ProgramConfig::default(),
+            enforce_dealer_program: false,
         }
     }
 }
@@ -264,6 +274,8 @@ pub struct Engine {
     /// RFQ state machine (G-11) and block-trade tape (G-13).
     pub(crate) rfq_book: RfqBook,
     pub(crate) blocks: BlockLedger,
+    /// Dealer program (G-15): firm-quote enforcement registry.
+    pub(crate) dealer_program: poc_rfq::DealerProgram,
     /// Live governed volatility surface (G-04).
     pub(crate) vol_surface: VolSurface,
     /// MMP state per (subaccount, underlying).
@@ -354,6 +366,11 @@ impl Engine {
             .or_else(|_| VolSurface::new(SurfaceConfig::default()))
             .expect("default surface config is valid");
         let next_mm_review_ts = config.mm_program.review_interval_ms;
+        // G-15: the dealer program; an invalid policy falls back to the
+        // validated default (the program is a scoring gate, not a
+        // solvency primitive — the engine refuses to die for it).
+        let dealer_program =
+            poc_rfq::DealerProgram::new(config.dealer_program.clone()).unwrap_or_default();
         Self {
             config,
             instruments: BTreeMap::new(),
@@ -380,6 +397,7 @@ impl Engine {
             stop_orders: BTreeMap::new(),
             rfq_book: RfqBook::new(),
             blocks: BlockLedger::new(poc_rfq::BlockLedger::DEFAULT_DELAY_MS),
+            dealer_program,
             vol_surface,
             mmp: BTreeMap::new(),
             cancel_on_disconnect: BTreeMap::new(),
@@ -726,13 +744,49 @@ impl Engine {
                 leg_prices_ticks,
                 ttl_ms,
                 now,
-            } => self.plan_rfq_quote(*maker, *rfq_id, leg_prices_ticks, *ttl_ms, *now),
+            } => self.plan_rfq_quote(*maker, *rfq_id, leg_prices_ticks, &[], *ttl_ms, *now),
+            Command::RfqQuoteSized {
+                maker,
+                rfq_id,
+                leg_prices_ticks,
+                qty_lots,
+                ttl_ms,
+                now,
+            } => self.plan_rfq_quote(*maker, *rfq_id, leg_prices_ticks, qty_lots, *ttl_ms, *now),
             Command::RfqExecute {
                 taker,
                 rfq_id,
                 quote_id,
                 now,
-            } => institutions::plan_rfq_execute(self, *taker, *rfq_id, *quote_id, *now),
+            } => institutions::plan_rfq_execute(self, *taker, *rfq_id, *quote_id, None, *now),
+            Command::RfqExecutePartial {
+                taker,
+                rfq_id,
+                quote_id,
+                take_per_leg,
+                now,
+            } => institutions::plan_rfq_execute(
+                self,
+                *taker,
+                *rfq_id,
+                *quote_id,
+                Some(take_per_leg),
+                *now,
+            ),
+            Command::DealerEnroll { dealer, tier, now } => {
+                vec![Event::DealerEnrolled {
+                    dealer: *dealer,
+                    tier: *tier,
+                    ts: *now,
+                }]
+            }
+            Command::DealerSetTier { dealer, tier, now } => {
+                vec![Event::DealerTierSet {
+                    dealer: *dealer,
+                    tier: *tier,
+                    ts: *now,
+                }]
+            }
             Command::RfqCancel {
                 subaccount,
                 rfq_id,
@@ -915,6 +969,7 @@ impl Engine {
         maker: SubaccountId,
         rfq_id: u64,
         leg_prices: &[u64],
+        qty_lots: &[u64],
         ttl_ms: TimestampMs,
         now: TimestampMs,
     ) -> Vec<Event> {
@@ -946,10 +1001,36 @@ impl Engine {
                 ts: now,
             }];
         }
-        if leg_prices.len() != rfq.legs.len() || leg_prices.contains(&0) || ttl_ms == 0 {
+        if leg_prices.len() != rfq.legs.len()
+            || leg_prices.contains(&0)
+            || ttl_ms == 0
+            || qty_lots.len() > rfq.legs.len()
+            || (!qty_lots.is_empty() && qty_lots.contains(&0))
+        {
             return vec![Event::RfqRejected {
                 subaccount: maker,
                 reason: "invalid quote parameters",
+                ts: now,
+            }];
+        }
+        // Working size may not exceed the RFQ's remaining size per leg.
+        if !qty_lots.is_empty() {
+            for (i, &q) in qty_lots.iter().enumerate() {
+                if q > rfq.remaining_lots[i] {
+                    return vec![Event::RfqRejected {
+                        subaccount: maker,
+                        reason: "quote size exceeds rfq remaining",
+                        ts: now,
+                    }];
+                }
+            }
+        }
+        // G-15: the dealer program gates quoting when enforcement is on.
+        if self.config.enforce_dealer_program && self.dealer_program.can_quote(maker, now).is_err()
+        {
+            return vec![Event::RfqRejected {
+                subaccount: maker,
+                reason: "dealer program gate",
                 ts: now,
             }];
         }
@@ -957,6 +1038,7 @@ impl Engine {
             rfq_id,
             maker,
             leg_prices_ticks: leg_prices.to_vec(),
+            qty_lots: qty_lots.to_vec(),
             ttl_ms,
             ts: now,
         }]
@@ -984,11 +1066,44 @@ impl Engine {
             }
         }
         if let Some(quote_id) = quote_id {
-            let owned = self
-                .rfq_book
-                .quote(quote_id)
-                .is_some_and(|q| q.maker == subaccount);
+            let quote = self.rfq_book.quote(quote_id);
+            let owned = quote.is_some_and(|q| q.maker == subaccount);
             if owned {
+                // A cancel of a LIVE quote on a still-OPEN, in-window RFQ
+                // is a PULL of a firm quote — the G-15 strike signal.
+                // "A dealer who pulls quotes after seeing the request
+                // pattern gets dropped from the program."
+                let is_pull = quote.is_some_and(|q| {
+                    q.status == poc_rfq::QuoteStatus::Live
+                        && self.rfq_book.rfq(q.rfq_id).is_some_and(|r| {
+                            r.status == poc_rfq::RfqStatus::Open && now <= r.valid_until
+                        })
+                });
+                if is_pull {
+                    events.push(Event::DealerStruck {
+                        dealer: subaccount,
+                        ts: now,
+                    });
+                    // The ladder outcome is a pure function of program
+                    // state + ts: preview it so the echo events are
+                    // journaled alongside the strike.
+                    match self.dealer_program.preview_pull(subaccount, now) {
+                        poc_rfq::PullOutcome::Suspended(until) => {
+                            events.push(Event::DealerSuspended {
+                                dealer: subaccount,
+                                until,
+                                ts: now,
+                            });
+                        }
+                        poc_rfq::PullOutcome::Dropped => {
+                            events.push(Event::DealerDropped {
+                                dealer: subaccount,
+                                ts: now,
+                            });
+                        }
+                        poc_rfq::PullOutcome::Strike => {}
+                    }
+                }
                 events.push(Event::RfqClosed {
                     rfq_id: 0,
                     quote_id: Some(quote_id),
@@ -1988,28 +2103,66 @@ impl Engine {
                 rfq_id,
                 maker,
                 leg_prices_ticks,
+                qty_lots,
                 ttl_ms,
                 ts,
             } => {
-                if self
-                    .rfq_book
-                    .send_quote(*maker, *rfq_id, leg_prices_ticks.clone(), *ttl_ms, *ts)
-                    .is_err()
-                {}
+                // EMPTY qty = full remaining size (the `RfqQuote` command
+                // path); a vector is the `RfqQuoteSized` working size.
+                let qty = if qty_lots.is_empty() {
+                    self.rfq_book
+                        .rfq(*rfq_id)
+                        .map_or_else(Vec::new, |r| r.remaining_lots.clone())
+                } else {
+                    qty_lots.clone()
+                };
+                let _ = self.rfq_book.send_quote_sized(
+                    *maker,
+                    *rfq_id,
+                    leg_prices_ticks.clone(),
+                    qty,
+                    *ttl_ms,
+                    *ts,
+                );
             }
             Event::RfqSettled {
                 rfq_id,
                 quote_id,
                 trades,
                 taker,
+                maker,
                 ..
             } => {
-                // Mutate the RFQ state machine exactly as planned: mark
-                // filled, cancel every other live quote.
+                // Mutate the RFQ state machine exactly as planned: the
+                // trades' quantities ARE the take vector (full or
+                // partial); the quote's remainder stays firm, the RFQ
+                // stays open for its remainder.
                 let settled_at = trades.first().map_or(self.now, |t| t.ts);
-                let _ = self
+                let take: Vec<u64> = trades.iter().map(|t| t.qty_lots).collect();
+                if let Ok(execution) = self
                     .rfq_book
-                    .execute(*taker, *rfq_id, *quote_id, settled_at);
+                    .execute_partial(*taker, *rfq_id, *quote_id, take, settled_at)
+                {
+                    // G-11 Transparency pattern: the RFQ execution
+                    // prints on the delayed negotiated tape — the public
+                    // market must not front-run private size.
+                    let legs: Vec<(Symbol, Side, u64, u64)> = execution
+                        .legs
+                        .iter()
+                        .map(|(s, side, qty, px)| (s.clone(), *side, *qty, *px))
+                        .collect();
+                    let notional: u128 = trades.iter().map(|t| t.notional_quote_minor).sum();
+                    let _ = self
+                        .blocks
+                        .register_rfq(*taker, *maker, legs, notional, settled_at);
+                    // G-15: the execution is the dealer's program credit.
+                    let lots: u128 = execution
+                        .legs
+                        .iter()
+                        .map(|(_, _, qty, _)| u128::from(*qty))
+                        .sum();
+                    let _ = self.dealer_program.record_execution(*maker, lots);
+                }
                 for trade in trades {
                     self.apply_rfq_trade(trade, *taker);
                 }
@@ -2030,11 +2183,31 @@ impl Engine {
                 }
                 if let Some(quote_id) = quote_id {
                     if expired {
+                        // A lapsed quote erodes the dealer's reliability
+                        // score (G-15) — never suspends, but counts.
+                        if let Some(maker) = self.rfq_book.quote(*quote_id).map(|q| q.maker) {
+                            self.dealer_program.record_lapse(maker);
+                        }
                         self.rfq_book.expire_quote_by_id(*quote_id);
                     } else {
                         self.rfq_book.cancel_quote_by_id(*quote_id);
                     }
                 }
+            }
+            Event::DealerEnrolled { dealer, tier, ts } => {
+                let _ = self.dealer_program.enroll(*dealer, *tier, *ts);
+            }
+            Event::DealerStruck { dealer, ts } => {
+                // The ladder mutation site: `record_pull` deterministically
+                // reproduces the plan-time `preview_pull` outcome (the
+                // `DealerSuspended` / `DealerDropped` echoes that may
+                // follow this event are observers, not mutation sites).
+                let _ = self.dealer_program.record_pull(*dealer, *ts);
+            }
+            Event::DealerSuspended { .. } => {}
+            Event::DealerDropped { .. } => {}
+            Event::DealerTierSet { dealer, tier, .. } => {
+                let _ = self.dealer_program.set_tier(*dealer, *tier);
             }
             Event::BlockRegistered {
                 taker,
@@ -3273,6 +3446,13 @@ impl Engine {
         &self.blocks
     }
 
+    /// The dealer program registry (read-only view for governance and the
+    /// API; G-15).
+    #[must_use]
+    pub fn dealer_program_view(&self) -> &poc_rfq::DealerProgram {
+        &self.dealer_program
+    }
+
     /// The governed volatility surface (read-only).
     #[must_use]
     pub fn vol_surface_view(&self) -> &VolSurface {
@@ -3565,6 +3745,11 @@ fn event_ts(event: &Event) -> TimestampMs {
         | Event::BlockRegistered { .. }
         | Event::BlockPrinted { .. }
         | Event::MmpConfigured { .. } => 0,
+        Event::DealerEnrolled { ts, .. }
+        | Event::DealerStruck { ts, .. }
+        | Event::DealerSuspended { ts, .. }
+        | Event::DealerDropped { ts, .. }
+        | Event::DealerTierSet { ts, .. } => *ts,
     }
 }
 

@@ -15,6 +15,7 @@ members = [
     "crates/persist",
     "crates/api",
     "crates/governance",
+    "crates/fix",
     "crates/bench",
 ]
 

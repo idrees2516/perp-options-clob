@@ -28,8 +28,13 @@
 //! prints them on the public tape after a configurable delay.
 
 pub mod block;
+pub mod dealer;
 
-pub use block::{BlockLedger, BlockTrade};
+pub use block::{BlockLedger, BlockOrigin, BlockTrade};
+pub use dealer::{
+    DealerProgram, DealerRecord, DealerTier, ExecuteOutcome, ProgramConfig, ProgramGate,
+    PullOutcome,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -90,6 +95,27 @@ impl RfqLeg {
         )
     }
 
+    /// Signed cash flow of the taker on this leg for a SPECIFIC quantity
+    /// (lots) at `price_ticks` (negative = taker pays, positive = taker
+    /// receives) — the partial-execution pricer. Returns `None` on
+    /// overflow.
+    #[must_use]
+    pub fn taker_flow_at_qty(&self, price_ticks: u64, qty_lots: u64) -> Option<i128> {
+        let price = u128::from(price_ticks).checked_mul(self.spec.tick_size_quote_minor)?;
+        let base_minor = u128::from(qty_lots).checked_mul(self.spec.lot_size_base_minor)?;
+        let n = i128::try_from(mul_div(
+            price,
+            base_minor,
+            self.base_unit()?,
+            Rounding::NearestHalfUp,
+        )?)
+        .ok()?;
+        match self.side {
+            Side::Bid => n.checked_neg(),
+            Side::Ask => Some(n),
+        }
+    }
+
     /// Signed cash flow of the taker on this leg at `price_ticks`
     /// (negative = taker pays, positive = taker receives). Returns `None` on
     /// overflow.
@@ -110,9 +136,10 @@ impl RfqLeg {
 /// Lifecycle state of an RFQ request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RfqStatus {
-    /// Published, inside its quoting window, accepting quotes.
+    /// Published, inside its quoting window, accepting quotes (possibly
+    /// with a partially-consumed remaining size).
     Open,
-    /// One quote executed; terminal.
+    /// Every leg fully executed; terminal.
     Filled,
     /// Cancelled by the taker; terminal.
     Cancelled,
@@ -153,6 +180,10 @@ pub struct RfqRequest {
     pub created_ts: TimestampMs,
     /// End of the quoting window (ms epoch).
     pub valid_until: TimestampMs,
+    /// Remaining size per leg (lots): starts at `legs[i].qty_lots` and is
+    /// reduced by partial executions. An `Open` RFQ with a zero leg is
+    /// still quotable on its other legs.
+    pub remaining_lots: Vec<u64>,
     /// Current lifecycle state.
     pub status: RfqStatus,
 }
@@ -169,8 +200,16 @@ pub struct Quote {
     /// Maker's price per leg, in ticks, aligned with the RFQ's legs order.
     /// The maker's side on each leg is the opposite of the leg's taker side.
     pub leg_prices_ticks: Vec<u64>,
-    /// Taker's total signed flow at these prices, computed and frozen at
-    /// quote time (negative = taker pays net).
+    /// Committed size per leg (lots) — what the dealer is firm on. A
+    /// full-size quote carries the RFQ's remaining size at quote time;
+    /// a partial-size quote commits less.
+    pub qty_lots: Vec<u64>,
+    /// Executed size per leg so far (lots) — partial executions consume
+    /// the quote without killing it; the remainder stays firm.
+    pub filled_lots: Vec<u64>,
+    /// Taker's total signed flow at these prices for the FULL committed
+    /// size, computed and frozen at quote time (negative = taker pays
+    /// net). Partial executions re-derive flow for the taken part.
     pub total_taker_flow_quote_minor: i128,
     /// Creation timestamp (ms epoch).
     pub created_ts: TimestampMs,
@@ -179,6 +218,27 @@ pub struct Quote {
     pub valid_until: TimestampMs,
     /// Current lifecycle state.
     pub status: QuoteStatus,
+}
+
+impl Quote {
+    /// Remaining committed size per leg (lots): `qty - filled`. Partial
+    /// executions consume this; the quote is fully consumed when every
+    /// leg reaches zero.
+    #[must_use]
+    pub fn remaining_lots(&self) -> Vec<u64> {
+        self.qty_lots
+            .iter()
+            .zip(&self.filled_lots)
+            .map(|(&q, &f)| q.saturating_sub(f))
+            .collect()
+    }
+
+    /// Whether the quote is fully consumed (every leg's remaining is
+    /// zero) — the `Executed` transition condition.
+    #[must_use]
+    pub fn fully_consumed(&self) -> bool {
+        self.remaining_lots().iter().all(|&r| r == 0)
+    }
 }
 
 /// A successfully executed RFQ — consumed by the engine to settle trades.
@@ -230,6 +290,15 @@ pub enum RfqError {
     InvalidQty,
     /// The executed total cost violates the RFQ's min/max bounds.
     BoundsViolation,
+    /// A partial execution's take vector is malformed (length, zero-everywhere,
+    /// or larger than the quote's or RFQ's remaining size on some leg).
+    InvalidPartial,
+    /// The maker is not enrolled in the dealer program (G-15).
+    NotEnrolled,
+    /// The maker is suspended until the carried timestamp (G-15).
+    Suspended(TimestampMs),
+    /// The maker was dropped from the dealer program (G-15).
+    Dropped,
     /// The taker (or a block-trade side) is also the counterparty.
     SelfQuote,
     /// The referenced quote is no longer live (executed/cancelled/expired).
@@ -253,6 +322,12 @@ impl fmt::Display for RfqError {
             RfqError::InvalidTtl => write!(f, "ttl must be positive"),
             RfqError::InvalidQty => write!(f, "quantity must be positive"),
             RfqError::BoundsViolation => write!(f, "total cost outside rfq bounds"),
+            RfqError::InvalidPartial => {
+                write!(f, "invalid partial take")
+            }
+            RfqError::NotEnrolled => write!(f, "maker not enrolled in dealer program"),
+            RfqError::Suspended(until) => write!(f, "maker suspended until {until}"),
+            RfqError::Dropped => write!(f, "maker dropped from dealer program"),
             RfqError::SelfQuote => write!(f, "cannot trade with self"),
             RfqError::AlreadySettled => write!(f, "quote is no longer live"),
             RfqError::MathOverflow => write!(f, "arithmetic overflow"),
@@ -345,6 +420,7 @@ impl RfqBook {
         let valid_until = now.checked_add(ttl_ms).ok_or(RfqError::InvalidTtl)?;
         let rfq_id = self.next_rfq_id;
         self.next_rfq_id = rfq_id.checked_add(1).ok_or(RfqError::MathOverflow)?;
+        let remaining_lots = legs.iter().map(|l| l.qty_lots).collect();
         self.rfqs.insert(
             rfq_id,
             RfqRequest {
@@ -356,6 +432,7 @@ impl RfqBook {
                 max_total_cost_quote_minor: max_total_cost,
                 created_ts: now,
                 valid_until,
+                remaining_lots,
                 status: RfqStatus::Open,
             },
         );
@@ -386,13 +463,15 @@ impl RfqBook {
         Ok(())
     }
 
-    /// Maker submits a quote on an `Open`, in-window RFQ they may see.
+    /// Maker submits a **full-size** quote on an `Open`, in-window RFQ they
+    /// may see: the committed size is the RFQ's remaining size per leg at
+    /// quote time.
     ///
     /// Prices must be positive per leg and line up with the RFQ's legs; the
-    /// taker's total signed flow is computed and frozen at quote time. A
-    /// maker may hold several quotes on one RFQ and swap any of them
-    /// atomically via [`replace_quote`](Self::replace_quote). Returns the
-    /// new quote id.
+    /// taker's total signed flow for the full size is computed and frozen
+    /// at quote time. A maker may hold several quotes on one RFQ and swap
+    /// any of them atomically via [`replace_quote`](Self::replace_quote).
+    /// Returns the new quote id.
     pub fn send_quote(
         &mut self,
         maker: SubaccountId,
@@ -403,14 +482,47 @@ impl RfqBook {
     ) -> Result<u64, RfqError> {
         let rfq = self.rfqs.get(&rfq_id).ok_or(RfqError::UnknownRfq)?;
         Self::check_quotable(rfq, maker, &leg_prices_ticks, now)?;
-        let total = Self::total_flow(rfq, &leg_prices_ticks)?;
+        let qty = rfq.remaining_lots.clone();
+        self.send_quote_sized(maker, rfq_id, leg_prices_ticks, qty, ttl_ms, now)
+    }
+
+    /// Maker submits a **partial-size** quote: the dealer commits only
+    /// `qty_lots[i]` per leg (the Paradigm “working size” — a dealer may
+    /// not want the whole block). Each committed quantity must be positive
+    /// and may not exceed the RFQ's remaining size on that leg.
+    pub fn send_quote_sized(
+        &mut self,
+        maker: SubaccountId,
+        rfq_id: u64,
+        leg_prices_ticks: Vec<u64>,
+        qty_lots: Vec<u64>,
+        ttl_ms: TimestampMs,
+        now: TimestampMs,
+    ) -> Result<u64, RfqError> {
+        let rfq = self.rfqs.get(&rfq_id).ok_or(RfqError::UnknownRfq)?;
+        Self::check_quotable(rfq, maker, &leg_prices_ticks, now)?;
+        if qty_lots.len() != rfq.legs.len() {
+            return Err(RfqError::LegCountMismatch);
+        }
+        if qty_lots.contains(&0) {
+            return Err(RfqError::InvalidQty);
+        }
+        for (i, &q) in qty_lots.iter().enumerate() {
+            if q > rfq.remaining_lots[i] {
+                return Err(RfqError::InvalidQty);
+            }
+        }
+        let total = Self::flow_for(rfq, &leg_prices_ticks, &qty_lots)?;
         let valid_until = Self::quote_valid_until(ttl_ms, now)?;
+        let legs_len = rfq.legs.len();
         let quote_id = self.alloc_quote_id()?;
         self.insert_quote(Quote {
             quote_id,
             rfq_id,
             maker,
             leg_prices_ticks,
+            qty_lots,
+            filled_lots: vec![0; legs_len],
             total_taker_flow_quote_minor: total,
             created_ts: now,
             valid_until,
@@ -423,8 +535,8 @@ impl RfqBook {
     /// quote and submits the new one in a single step.
     ///
     /// The new quote is fully validated **first** — if validation fails the
-    /// old quote is left untouched. The new quote gets a fresh id and rides
-    /// on the same RFQ as the old one.
+    /// old quote is left untouched. The new quote gets a fresh id, rides on
+    /// the same RFQ, and is sized at the RFQ's current remaining size.
     pub fn replace_quote(
         &mut self,
         maker: SubaccountId,
@@ -441,8 +553,10 @@ impl RfqBook {
         };
         let rfq = self.rfqs.get(&old_rfq_id).ok_or(RfqError::UnknownRfq)?;
         Self::check_quotable(rfq, maker, &leg_prices_ticks, now)?;
-        let total = Self::total_flow(rfq, &leg_prices_ticks)?;
+        let qty = rfq.remaining_lots.clone();
+        let total = Self::flow_for(rfq, &leg_prices_ticks, &qty)?;
         let valid_until = Self::quote_valid_until(ttl_ms, now)?;
+        let legs_len = rfq.legs.len();
 
         // Validated — now mutate atomically.
         if let Some(old) = self.quotes.get_mut(&quote_id) {
@@ -454,6 +568,8 @@ impl RfqBook {
             rfq_id: old_rfq_id,
             maker,
             leg_prices_ticks,
+            qty_lots: qty,
+            filled_lots: vec![0; legs_len],
             total_taker_flow_quote_minor: total,
             created_ts: now,
             valid_until,
@@ -501,15 +617,12 @@ impl RfqBook {
         best
     }
 
-    /// Taker executes a specific quote.
+    /// Taker executes a quote **in full**: the take per leg is the
+    /// minimum of the quote's and the RFQ's remaining size — a
+    /// full-size quote therefore settles the RFQ, while a
+    /// partial-size quote consumes only what the dealer committed.
     ///
-    /// Atomically marks the RFQ `Filled` and the quote `Executed`, cancels
-    /// every other live quote on the RFQ, and returns the execution record
-    /// for the engine to settle. Validates, in order: RFQ exists, is `Open`
-    /// and inside its window, taker owns it, the quote exists, belongs to
-    /// this RFQ, is `Live` and inside its own window, and — when min/max
-    /// total cost bounds are set — the executed cost (`-total_flow`)
-    /// satisfies them. On any failure the book is left untouched.
+    /// See [`execute_partial`](Self::execute_partial) for sized takes.
     pub fn execute(
         &mut self,
         taker: SubaccountId,
@@ -517,6 +630,102 @@ impl RfqBook {
         quote_id: u64,
         now: TimestampMs,
     ) -> Result<RfqExecution, RfqError> {
+        let take = self.take_vector(taker, rfq_id, quote_id, None, now)?.0; // validated full take
+        self.settle(taker, rfq_id, quote_id, &take, now)
+    }
+
+    /// Taker accepts a **partial** of one quote (Paradigm's “accept a
+    /// partial”): the take vector says how many lots per leg to lift now.
+    ///
+    /// The remainder of the quote **stays firm** until its own TTL — that
+    /// is the whole point of firmness: a partial fill does not release the
+    /// dealer from their remaining commitment. The RFQ's remaining size
+    /// shrinks by the take; the RFQ closes (`Filled`) only when every
+    /// leg's remaining reaches zero. Other live quotes are NOT cancelled by
+    /// a partial — they keep competing for the remainder.
+    pub fn execute_partial(
+        &mut self,
+        taker: SubaccountId,
+        rfq_id: u64,
+        quote_id: u64,
+        take_per_leg: Vec<u64>,
+        now: TimestampMs,
+    ) -> Result<RfqExecution, RfqError> {
+        let take = self
+            .take_vector(taker, rfq_id, quote_id, Some(&take_per_leg), now)?
+            .0;
+        self.settle(taker, rfq_id, quote_id, &take, now)
+    }
+
+    /// Convenience: execute the current **best** live quote in full —
+    /// "the taker executes against the best one".
+    pub fn execute_best(
+        &mut self,
+        taker: SubaccountId,
+        rfq_id: u64,
+        now: TimestampMs,
+    ) -> Result<RfqExecution, RfqError> {
+        let best_id = self
+            .best_quote(rfq_id)
+            .filter(|q| q.remaining_lots().iter().any(|&r| r > 0))
+            .map(|q| q.quote_id)
+            .ok_or(RfqError::UnknownQuote)?;
+        self.execute(taker, rfq_id, best_id, now)
+    }
+
+    /// **Pure** take resolution (plan stage): validates the request and
+    /// returns the execution record that `execute_partial` would settle —
+    /// without mutating anything. The engine's planner calls this to
+    /// build `RfqSettled` events; its apply stage then replays the take
+    /// through `execute_partial`, which deterministically re-validates
+    /// (idempotently) and mutates. `None` take = full execution.
+    pub fn plan_take(
+        &self,
+        taker: SubaccountId,
+        rfq_id: u64,
+        quote_id: u64,
+        take_per_leg: Option<&[u64]>,
+        now: TimestampMs,
+    ) -> Result<RfqExecution, RfqError> {
+        let (take, maker) = self.take_vector(taker, rfq_id, quote_id, take_per_leg, now)?;
+        let (rfq, quote) = match (self.rfqs.get(&rfq_id), self.quotes.get(&quote_id)) {
+            (Some(r), Some(q)) => (r, q),
+            _ => return Err(RfqError::UnknownRfq),
+        };
+        let flow = Self::flow_for(rfq, &quote.leg_prices_ticks, &take)?;
+        let cost = flow.checked_neg().ok_or(RfqError::MathOverflow)?;
+        if !cost_within_bounds(
+            cost,
+            rfq.min_total_cost_quote_minor,
+            rfq.max_total_cost_quote_minor,
+        ) {
+            return Err(RfqError::BoundsViolation);
+        }
+        let mut legs = Vec::with_capacity(rfq.legs.len());
+        for ((leg, &px), &t) in rfq.legs.iter().zip(&quote.leg_prices_ticks).zip(&take) {
+            legs.push((leg.symbol.clone(), leg.side, t, px));
+        }
+        Ok(RfqExecution {
+            rfq_id,
+            quote_id,
+            taker,
+            maker,
+            total_taker_flow_quote_minor: flow,
+            legs,
+        })
+    }
+
+    /// Validation core shared by `execute` and `execute_partial`.
+    /// Returns `(take vector, maker)` on success; mutates nothing.
+    #[allow(clippy::type_complexity)]
+    fn take_vector(
+        &self,
+        taker: SubaccountId,
+        rfq_id: u64,
+        quote_id: u64,
+        take_per_leg: Option<&[u64]>,
+        now: TimestampMs,
+    ) -> Result<(Vec<u64>, SubaccountId), RfqError> {
         let rfq = self.rfqs.get(&rfq_id).ok_or(RfqError::UnknownRfq)?;
         if rfq.status != RfqStatus::Open {
             return Err(RfqError::NotOpen);
@@ -537,10 +746,53 @@ impl RfqBook {
         if now > quote.valid_until {
             return Err(RfqError::QuoteWindowClosed);
         }
-        let cost = quote
-            .total_taker_flow_quote_minor
-            .checked_neg()
-            .ok_or(RfqError::MathOverflow)?;
+        let quote_rem = quote.remaining_lots();
+        if quote_rem.iter().all(|&r| r == 0) {
+            return Err(RfqError::AlreadySettled);
+        }
+        let legs = rfq.legs.len();
+        let take: Vec<u64> = match take_per_leg {
+            None => quote_rem
+                .iter()
+                .zip(&rfq.remaining_lots)
+                .map(|(&q, &r)| q.min(r))
+                .collect(),
+            Some(req) => {
+                if req.len() != legs {
+                    return Err(RfqError::InvalidPartial);
+                }
+                for i in 0..legs {
+                    if req[i] > quote_rem[i] || req[i] > rfq.remaining_lots[i] {
+                        return Err(RfqError::InvalidPartial);
+                    }
+                }
+                if req.iter().all(|&t| t == 0) {
+                    return Err(RfqError::InvalidPartial);
+                }
+                req.to_vec()
+            }
+        };
+        Ok((take, quote.maker))
+    }
+
+    /// Mutation core shared by `execute` and `execute_partial` — consumes
+    /// `take` from the quote and the RFQ, enforces cost bounds, and builds
+    /// the execution record. Atomic: all checks precede all mutations.
+    fn settle(
+        &mut self,
+        taker: SubaccountId,
+        rfq_id: u64,
+        quote_id: u64,
+        take: &[u64],
+        _now: TimestampMs,
+    ) -> Result<RfqExecution, RfqError> {
+        // Cost bounds are enforced on the FLOW OF THE TAKE.
+        let (rfq, quote) = match (self.rfqs.get(&rfq_id), self.quotes.get(&quote_id)) {
+            (Some(r), Some(q)) => (r, q),
+            _ => return Err(RfqError::UnknownRfq),
+        };
+        let flow = Self::flow_for(rfq, &quote.leg_prices_ticks, take)?;
+        let cost = flow.checked_neg().ok_or(RfqError::MathOverflow)?;
         if !cost_within_bounds(
             cost,
             rfq.min_total_cost_quote_minor,
@@ -549,36 +801,56 @@ impl RfqBook {
             return Err(RfqError::BoundsViolation);
         }
 
-        // Validated — build the execution, then mutate atomically.
+        // Build the execution record.
         let mut legs = Vec::with_capacity(rfq.legs.len());
-        for (leg, &price) in rfq.legs.iter().zip(&quote.leg_prices_ticks) {
-            legs.push((leg.symbol.clone(), leg.side, leg.qty_lots, price));
+        for ((leg, &px), &t) in rfq.legs.iter().zip(&quote.leg_prices_ticks).zip(take) {
+            legs.push((leg.symbol.clone(), leg.side, t, px));
         }
+        let maker = quote.maker;
         let execution = RfqExecution {
             rfq_id,
             quote_id,
             taker,
-            maker: quote.maker,
-            total_taker_flow_quote_minor: quote.total_taker_flow_quote_minor,
+            maker,
+            total_taker_flow_quote_minor: flow,
             legs,
         };
 
-        if let Some(r) = self.rfqs.get_mut(&rfq_id) {
-            r.status = RfqStatus::Filled;
-        }
+        // Mutations (all checks passed).
+        let rfq_filled = match self.rfqs.get_mut(&rfq_id) {
+            None => false,
+            Some(r) => {
+                for (rem, &t) in r.remaining_lots.iter_mut().zip(take) {
+                    *rem = rem.saturating_sub(t);
+                }
+                let filled = r.remaining_lots.iter().all(|&rem| rem == 0);
+                if filled {
+                    r.status = RfqStatus::Filled;
+                }
+                filled
+            }
+        };
         if let Some(q) = self.quotes.get_mut(&quote_id) {
-            q.status = QuoteStatus::Executed;
+            for (filled, &t) in q.filled_lots.iter_mut().zip(take) {
+                *filled = filled.saturating_add(t);
+            }
+            if q.fully_consumed() {
+                q.status = QuoteStatus::Executed;
+            }
         }
-        let others: Vec<u64> = self
-            .rfq_quotes
-            .get(&rfq_id)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|qid| *qid != quote_id)
-            .collect();
-        for qid in others {
-            self.cancel_if_live(qid);
+        if rfq_filled {
+            // The RFQ is done: drain every other live quote.
+            let others: Vec<u64> = self
+                .rfq_quotes
+                .get(&rfq_id)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|qid| *qid != quote_id)
+                .collect();
+            for qid in others {
+                self.cancel_if_live(qid);
+            }
         }
         Ok(execution)
     }
@@ -629,6 +901,29 @@ impl RfqBook {
             .filter_map(|&qid| self.quotes.get(&qid))
             .filter(|q| q.status == QuoteStatus::Live)
             .collect()
+    }
+
+    /// **Privacy view** (the G-11 discipline): quotes are private to the
+    /// requesting account. The RFQ's taker sees every live quote on it;
+    /// a maker sees only their own; anyone else sees nothing. The engine
+    /// MUST serve quote lists exclusively through this method.
+    #[must_use]
+    pub fn quotes_for_viewer(&self, rfq_id: u64, viewer: SubaccountId) -> Vec<&Quote> {
+        let Some(rfq) = self.rfqs.get(&rfq_id) else {
+            return Vec::new();
+        };
+        if viewer != rfq.taker {
+            // A maker on the RFQ sees only their own quotes.
+            return self
+                .rfq_quotes
+                .get(&rfq_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|&qid| self.quotes.get(&qid))
+                .filter(|q| q.status == QuoteStatus::Live && q.maker == viewer)
+                .collect();
+        }
+        self.live_quotes(rfq_id)
     }
 
     /// Live quotes held by one maker, ascending id — the index the engine
@@ -778,12 +1073,20 @@ impl RfqBook {
         Ok(())
     }
 
-    /// Sum of taker flows across legs at the quoted prices.
-    fn total_flow(rfq: &RfqRequest, leg_prices_ticks: &[u64]) -> Result<i128, RfqError> {
+    /// Sum of taker flows across legs at the quoted prices for a given
+    /// per-leg quantity vector (partial-execution pricer).
+    fn flow_for(
+        rfq: &RfqRequest,
+        leg_prices_ticks: &[u64],
+        qty_lots: &[u64],
+    ) -> Result<i128, RfqError> {
         let mut total: i128 = 0;
-        for (leg, &price) in rfq.legs.iter().zip(leg_prices_ticks) {
+        for ((leg, &price), &qty) in rfq.legs.iter().zip(leg_prices_ticks).zip(qty_lots) {
             total = total
-                .checked_add(leg.taker_flow(price).ok_or(RfqError::MathOverflow)?)
+                .checked_add(
+                    leg.taker_flow_at_qty(price, qty)
+                        .ok_or(RfqError::MathOverflow)?,
+                )
                 .ok_or(RfqError::MathOverflow)?;
         }
         Ok(total)
@@ -2036,5 +2339,286 @@ mod tests {
         assert_eq!(a_ids, vec![qd]);
         // A maker with no quotes yields an empty index.
         assert!(book.live_quotes_by_maker(OUTSIDER).is_empty());
+    }
+
+    // 25. partial acceptance: quote stays firm for the remainder ---------------
+
+    #[test]
+    fn partial_acceptance_keeps_quote_firm() {
+        let mut book = RfqBook::new();
+        let now = 1_000_000;
+        let r = book
+            .create_rfq(
+                TAKER,
+                vec![leg("BTC-PERP", Side::Bid, 10)],
+                vec![],
+                None,
+                None,
+                60_000,
+                now,
+            )
+            .unwrap();
+        let q = book
+            .send_quote_sized(MAKER_A, r, vec![50_000], vec![10], 60_000, now + 1)
+            .unwrap();
+
+        // Take 4 of the 10 lots.
+        let ex = book.execute_partial(TAKER, r, q, vec![4], now + 2).unwrap();
+        assert_eq!(ex.legs[0].2, 4);
+        assert_eq!(
+            ex.total_taker_flow_quote_minor,
+            -4 * 50_000 * 100_000 / 100_000
+        );
+
+        // The quote is still Live with 6 lots remaining.
+        assert_eq!(book.quote(q).unwrap().status, QuoteStatus::Live);
+        assert_eq!(book.quote(q).unwrap().remaining_lots(), vec![6]);
+        // The RFQ is still Open with 6 lots remaining.
+        assert_eq!(book.rfq(r).unwrap().status, RfqStatus::Open);
+        assert_eq!(book.rfq(r).unwrap().remaining_lots, vec![6]);
+
+        // Take the remaining 6: quote consumed, RFQ filled, others drained.
+        let other = book
+            .send_quote(MAKER_B, r, vec![51_000], 60_000, now + 3)
+            .unwrap();
+        let ex2 = book.execute_partial(TAKER, r, q, vec![6], now + 4).unwrap();
+        assert_eq!(ex2.legs[0].2, 6);
+        assert_eq!(book.quote(q).unwrap().status, QuoteStatus::Executed);
+        assert_eq!(book.rfq(r).unwrap().status, RfqStatus::Filled);
+        assert_eq!(book.quote(other).unwrap().status, QuoteStatus::Cancelled);
+    }
+
+    // 25b. full execute on a partial-size quote consumes only the commitment -
+
+    #[test]
+    fn full_execute_honors_quote_size() {
+        let mut book = RfqBook::new();
+        let now = 1_100_000;
+        let r = book
+            .create_rfq(
+                TAKER,
+                vec![leg("BTC-PERP", Side::Bid, 10)],
+                vec![],
+                None,
+                None,
+                60_000,
+                now,
+            )
+            .unwrap();
+        // Dealer A commits only 3 of 10.
+        let qa = book
+            .send_quote_sized(MAKER_A, r, vec![50_000], vec![3], 60_000, now + 1)
+            .unwrap();
+        let ex = book.execute(TAKER, r, qa, now + 2).unwrap();
+        assert_eq!(ex.legs[0].2, 3);
+        // Quote consumed, but the RFQ stays open with 7 remaining.
+        assert_eq!(book.quote(qa).unwrap().status, QuoteStatus::Executed);
+        assert_eq!(book.rfq(r).unwrap().status, RfqStatus::Open);
+        assert_eq!(book.rfq(r).unwrap().remaining_lots, vec![7]);
+    }
+
+    // 25c. partial validation ---------------------------------------------------
+
+    #[test]
+    fn partial_validation() {
+        let mut book = RfqBook::new();
+        let now = 1_200_000;
+        let r = book
+            .create_rfq(
+                TAKER,
+                vec![
+                    leg("BTC-PERP", Side::Bid, 10),
+                    leg("ETH-PERP", Side::Ask, 4),
+                ],
+                vec![],
+                None,
+                None,
+                60_000,
+                now,
+            )
+            .unwrap();
+        let q = book
+            .send_quote(MAKER_A, r, vec![50_000, 3_000], 60_000, now + 1)
+            .unwrap();
+
+        // Wrong length.
+        assert_eq!(
+            book.execute_partial(TAKER, r, q, vec![1], now + 2)
+                .unwrap_err(),
+            RfqError::InvalidPartial
+        );
+        // All-zero take.
+        assert_eq!(
+            book.execute_partial(TAKER, r, q, vec![0, 0], now + 2)
+                .unwrap_err(),
+            RfqError::InvalidPartial
+        );
+        // Take larger than the quote on a leg.
+        assert_eq!(
+            book.execute_partial(TAKER, r, q, vec![11, 0], now + 2)
+                .unwrap_err(),
+            RfqError::InvalidPartial
+        );
+        assert_eq!(
+            book.execute_partial(TAKER, r, q, vec![0, 5], now + 2)
+                .unwrap_err(),
+            RfqError::InvalidPartial
+        );
+        // Book untouched by all failed attempts.
+        assert_eq!(book.rfq(r).unwrap().remaining_lots, vec![10, 4]);
+        assert_eq!(book.quote(q).unwrap().filled_lots, vec![0, 0]);
+
+        // A legal partial across both legs.
+        let ex = book
+            .execute_partial(TAKER, r, q, vec![2, 1], now + 3)
+            .unwrap();
+        assert_eq!(ex.legs[0].2, 2);
+        assert_eq!(ex.legs[1].2, 1);
+        assert_eq!(book.rfq(r).unwrap().remaining_lots, vec![8, 3]);
+        assert_eq!(book.quote(q).unwrap().filled_lots, vec![2, 1]);
+        assert_eq!(book.quote(q).unwrap().remaining_lots(), vec![8, 3]);
+    }
+
+    // 25d. quote privacy: quotes are private to the requesting account --------
+
+    #[test]
+    fn quote_privacy_views() {
+        let mut book = RfqBook::new();
+        let now = 1_300_000;
+        let r = book
+            .create_rfq(
+                TAKER,
+                vec![leg("BTC-PERP", Side::Bid, 5)],
+                vec![],
+                None,
+                None,
+                60_000,
+                now,
+            )
+            .unwrap();
+        let qa = book
+            .send_quote(MAKER_A, r, vec![50_000], 60_000, now + 1)
+            .unwrap();
+        let qb = book
+            .send_quote(MAKER_B, r, vec![51_000], 60_000, now + 2)
+            .unwrap();
+
+        // The taker sees BOTH live quotes (their competitive channel).
+        let taker_ids: Vec<u64> = book
+            .quotes_for_viewer(r, TAKER)
+            .iter()
+            .map(|q| q.quote_id)
+            .collect();
+        assert_eq!(taker_ids, vec![qa, qb]);
+
+        // A maker sees only their own quote — never the rival's.
+        let a_ids: Vec<u64> = book
+            .quotes_for_viewer(r, MAKER_A)
+            .iter()
+            .map(|q| q.quote_id)
+            .collect();
+        assert_eq!(a_ids, vec![qa]);
+        let b_ids: Vec<u64> = book
+            .quotes_for_viewer(r, MAKER_B)
+            .iter()
+            .map(|q| q.quote_id)
+            .collect();
+        assert_eq!(b_ids, vec![qb]);
+
+        // Anyone else sees nothing; unknown RFQs also return nothing.
+        assert!(book.quotes_for_viewer(r, OUTSIDER).is_empty());
+        assert!(book.quotes_for_viewer(999, TAKER).is_empty());
+    }
+
+    // 25e. execute_best: the taker executes against the best one ---------------
+
+    #[test]
+    fn execute_best_picks_best_quote() {
+        let mut book = RfqBook::new();
+        let now = 1_400_000;
+        let r = book
+            .create_rfq(
+                TAKER,
+                vec![leg("BTC-PERP", Side::Bid, 5)],
+                vec![],
+                None,
+                None,
+                60_000,
+                now,
+            )
+            .unwrap();
+        let _qa = book
+            .send_quote(MAKER_A, r, vec![50_000], 60_000, now + 1)
+            .unwrap();
+        // Maker B's price is better for the taker (they receive more flow:
+        // buying cheaper). At 49_000 the taker pays less than at 50_000.
+        let qb = book
+            .send_quote(MAKER_B, r, vec![49_000], 60_000, now + 2)
+            .unwrap();
+
+        let ex = book.execute_best(TAKER, r, now + 3).unwrap();
+        assert_eq!(ex.quote_id, qb);
+        assert_eq!(ex.maker, MAKER_B);
+        assert_eq!(book.rfq(r).unwrap().status, RfqStatus::Filled);
+
+        // No live quotes: execute_best fails cleanly.
+        let r2 = book
+            .create_rfq(
+                TAKER,
+                vec![leg("ETH-PERP", Side::Ask, 2)],
+                vec![],
+                None,
+                None,
+                60_000,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            book.execute_best(TAKER, r2, now + 4).unwrap_err(),
+            RfqError::UnknownQuote
+        );
+    }
+
+    // 25f. sized quotes: working size below the request -------------------------
+
+    #[test]
+    fn sized_quote_validation() {
+        let mut book = RfqBook::new();
+        let now = 1_500_000;
+        let r = book
+            .create_rfq(
+                TAKER,
+                vec![leg("BTC-PERP", Side::Bid, 10)],
+                vec![],
+                None,
+                None,
+                60_000,
+                now,
+            )
+            .unwrap();
+        // Zero size rejected.
+        assert_eq!(
+            book.send_quote_sized(MAKER_A, r, vec![50_000], vec![0], 60_000, now + 1)
+                .unwrap_err(),
+            RfqError::InvalidQty
+        );
+        // Size above the RFQ remaining rejected.
+        assert_eq!(
+            book.send_quote_sized(MAKER_A, r, vec![50_000], vec![11], 60_000, now + 1)
+                .unwrap_err(),
+            RfqError::InvalidQty
+        );
+        // Wrong length rejected.
+        assert_eq!(
+            book.send_quote_sized(MAKER_A, r, vec![50_000], vec![1, 2], 60_000, now + 1)
+                .unwrap_err(),
+            RfqError::LegCountMismatch
+        );
+        // Legal working size accepted.
+        let q = book
+            .send_quote_sized(MAKER_A, r, vec![50_000], vec![4], 60_000, now + 1)
+            .unwrap();
+        assert_eq!(book.quote(q).unwrap().qty_lots, vec![4]);
+        assert_eq!(book.quote(q).unwrap().remaining_lots(), vec![4]);
     }
 }

@@ -189,6 +189,58 @@ pub enum Command {
         /// Engine wall-clock.
         now: TimestampMs,
     },
+    /// Taker accepts a **partial** of one quote (G-11: "the taker accepts
+    /// one quote (or a partial)"): `take_per_leg` lots per leg, bounded by
+    /// the quote's and the RFQ's remaining size. The quote's remainder
+    /// stays firm; the RFQ stays open for its remainder.
+    RfqExecutePartial {
+        /// Executing taker.
+        taker: SubaccountId,
+        /// The RFQ.
+        rfq_id: u64,
+        /// The accepted quote.
+        quote_id: u64,
+        /// Lots to lift per leg, aligned with the RFQ's leg order.
+        take_per_leg: Vec<u64>,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Maker submits a **partial-size** quote (Paradigm working size): the
+    /// dealer commits `qty_lots[i]` per leg — possibly less than the RFQ's
+    /// remaining size.
+    RfqQuoteSized {
+        /// Quoting maker.
+        maker: SubaccountId,
+        /// Target RFQ.
+        rfq_id: u64,
+        /// Price per leg in ticks, aligned with the RFQ's leg order.
+        leg_prices_ticks: Vec<u64>,
+        /// Committed size per leg, lots.
+        qty_lots: Vec<u64>,
+        /// Quote window.
+        ttl_ms: TimestampMs,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Enroll a dealer in the G-15 program (or re-enroll a dropped dealer —
+    /// an explicit governance act that resets the ladder).
+    DealerEnroll {
+        /// The dealer's subaccount.
+        dealer: SubaccountId,
+        /// Starting tier.
+        tier: poc_rfq::DealerTier,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Governance: set a dealer's tier explicitly (promotion or demotion).
+    DealerSetTier {
+        /// The dealer's subaccount.
+        dealer: SubaccountId,
+        /// The new tier.
+        tier: poc_rfq::DealerTier,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
     /// Cancel an RFQ (taker) or a quote (maker).
     RfqCancel {
         /// Owning subaccount.

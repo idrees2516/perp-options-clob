@@ -261,35 +261,36 @@ pub fn rfq_taker_fees(
         .collect()
 }
 
-/// Plan the taker's execution of one quote into journal events.
+/// Plan the taker's execution of one quote into journal events —
+/// full (`take == None`) or partial (the G-11 "accepts a partial").
 /// Pure over the pre-command snapshot.
 pub(crate) fn plan_rfq_execute(
     engine: &Engine,
     taker: SubaccountId,
     rfq_id: u64,
     quote_id: u64,
+    take_per_leg: Option<&[u64]>,
     now: TimestampMs,
 ) -> Vec<Event> {
-    let planned = resolve_execution(engine, taker, rfq_id, quote_id, now);
+    let planned = engine
+        .rfq_book_ref()
+        .plan_take(taker, rfq_id, quote_id, take_per_leg, now);
     let planned = match planned {
         Ok(p) => p,
-        Err(reason) => {
+        Err(_reason) => {
             return vec![Event::RfqRejected {
                 subaccount: taker,
-                reason,
+                reason: "rfq execution rejected",
                 ts: now,
             }]
         }
     };
-    match rfq_margin_ok(engine, taker, planned.maker, &planned.legs, now) {
-        Some(true) => {}
-        _ => {
-            return vec![Event::RfqRejected {
-                subaccount: taker,
-                reason: "insufficient margin for package",
-                ts: now,
-            }]
-        }
+    if rfq_margin_ok(engine, taker, planned.maker, &planned.legs, now) != Some(true) {
+        return vec![Event::RfqRejected {
+            subaccount: taker,
+            reason: "insufficient margin for package",
+            ts: now,
+        }];
     }
     let fees = rfq_taker_fees(engine, taker, &planned.legs);
     let mut trades = Vec::with_capacity(planned.legs.len());

@@ -1,0 +1,17 @@
+[package]
+name = "poc-fix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FIX 4.4 gateway for the perp-options-clob: wire codec, session protocol (logon/heartbeat/sequence/resend), and the application layer bridging legacy OMS/EMS desks to the engine's CLOB and RFQ network"
+
+[dependencies]
+poc-core = { path = "../core" }
+poc-orderbook = { path = "../orderbook" }
+poc-engine = { path = "../engine" }
+poc-rfq = { path = "../rfq" }
+
+[lints]
+workspace = true

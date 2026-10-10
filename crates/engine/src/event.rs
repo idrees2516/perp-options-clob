@@ -512,6 +512,10 @@ pub enum Event {
         maker: SubaccountId,
         /// Per-leg prices, ticks.
         leg_prices_ticks: Vec<u64>,
+        /// Committed size per leg, lots. EMPTY = full remaining size at
+        /// apply time (the `RfqQuote` command path); a vector is the
+        /// `RfqQuoteSized` working-size path.
+        qty_lots: Vec<u64>,
         /// Quote window.
         ttl_ms: TimestampMs,
         /// Engine wall-clock.
@@ -549,6 +553,54 @@ pub enum Event {
         quote_id: Option<u64>,
         /// Why (`cancelled` | `expired` | `filled`).
         reason: &'static str,
+    },
+    /// A dealer was enrolled (or re-enrolled after a drop) into the G-15
+    /// program. Re-enrollment resets the ladder from zero.
+    DealerEnrolled {
+        /// The dealer's subaccount.
+        dealer: SubaccountId,
+        /// Starting tier.
+        tier: poc_rfq::DealerTier,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A dealer pulled a firm quote on a still-open RFQ — the G-15
+    /// strike signal. If the pull trips the ladder, a `DealerSuspended`
+    /// or `DealerDropped` event follows immediately.
+    DealerStruck {
+        /// The dealer's subaccount.
+        dealer: SubaccountId,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A dealer's pull count tripped the ladder: they cannot quote until
+    /// `until`. Echo event — the mutation happened in `DealerStruck`'s
+    /// apply (deterministic; replay reproduces the exact `until`).
+    DealerSuspended {
+        /// The dealer's subaccount.
+        dealer: SubaccountId,
+        /// Suspended until (engine wall-clock, ms).
+        until: TimestampMs,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A dealer was permanently removed from the program (third
+    /// suspension). Echo event — mutation happened in `DealerStruck`'s
+    /// apply.
+    DealerDropped {
+        /// The dealer's subaccount.
+        dealer: SubaccountId,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// Governance set a dealer's tier explicitly.
+    DealerTierSet {
+        /// The dealer's subaccount.
+        dealer: SubaccountId,
+        /// The new tier.
+        tier: poc_rfq::DealerTier,
+        /// Engine wall-clock.
+        ts: TimestampMs,
     },
     /// Cancel-on-disconnect setting changed.
     CodChanged {

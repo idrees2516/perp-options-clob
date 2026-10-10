@@ -639,6 +639,115 @@ fn micro() {
         }
         stats("book commitment (1000 resting orders)", &mut samples);
     }
+
+    // 6. The dealer-network round trip: RFQ create -> quote -> execute.
+    {
+        const N: usize = 20_000;
+        let mut e = setup_engine(4);
+        let mut samples = Vec::with_capacity(N);
+        let mut rng = Rng::new(7);
+        for i in 0..u64::try_from(N).unwrap_or(1) {
+            let taker = 1 + rng.below(2);
+            let maker = 3 + rng.below(2);
+            let qty = 1 + rng.below(50);
+            let px = 70_000 + rng.below(20_000);
+            let rfq_id = 1 + i;
+            let quote_id = 1 + i;
+            let t = Instant::now();
+            e.process(Command::RfqCreate {
+                taker,
+                legs: vec![poc_engine::RfqLegCommand {
+                    symbol: "BTC-PERP".into(),
+                    side: poc_core::Side::Bid,
+                    qty_lots: qty,
+                }],
+                counterparties: vec![],
+                min_total_cost_quote_minor: None,
+                max_total_cost_quote_minor: None,
+                ttl_ms: 60_000,
+                now: 2_000,
+            });
+            e.process(Command::RfqQuote {
+                maker,
+                rfq_id,
+                leg_prices_ticks: vec![px],
+                ttl_ms: 60_000,
+                now: 2_000,
+            });
+            e.process(Command::RfqExecute {
+                taker,
+                rfq_id,
+                quote_id,
+                now: 2_000,
+            });
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("RFQ round trip (create+quote+exec)", &mut samples);
+    }
+
+    // 7. FIX wire codec: encode + decode round trip.
+    {
+        use poc_fix::{tag, FixMessage, MsgType};
+        const N: usize = 60_000;
+        let mut m = FixMessage::new();
+        m.push(tag::MSG_SEQ_NUM, "42");
+        m.push(tag::SENDER_COMP_ID, "DESK");
+        m.push(tag::TARGET_COMP_ID, "VENUE");
+        m.push(tag::MSG_TYPE, MsgType::NewOrderSingle.code());
+        m.push(tag::CL_ORD_ID, "ORDER-88123456");
+        m.push(tag::SYMBOL, "BTC-PERP");
+        m.push(tag::SIDE, "1");
+        m.push(tag::ORDER_QTY, "100");
+        m.push(tag::ORD_TYPE, "2");
+        m.push(tag::PRICE, "80000");
+        m.push(tag::TIME_IN_FORCE, "1");
+        let mut samples = Vec::with_capacity(N);
+        for _ in 0..N {
+            let t = Instant::now();
+            let bytes = m.encode();
+            let back = FixMessage::decode(&bytes).expect("decode");
+            let _ = back.get_u64(tag::ORDER_QTY);
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("FIX encode+decode round trip", &mut samples);
+    }
+
+    // 8. FIX gateway end-to-end: logon + NewOrderSingle through the
+    // full session + application stack.
+    {
+        use poc_fix::{tag, FixMessage, MsgType};
+        const N: usize = 20_000;
+        let mut gw = poc_fix::FixGateway::new(setup_engine(4));
+        gw.register_comp_id("DESK", 1);
+        let sid = gw.connect("DESK").expect("connect");
+        let mut m = FixMessage::new();
+        m.push(tag::MSG_SEQ_NUM, "1");
+        m.push(tag::SENDER_COMP_ID, "DESK");
+        m.push(tag::TARGET_COMP_ID, "VENUE");
+        m.push(tag::MSG_TYPE, MsgType::Logon.code());
+        m.push(tag::ENCRYPT_METHOD, "0");
+        m.push(tag::HEART_BT_INT, "30");
+        let _ = gw.on_frame(sid, &m.encode(), 1_000).expect("logon");
+
+        let mut samples = Vec::with_capacity(N);
+        for i in 0..N {
+            let mut order = FixMessage::new();
+            order.push(tag::MSG_SEQ_NUM, (2 + i).to_string());
+            order.push(tag::SENDER_COMP_ID, "DESK");
+            order.push(tag::TARGET_COMP_ID, "VENUE");
+            order.push(tag::MSG_TYPE, MsgType::NewOrderSingle.code());
+            order.push(tag::CL_ORD_ID, format!("C-{i}"));
+            order.push(tag::SYMBOL, "BTC-PERP");
+            order.push(tag::SIDE, if i % 2 == 0 { "1" } else { "2" });
+            order.push(tag::ORDER_QTY, "1");
+            order.push(tag::ORD_TYPE, "2");
+            order.push(tag::PRICE, (70_000 + i % 100).to_string());
+            let t = Instant::now();
+            let _ = gw.on_frame(sid, &order.encode(), 1_000).expect("order");
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        stats("FIX gateway on_frame (NewOrderSingle)", &mut samples);
+    }
 }
 
 // ----------------------------------------------------------------------

@@ -10,6 +10,7 @@ description = "Durable command WAL for the perp-options-clob engine: framed appe
 [dependencies]
 poc-core = { path = "../core" }
 poc-engine = { path = "../engine" }
+poc-rfq = { path = "../rfq" }
 
 [lints]
 workspace = true

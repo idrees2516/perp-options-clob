@@ -18,9 +18,11 @@ dependencies = [
  "poc-core",
  "poc-economics",
  "poc-engine",
+ "poc-fix",
  "poc-margin",
  "poc-oracle",
  "poc-persist",
+ "poc-rfq",
  "poc-settlement",
 ]
 
@@ -65,6 +67,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "poc-fix"
+version = "0.1.0"
+dependencies = [
+ "poc-core",
+ "poc-engine",
+ "poc-orderbook",
+ "poc-rfq",
+]
+
+[[package]]
 name = "poc-governance"
 version = "0.1.0"
 dependencies = [
@@ -98,6 +110,7 @@ version = "0.1.0"
 dependencies = [
  "poc-core",
  "poc-engine",
+ "poc-rfq",
 ]
 
 [[package]]

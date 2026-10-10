@@ -302,6 +302,23 @@ impl<'a> Decoder<'a> {
         Ok(b)
     }
 
+    /// Decode a single byte (enum tags).
+    pub fn u8(&mut self) -> Result<u8, DecodeError> {
+        self.take()
+    }
+
+    /// Decode a length-prefixed vec of varints ([`Encoder::varint_vec`]).
+    pub fn varint_vec(&mut self) -> Result<Vec<u64>, DecodeError> {
+        let len = self.varint()?;
+        let len = usize::try_from(len).map_err(|_| DecodeError::Malformed)?;
+        let mut out = Vec::with_capacity(len.min(4096));
+        for _ in 0..len {
+            let v = self.varint()?;
+            out.push(u64::try_from(v).map_err(|_| DecodeError::Malformed)?);
+        }
+        Ok(out)
+    }
+
     /// Decode a varint.
     pub fn varint(&mut self) -> Result<u128, DecodeError> {
         let mut out = 0_u128;
@@ -950,8 +967,69 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
             e.varint(u128::from(*subaccount));
             e.varint(u128::from(*now));
         }
+        Command::RfqExecutePartial {
+            taker,
+            rfq_id,
+            quote_id,
+            take_per_leg,
+            now,
+        } => {
+            e.varint(31);
+            e.varint(u128::from(*taker));
+            e.varint(u128::from(*rfq_id));
+            e.varint(u128::from(*quote_id));
+            e.varint_vec(take_per_leg);
+            e.varint(u128::from(*now));
+        }
+        Command::RfqQuoteSized {
+            maker,
+            rfq_id,
+            leg_prices_ticks,
+            qty_lots,
+            ttl_ms,
+            now,
+        } => {
+            e.varint(32);
+            e.varint(u128::from(*maker));
+            e.varint(u128::from(*rfq_id));
+            e.varint_vec(leg_prices_ticks);
+            e.varint_vec(qty_lots);
+            e.varint(u128::from(*ttl_ms));
+            e.varint(u128::from(*now));
+        }
+        Command::DealerEnroll { dealer, tier, now } => {
+            e.varint(33);
+            e.varint(u128::from(*dealer));
+            e.varint(u128::from(tier_tag(*tier)));
+            e.varint(u128::from(*now));
+        }
+        Command::DealerSetTier { dealer, tier, now } => {
+            e.varint(34);
+            e.varint(u128::from(*dealer));
+            e.varint(u128::from(tier_tag(*tier)));
+            e.varint(u128::from(*now));
+        }
     }
     e.into_vec()
+}
+
+/// Wire tag of a dealer tier (G-15).
+fn tier_tag(tier: poc_rfq::DealerTier) -> u8 {
+    match tier {
+        poc_rfq::DealerTier::Basic => 0,
+        poc_rfq::DealerTier::Silver => 1,
+        poc_rfq::DealerTier::Gold => 2,
+    }
+}
+
+/// Inverse of [`tier_tag`].
+fn tier_from_tag(tag: u8) -> Result<poc_rfq::DealerTier, DecodeError> {
+    match tag {
+        0 => Ok(poc_rfq::DealerTier::Basic),
+        1 => Ok(poc_rfq::DealerTier::Silver),
+        2 => Ok(poc_rfq::DealerTier::Gold),
+        _ => Err(DecodeError::UnknownTag(tag)),
+    }
 }
 
 /// Decode a command from bytes (must consume the whole buffer).
@@ -1204,6 +1282,31 @@ pub fn decode_command(data: &[u8]) -> Result<Command, DecodeError> {
             from: d.str()?,
             to: d.str()?,
             from_amount_minor: d.varint()?,
+            now: d.u64()?,
+        },
+        31 => Command::RfqExecutePartial {
+            taker: d.u64()?,
+            rfq_id: d.u64()?,
+            quote_id: d.u64()?,
+            take_per_leg: d.varint_vec()?,
+            now: d.u64()?,
+        },
+        32 => Command::RfqQuoteSized {
+            maker: d.u64()?,
+            rfq_id: d.u64()?,
+            leg_prices_ticks: d.varint_vec()?,
+            qty_lots: d.varint_vec()?,
+            ttl_ms: d.u64()?,
+            now: d.u64()?,
+        },
+        33 => Command::DealerEnroll {
+            dealer: d.u64()?,
+            tier: tier_from_tag(d.u8()?)?,
+            now: d.u64()?,
+        },
+        34 => Command::DealerSetTier {
+            dealer: d.u64()?,
+            tier: tier_from_tag(d.u8()?)?,
             now: d.u64()?,
         },
         other => return Err(DecodeError::UnknownTag(other as u8)),
