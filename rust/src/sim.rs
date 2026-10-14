@@ -88,8 +88,8 @@ impl DaySchedule {
 pub enum AgentCmd {
     /// Place an order.
     Place(NewOrder),
-    /// Cancel a resting order.
-    Cancel(OrderId, SymbolId),
+    /// Cancel a resting order (owner, order, symbol).
+    Cancel(AcctId, OrderId, SymbolId),
     /// Advance time by one step.
     Tick,
     /// New underlying mark.
@@ -218,7 +218,7 @@ impl Flow {
         if !self.resting[ai].is_empty() && self.rng.chance(1, 5) {
             let idx = self.rng.below(self.resting[ai].len() as u64) as usize;
             let (oid, osym) = self.resting[ai].swap_remove(idx);
-            return AgentCmd::Cancel(oid, osym);
+            return AgentCmd::Cancel(acct, oid, osym);
         }
         // Quote around a synthetic fair value = max(intrinsic-ish, 1 tick).
         let side = self.rng.side();
@@ -251,7 +251,7 @@ impl Flow {
     pub fn note_ack(&mut self, ev: &EvBuf) {
         for e in &ev.events {
             if let crate::journal::Event::Ack {
-                order, account, symbol, leaves,
+                order, account, symbol, leaves, ..
             } = *e
             {
                 if order != 0 && leaves > 0 && (account as usize) < self.resting.len() {

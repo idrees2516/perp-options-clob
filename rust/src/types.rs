@@ -200,4 +200,36 @@ pub enum Reject {
     Halted = 13,
     /// Delta notional limit exceeded.
     DeltaLimit = 14,
+    /// Per-account open-order count cap exceeded (book-flood defense).
+    TooManyOrders = 15,
+    /// Order quantity above the configured per-order cap.
+    QtyTooLarge = 16,
+    /// Cancel/replace targeted an order owned by a different account.
+    NotOwner = 17,
+}
+
+impl Reject {
+    /// Stable machine-readable reason string (REST/WS wire).
+    pub fn name(self) -> &'static str {
+        match self {
+            Reject::UnknownSymbol => "UnknownSymbol",
+            Reject::UnknownAccount => "UnknownAccount",
+            Reject::PriceBand => "PriceBand",
+            Reject::PostOnlyCross => "PostOnlyCross",
+            Reject::ReduceOnlyWouldIncrease => "ReduceOnlyWouldIncrease",
+            Reject::InsufficientFunds => "InsufficientFunds",
+            Reject::PositionLimit => "PositionLimit",
+            Reject::RateLimit => "RateLimit",
+            Reject::Malformed => "Malformed",
+            Reject::NotContinuous => "NotContinuous",
+            Reject::FokDepth => "FokDepth",
+            Reject::DuplicateOrder => "DuplicateOrder",
+            Reject::UnknownOrder => "UnknownOrder",
+            Reject::Halted => "Halted",
+            Reject::DeltaLimit => "DeltaLimit",
+            Reject::TooManyOrders => "TooManyOrders",
+            Reject::QtyTooLarge => "QtyTooLarge",
+            Reject::NotOwner => "NotOwner",
+        }
+    }
 }

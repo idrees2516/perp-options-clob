@@ -43,3 +43,11 @@ path = "src/bin/tps.rs"
 name = "latency"
 path = "benches/latency.rs"
 harness = false
+
+[[bin]]
+name = "ns-venue"
+path = "src/bin/venue.rs"
+
+[[bin]]
+name = "venue-tps"
+path = "src/bin/venue_tps.rs"

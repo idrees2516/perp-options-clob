@@ -59,6 +59,11 @@ pub struct ShardConfig {
     pub order_cap: usize,
     /// Per-book level capacity hint.
     pub level_cap: usize,
+    /// Per-account cap on simultaneously resting orders across the shard
+    /// (book-flood / memory-exhaustion defense).
+    pub max_open_orders: u32,
+    /// Maximum quantity of a single order (fat-finger defense).
+    pub max_order_qty: u32,
     /// Keep the WAL in memory (true, default) or discard flushed frames
     /// (false — pure engine-capacity mode for benchmarking).
     pub journal_in_memory: bool,
@@ -79,6 +84,8 @@ impl ShardConfig {
             fast_bps: 300,
             order_cap: 4096,
             level_cap: 256,
+            max_open_orders: 256,
+            max_order_qty: 10_000,
             journal_in_memory: true,
         }
     }
@@ -167,12 +174,16 @@ impl SymbolState {
 pub enum Cmd {
     /// Submit an order (symbol is the shard-local symbol id).
     Place(NewOrder),
-    /// Cancel an order by id and symbol.
+    /// Cancel an order by id and symbol. The cancelling account must own
+    /// the order — ownership is verified and `Reject::NotOwner` emitted on
+    /// mismatch (authorization enforced in the engine, not just the edge).
     Cancel {
         /// Order to cancel (packed id).
         order: OrderId,
         /// Its symbol.
         symbol: SymbolId,
+        /// Account requesting the cancel (must own the order).
+        account: AcctId,
     },
     /// Cancel-replace: atomically cancel and submit a new order.
     Replace {
@@ -184,6 +195,8 @@ pub enum Cmd {
         price: Price,
         /// New quantity.
         qty: Qty,
+        /// Account requesting the replace (must own the order).
+        account: AcctId,
     },
     /// Register an account.
     CreateAccount {
@@ -264,16 +277,30 @@ pub fn decode_cmd(raw: &[u8]) -> Option<Cmd> {
             qty: g32(21)?,
             oco: g64(25)?,
         })),
-        2 => Some(Cmd::Cancel {
-            order: g64(1)?,
-            symbol: g32(9)?,
-        }),
-        3 => Some(Cmd::Replace {
-            order: g64(1)?,
-            symbol: g32(9)?,
-            price: g64(13)?,
-            qty: g32(21)?,
-        }),
+        2 => {
+            let order = g64(1)?;
+            let symbol = g32(9)?;
+            let account = g32(13)?;
+            Some(Cmd::Cancel {
+                order,
+                symbol,
+                account,
+            })
+        }
+        3 => {
+            let order = g64(1)?;
+            let symbol = g32(9)?;
+            let price = g64(13)?;
+            let qty = g32(21)?;
+            let account = g32(25)?;
+            Some(Cmd::Replace {
+                order,
+                symbol,
+                price,
+                qty,
+                account,
+            })
+        }
         4 => Some(Cmd::CreateAccount {
             account: g32(1)?,
             tier: match raw.get(5)? {
@@ -455,6 +482,8 @@ pub struct Shard {
     pos_free: Vec<u32>,
     /// Cached per-account delta notional.
     acct_delta: Vec<i64>,
+    /// Resting-order count per account (book-flood defense).
+    open_orders: Vec<u32>,
     /// Slots of positions currently short (margin-relevant); maintained on
     /// every position transition so oracle refreshes stay O(active shorts).
     short_slots: Vec<u32>,
@@ -513,6 +542,7 @@ impl Shard {
             pos_meta: Vec::with_capacity(1024),
             pos_free: Vec::new(),
             acct_delta: Vec::new(),
+            open_orders: Vec::new(),
             short_slots: Vec::new(),
             short_cursor: 0,
             scratch: [0; 96],
@@ -574,20 +604,36 @@ impl Shard {
         }
         match cmd {
             Cmd::Place(o) => self.place(o, ev),
-            Cmd::Cancel { order, symbol } => {
+            Cmd::Cancel {
+                order,
+                symbol,
+                account,
+            } => {
                 let slot = id_slot(order);
-                self.cancel_slot(slot, order, symbol, 0, ev, true);
+                // Ownership is enforced inside the (single) slot lookup; a
+                // vanished order must still answer UnknownOrder.
+                let before = ev.events.len();
+                self.cancel_slot(slot, order, symbol, 0, ev, true, account);
+                if ev.events.len() == before {
+                    ev.push(Event::Reject {
+                        order,
+                        account,
+                        symbol,
+                        code: Reject::UnknownOrder as u8,
+                    });
+                }
             }
             Cmd::Replace {
                 order,
                 symbol,
                 price,
                 qty,
-            } => self.replace(order, symbol, price, qty, ev),
+                account,
+            } => self.replace(order, symbol, price, qty, account, ev),
             Cmd::CreateAccount { account, tier } => self.create_account(account, tier),
             Cmd::Deposit { account, amount } => self.deposit(account, amount, ev),
             Cmd::Withdraw { account, amount } => self.withdraw(account, amount, ev),
-            Cmd::CreateSymbol { listing } => self.create_symbol(listing),
+            Cmd::CreateSymbol { listing } => self.create_symbol(listing, ev),
             Cmd::Oracle { price } => self.oracle(price, ev),
             Cmd::Advance { to } => self.advance(to, ev),
             Cmd::Halt => self.enter_halt(7, ev),
@@ -646,10 +692,12 @@ impl Shard {
                 scratch[n..n + 8].copy_from_slice(&o.oco.to_le_bytes());
                 n += 8;
             }
-            Cmd::Cancel { order, symbol } => {
+            Cmd::Cancel { order, symbol, account } => {
                 scratch[n..n + 8].copy_from_slice(&order.to_le_bytes());
                 n += 8;
                 scratch[n..n + 4].copy_from_slice(&symbol.to_le_bytes());
+                n += 4;
+                scratch[n..n + 4].copy_from_slice(&account.to_le_bytes());
                 n += 4;
             }
             Cmd::Replace {
@@ -657,6 +705,7 @@ impl Shard {
                 symbol,
                 price,
                 qty,
+                account,
             } => {
                 scratch[n..n + 8].copy_from_slice(&order.to_le_bytes());
                 n += 8;
@@ -665,6 +714,8 @@ impl Shard {
                 scratch[n..n + 8].copy_from_slice(&price.to_le_bytes());
                 n += 8;
                 scratch[n..n + 4].copy_from_slice(&qty.to_le_bytes());
+                n += 4;
+                scratch[n..n + 4].copy_from_slice(&account.to_le_bytes());
                 n += 4;
             }
             Cmd::CreateAccount { account, tier } => {
@@ -717,6 +768,7 @@ impl Shard {
                 TokenBucket::new(self.cfg.risk.rate_per_sec, self.clock),
             );
             self.acct_delta.resize(n, 0);
+            self.open_orders.resize(n, 0);
         }
     }
 
@@ -739,13 +791,25 @@ impl Shard {
         if account as usize >= self.accounts.len() || self.accounts[account as usize].id == NIL {
             return;
         }
-        self.accounts[account as usize].cash += amount;
+        // Defensive validation: positive amounts only, checked arithmetic so
+        // no overflow can ever break ledger conservation.
+        if amount <= 0 {
+            return;
+        }
+        let a = &mut self.accounts[account as usize];
+        match a.cash.checked_add(amount) {
+            Some(_) => a.cash += amount,
+            None => return,
+        }
         self.ledger.deposit(amount);
         ev.push(Event::Deposited { account, amount });
     }
 
     fn withdraw(&mut self, account: AcctId, amount: Cash, ev: &mut EvBuf) {
         if account as usize >= self.accounts.len() || self.accounts[account as usize].id == NIL {
+            return;
+        }
+        if amount <= 0 {
             return;
         }
         if self.accounts[account as usize].available() >= amount {
@@ -755,7 +819,7 @@ impl Shard {
         }
     }
 
-    fn create_symbol(&mut self, listing: Listing) {
+    fn create_symbol(&mut self, listing: Listing, ev: &mut EvBuf) {
         let key = listing.key();
         if self.sym_map.get(key) != NIL {
             return;
@@ -763,6 +827,10 @@ impl Shard {
         let id = self.symbols.len() as u32;
         self.symbols.push(SymbolState::new(listing, &self.cfg));
         self.sym_map.insert(key, id);
+        ev.push(Event::SymbolListed {
+            symbol: id,
+            listing_key: key,
+        });
         // Schedule MOC auction open and settlement on the expiry wheel.
         let expiry_ns = listing.expiry_min as u64 * NANOS_PER_MIN;
         let now = self.clock;
@@ -788,6 +856,10 @@ impl Shard {
             return;
         }
         self.mark_price = price;
+        ev.push(Event::UnderlyingMark {
+            underlying: self.underlying,
+            price,
+        });
         if self.ref_price == 0 {
             self.ref_price = price;
         }
@@ -938,6 +1010,10 @@ impl Shard {
             self.reject(&o, Reject::Malformed, ev);
             return;
         }
+        if o.qty > self.cfg.max_order_qty {
+            self.reject(&o, Reject::QtyTooLarge, ev);
+            return;
+        }
         let sym = o.symbol as usize;
         if sym >= self.symbols.len() {
             self.reject(&o, Reject::UnknownSymbol, ev);
@@ -959,6 +1035,14 @@ impl Shard {
         }
         if !self.buckets[account].take(self.clock) {
             self.reject(&o, Reject::RateLimit, ev);
+            return;
+        }
+        // Book-flood defense: cap simultaneously resting orders per account.
+        if self.open_orders[account] >= self.cfg.max_open_orders
+            && o.kind == Kind::Limit
+            && o.tif == Tif::Gtc
+        {
+            self.reject(&o, Reject::TooManyOrders, ev);
             return;
         }
         let listing = self.symbols[sym].listing;
@@ -1098,6 +1182,7 @@ impl Shard {
             );
             let oid = self.symbols[sym].book.insert(order);
             self.wire_oco(o.symbol, oid);
+            self.open_orders[account] += 1;
             self.stats.orders += 1;
             self.last_ack_id = oid;
             ev.push(Event::Ack {
@@ -1105,6 +1190,12 @@ impl Shard {
                 account: o.account,
                 symbol: o.symbol,
                 leaves: o.qty,
+                buy: o.side == Side::Buy,
+                price: o.price,
+                qty: o.qty,
+                tif: o.tif as u8,
+                kind: o.kind as u8,
+                flags: o.flags,
             });
             self.emit_bbo(o.symbol, ev);
             return;
@@ -1146,6 +1237,7 @@ impl Shard {
                 );
                 ack_order = self.symbols[sym].book.insert(order);
                 self.wire_oco(o.symbol, ack_order);
+                self.open_orders[account] += 1;
                 self.last_ack_id = ack_order;
             } else {
                 // IOC/FOK/market remainder: release its commitment.
@@ -1159,6 +1251,12 @@ impl Shard {
             account: o.account,
             symbol: o.symbol,
             leaves: rem,
+            buy: o.side == Side::Buy,
+            price: o.price,
+            qty: o.qty,
+            tif: o.tif as u8,
+            kind: o.kind as u8,
+            flags: o.flags,
         });
         self.emit_bbo(o.symbol, ev);
     }
@@ -1221,7 +1319,7 @@ impl Shard {
         // Self-trade prevention: DecrementAndCancel.
         if maker.account == taker.account {
             let dec = rem.min(maker.leaves);
-            self.cancel_slot(head, pack_id(head, maker.uid), taker.symbol, 1, ev, false);
+            self.cancel_slot(head, pack_id(head, maker.uid), taker.symbol, 1, ev, false, maker.account);
             // Release the taker's commitment for the decremented qty.
             let (cc, mc) = commit_amounts(taker.side, taker_commit_pc, dec);
             self.accounts[taker.account as usize].release(cc, mc);
@@ -1279,6 +1377,11 @@ impl Shard {
     ) {
         let premium = price * qty as u64;
         let maker_acct = maker.account;
+        // A maker consumed to zero leaves the book (reduce_head removed it).
+        if maker.leaves == qty {
+            self.open_orders[maker_acct as usize] =
+                self.open_orders[maker_acct as usize].saturating_sub(1);
+        }
         let taker_tier = self.accounts[taker_acct as usize].tier;
         let maker_tier = self.accounts[maker_acct as usize].tier;
         let fees = self.cfg.fees;
@@ -1432,6 +1535,20 @@ impl Shard {
     // Cancel / replace
     // ------------------------------------------------------------------
 
+    /// Resolve the owning account of a live order, if any. Used for the
+    /// engine-enforced authorization on cancel/replace.
+    fn order_owner(&self, symbol: SymbolId, slot: u32, id: OrderId) -> Option<AcctId> {
+        let sym = symbol as usize;
+        if sym >= self.symbols.len() || slot == NIL || slot as usize >= self.symbols[sym].book.orders.len() {
+            return None;
+        }
+        let o = self.symbols[sym].book.orders[slot as usize];
+        if o.uid != id_uid(id) || o.level == NIL {
+            return None;
+        }
+        Some(o.account)
+    }
+
     /// Cancel by slot with generation guard; emits events, releases
     /// commitments, cascades OCO.
     #[allow(clippy::too_many_arguments)]
@@ -1443,8 +1560,9 @@ impl Shard {
         reason: u8,
         ev: &mut EvBuf,
         cascade_oco: bool,
+        requester: AcctId,
     ) {
-        self.cancel_slot_opt(slot, id, symbol, reason, ev, cascade_oco, true)
+        self.cancel_slot_opt(slot, id, symbol, reason, ev, cascade_oco, true, requester)
     }
 
     /// Cancel with optional BBO emission (replaces suppress the transient
@@ -1459,6 +1577,7 @@ impl Shard {
         ev: &mut EvBuf,
         cascade_oco: bool,
         emit: bool,
+        requester: AcctId,
     ) {
         let sym = symbol as usize;
         if sym >= self.symbols.len() || slot == NIL || slot as usize >= self.symbols[sym].book.orders.len() {
@@ -1469,8 +1588,20 @@ impl Shard {
         if o.uid != id_uid(id) || o.level == NIL {
             return; // stale or recycled
         }
+        // Engine-enforced authorization: internal cascades pass the order's
+        // own owner; user cancels pass the requesting account.
+        if o.account != requester {
+            ev.push(Event::Reject {
+                order: id,
+                account: requester,
+                symbol,
+                code: Reject::NotOwner as u8,
+            });
+            return;
+        }
         let o = self.symbols[sym].book.cancel(slot);
         self.stats.cancels += 1;
+        self.open_orders[o.account as usize] = self.open_orders[o.account as usize].saturating_sub(1);
         let (cc, mc) = commit_amounts(o.side, o.commit_pc, o.leaves);
         self.accounts[o.account as usize].release(cc, mc);
         ev.push(Event::Canceled {
@@ -1481,32 +1612,88 @@ impl Shard {
             reason,
         });
         if cascade_oco && o.oco != NIL && o.oco != slot {
-            self.cancel_slot_opt(o.oco, pack_id(o.oco, o.oco_uid), symbol, 4, ev, false, true);
+            let (pslot, puid) = (o.oco, o.oco_uid);
+            self.cancel_slot_opt(pslot, pack_id(pslot, puid), symbol, 4, ev, false, true, requester);
         }
         if emit {
             self.emit_bbo(symbol, ev);
         }
     }
 
-    fn replace(&mut self, order: OrderId, symbol: SymbolId, price: Price, qty: Qty, ev: &mut EvBuf) {
-        if qty == 0 || price == 0 {
+    fn replace(
+        &mut self,
+        order: OrderId,
+        symbol: SymbolId,
+        price: Price,
+        qty: Qty,
+        account: AcctId,
+        ev: &mut EvBuf,
+    ) {
+        // Authorization: only the owner may replace.
+        let slot = id_slot(order);
+        match self.order_owner(symbol, slot, order) {
+            Some(owner) if owner != account => {
+                ev.push(Event::Reject {
+                    order,
+                    account,
+                    symbol,
+                    code: Reject::NotOwner as u8,
+                });
+                return;
+            }
+            None => {
+                ev.push(Event::Reject {
+                    order,
+                    account,
+                    symbol,
+                    code: Reject::UnknownOrder as u8,
+                });
+                return;
+            }
+            Some(_) => {}
+        }
+        if qty == 0 || price == 0 || qty > self.cfg.max_order_qty {
+            ev.push(Event::Reject {
+                order,
+                account,
+                symbol,
+                code: Reject::Malformed as u8,
+            });
             return;
         }
         let sym = symbol as usize;
         if sym >= self.symbols.len() {
+            ev.push(Event::Reject {
+                order,
+                account,
+                symbol,
+                code: Reject::UnknownSymbol as u8,
+            });
             return;
         }
         let slot = id_slot(order);
         let book = &self.symbols[sym].book;
         if slot == NIL || slot as usize >= book.orders.len() {
+            ev.push(Event::Reject {
+                order,
+                account,
+                symbol,
+                code: Reject::UnknownOrder as u8,
+            });
             return;
         }
         let old = book.orders[slot as usize];
         if old.uid != id_uid(order) || old.level == NIL {
+            ev.push(Event::Reject {
+                order,
+                account,
+                symbol,
+                code: Reject::UnknownOrder as u8,
+            });
             return;
         }
         let (side, flags, tif, kind, account) = (old.side, old.flags, old.tif, old.kind, old.account);
-        self.cancel_slot_opt(slot, order, symbol, 5, ev, true, false);
+        self.cancel_slot_opt(slot, order, symbol, 5, ev, true, false, account);
         let req = NewOrder {
             symbol,
             account,
@@ -1540,6 +1727,8 @@ impl Shard {
         for (o, slot) in pulled {
             let (cc, mc) = commit_amounts(o.side, o.commit_pc, o.leaves);
             self.accounts[o.account as usize].release(cc, mc);
+            self.open_orders[o.account as usize] =
+                self.open_orders[o.account as usize].saturating_sub(1);
             ev.push(Event::Canceled {
                 order: pack_id(slot, o.uid),
                 account: o.account,
@@ -1618,6 +1807,8 @@ impl Shard {
         for (o, slot) in pulled {
             let (cc, mc) = commit_amounts(o.side, o.commit_pc, o.leaves);
             self.accounts[o.account as usize].release(cc, mc);
+            self.open_orders[o.account as usize] =
+                self.open_orders[o.account as usize].saturating_sub(1);
             ev.push(Event::Canceled {
                 order: pack_id(slot, o.uid),
                 account: o.account,
@@ -1672,6 +1863,14 @@ impl Shard {
             // Remove/reduce both heads.
             self.symbols[sym].book.reduce_head(Side::Buy, q);
             self.symbols[sym].book.reduce_head(Side::Sell, q);
+            if bo.leaves == q {
+                self.open_orders[bo.account as usize] =
+                    self.open_orders[bo.account as usize].saturating_sub(1);
+            }
+            if so.leaves == q {
+                self.open_orders[so.account as usize] =
+                    self.open_orders[so.account as usize].saturating_sub(1);
+            }
             // Settle at auction semantics: maker fees both sides, no aggressor.
             self.settle_auction_fill(symbol, &bo, &so, price, q, ev);
             remaining -= q as u64;
@@ -2289,12 +2488,12 @@ mod tests {
     fn short_margin_grows_and_blocks() {
         let mut s = setup();
         let mut ev = EvBuf::new();
-        // Position limit trips first for a monster order.
+        // A monster quantity order is stopped by the fat-finger cap first.
         s.execute(Cmd::Place(order(0, 2, Side::Sell, 500, 100_000)), &mut ev);
         assert!(ev
             .events
             .iter()
-            .any(|e| matches!(e, Event::Reject { code: 6, .. })));
+            .any(|e| matches!(e, Event::Reject { code: 16, .. })));
         // At the position limit, the margin bill exceeds cash (10M).
         s.execute(Cmd::Place(order(0, 2, Side::Sell, 500, 5_000)), &mut ev);
         assert!(ev
@@ -2306,6 +2505,78 @@ mod tests {
         let a2 = &s.accounts[2];
         assert!(a2.margin_reserved > 0);
         assert!(a2.available() < 10_000_000);
+        assert!(s.conservation());
+    }
+
+    #[test]
+    fn hardening_caps_and_ownership() {
+        let mut s = setup();
+        let mut ev = EvBuf::new();
+        // Book flood: resting orders stop at max_open_orders per account.
+        let mut rejects_too_many = 0;
+        for i in 0..300u64 {
+            ev.clear();
+            s.execute(
+                Cmd::Place(order(0, 2, Side::Sell, 300 + i % 200, 1)),
+                &mut ev,
+            );
+            if ev
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::Reject { code: 15, .. }))
+            {
+                rejects_too_many += 1;
+            }
+        }
+        assert!(rejects_too_many > 0, "book-flood cap never tripped");
+        assert!(s.conservation());
+        // Find one of account 2's resting orders and try to cancel as
+        // account 1 -> NotOwner.
+        let mut found = None;
+        for (i, o) in s.symbols[0].book.orders.iter().enumerate() {
+            if o.account == 2 && o.level != crate::book::NIL {
+                found = Some(crate::types::pack_id(i as u32, o.uid));
+            }
+        }
+        let oid = found.expect("account 2 has resting orders");
+        ev.clear();
+        s.execute(
+            Cmd::Cancel {
+                order: oid,
+                symbol: 0,
+                account: 1,
+            },
+            &mut ev,
+        );
+        assert!(ev
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Reject { code: 17, .. })));
+        // Owner cancels fine.
+        ev.clear();
+        s.execute(
+            Cmd::Cancel {
+                order: oid,
+                symbol: 0,
+                account: 2,
+            },
+            &mut ev,
+        );
+        assert!(ev
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Canceled { reason: 0, .. })));
+        // Negative deposit is ignored (defense in depth for admin APIs).
+        ev.clear();
+        s.execute(
+            Cmd::Deposit {
+                account: 1,
+                amount: -5_000,
+            },
+            &mut ev,
+        );
+        assert!(ev.events.is_empty());
+        assert_eq!(s.accounts[1].cash, 10_000_000);
         assert!(s.conservation());
     }
 
@@ -2448,6 +2719,7 @@ mod tests {
             Cmd::Cancel {
                 order: ack_id,
                 symbol: 0,
+                account: 1,
             },
             &mut ev,
         );

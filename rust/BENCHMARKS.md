@@ -105,3 +105,57 @@ rebates, positions, margin recompute — in 55 ns.
 * No `unsafe`, no SIMD intrinsics, no perf counters available in this
   container — all timing via batch-amortized `Instant::now()`; instruction
   counts unavailable without valgrind/perf.
+
+## 6. Production hardening pass (post-v2 measurements)
+
+The hardened engine (ownership verification on cancel/replace, anti-abuse
+caps, enriched audit events) was re-measured to quantify the security
+cost:
+
+| op | v2 (before) | hardened (after) |
+|---|---:|---:|
+| taker full pipeline | 55.0 ns mean | **54.1 ns** mean (p50 53.7) |
+| maker placement near touch | 85 ns | **83.7 ns** |
+| cancel + requote cycle | 163 ns | **152.3 ns** (ownership check merged into the single slot lookup) |
+| BBO query | 2.1 ns | 2.1 ns |
+
+Per-op hot-path latency is at parity or better; aggregate harness numbers
+fluctuate with sandbox neighbor load (15.6–18.0M orders/s aggregate on
+2 shared vCPUs across runs the same hour; best sustained remains 20.08M
+from the original window; pure-taker capacity is 18.5M/s/shard at
+54 ns/op, scaling linearly with dedicated cores).
+
+## 7. Gateway-fed end-to-end throughput — `venue-tps`
+
+Full production path per order: TCP connect → HTTP/WS parse → HMAC-SHA256
+verify (incl. SHA-256 body hash) → strict JSON parse → schema validation →
+shard queue → engine (risk → match → settle → journal) → await correlation
+→ JSON response/ack frame → socket write.
+
+| mode | conns | throughput (2 shared vCPUs) |
+|---|---:|---:|
+| REST (new conn per request, sequential round trips) | 8 | ~5.0k orders/s |
+| REST | 16 | ~4.9k orders/s |
+| WebSocket order entry (persistent conns, ack stream) | 8 | ~3.0k orders/s |
+| WebSocket order entry | 16 | **~6.3k orders/s** |
+
+Zero order rejections in these runs (post-only IOC equilibrium load; every
+op exercises the full admission pipeline). Syscall and thread-hop bound —
+this is the `std::net` thread-per-conn tier on a shared 2-vCPU box; the
+engine's shard queues are the integration point for kernel-bypass gateway
+nodes when network ingress must reach the 20M class. Run:
+
+```
+cargo run --release --bin ns-venue -- --loadtest --api-key   00000bb8:bb..bb:trade:8 --account 8:prime --fund 8:0:10000000000   --mark 500000 --ladder 1 &
+cargo run --release --bin venue-tps -- --mode ws --conns 16 --secs 10
+```
+
+## 8. Attack-surface regression suite
+
+`tests/gateway_e2e.rs` (13 tests) drives a booted venue over real TCP:
+auth attack battery (replay/stale/forged/tampered/scope), full order
+lifecycle with position+balance assertions, batch validation, admin ops +
+key minting, WS sessions (subs, order entry, fills, cancels), protocol
+abuse (smuggling shapes, slowloris deadline, oversized/unmasked/RSV/
+fragment-bomb frames, subscription floods), REST rate limiting, WAL crash
+recovery with bit-exact state, and account-spoofing rejection.

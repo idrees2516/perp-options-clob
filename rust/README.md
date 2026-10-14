@@ -1,12 +1,26 @@
-# ns-clob v2 — unified nanosecond 0DTE options trading stack
+# ns-clob v2 — production 0DTE options trading venue
 
 One Rust crate. Zero runtime dependencies. `#![forbid(unsafe_code)]`.
 
-A complete venue-side engine for **0DTE (same-day expiry) options markets**:
-central limit order book, pre-trade risk, options margin, per-trade
-settlement, closing auctions, expiry exercise, circuit breaker, WAL journal,
-multi-shard routing — with **exact-integer accounting enforced after every
-single command** and **20M+ orders/sec aggregate throughput** on two vCPUs.
+A complete **production** system for **0DTE (same-day expiry) options
+markets**: the nanosecond engine (central limit order book, pre-trade risk,
+options margin, per-trade settlement, closing auctions, expiry exercise,
+circuit breaker, WAL journal, multi-shard routing) **plus the hardened
+network venue** — HMAC-authenticated HTTP + WebSocket API, read replica,
+fan-out market data, session ladders, and disaster recovery — with
+**exact-integer accounting enforced after every single command**.
+
+Run the whole venue with one binary:
+
+```bash
+cargo run --release --bin ns-venue -- --demo
+# keys + session ladder printed to stderr; HTTP+WS on 127.0.0.1:8080
+```
+
+The API contract lives in [`docs/0DTE_API.md`](../docs/0DTE_API.md); the
+threat model and hardening inventory in
+[`docs/0DTE_PRODUCTION.md`](../docs/0DTE_PRODUCTION.md). The Next.js
+terminal is [`frontend/`](../frontend/).
 
 ## What it is
 
@@ -22,6 +36,12 @@ single command** and **20M+ orders/sec aggregate throughput** on two vCPUs.
 | Market data | `marketdata.rs` | BBO/L2/OHLC/VWAP derived off the critical path |
 | Platform | `platform.rs` | Shard-per-underlying router, batched queues, worker threads |
 | Simulation | `sim.rs` | Deterministic agents for tests and throughput runs |
+| **Production venue** | `venue.rs` | Shard workers with event fan-out, REST-await correlation, clock, WAL sinks with fsync + torn-tail replay, session ladders, graceful drain |
+| **Gateway** | `gateway.rs` | HTTP/1.1 + WebSocket serving, REST routing, WS sessions, per-IP caps, slow-consumer drop |
+| **Auth** | `auth.rs` | HMAC-SHA256 request signing, timestamp window, 4096-slot anti-replay nonce window, scopes, per-key rate buckets, key minting |
+| **Crypto** | `crypto.rs` | SHA-256/HMAC (FIPS + RFC vectors), SHA-1/base64 for the WS handshake, urandom, constant-time compare |
+| **Wire codecs** | `http.rs`, `ws.rs`, `json.rs` | Strict, bounded, fuzz-exercised parsers (anti-smuggling HTTP, RFC 6455 frame codec, integer-only JSON) |
+| **Read replica** | `replica.rs` | Event-derived market/account state for REST queries; engine-truth balance snapshots |
 
 ## The numbers (measured on a 2-vCPU shared sandbox)
 
@@ -98,7 +118,7 @@ conservation at the end.
 rust/
   Cargo.toml          # workspace = this crate, zero deps, forbid(unsafe)
   src/
-    types.rs          # ids (packed order ids), sides, TIF, flags
+    types.rs          # ids (packed order ids), sides, TIF, flags, reject codes
     symbol.rs         # 0DTE listing codec (u64 key), intrinsic, delta
     fees.rs           # maker/taker/settle/exercise schedule + tiers
     accounts.rs       # accounts, positions, commitments, ledger, buckets
@@ -111,30 +131,68 @@ rust/
     marketdata.rs     # derived feed state
     platform.rs       # multi-shard router + workers
     sim.rs            # deterministic market simulator
-    bin/tps.rs        # the throughput harness
+    crypto.rs         # SHA-256 / HMAC / SHA-1 / base64 / urandom / ct_eq
+    json.rs           # strict integer-only JSON codec
+    http.rs           # hardened HTTP/1.1 server codec
+    ws.rs             # RFC 6455 frame codec + message assembler
+    auth.rs           # API keys, signing, nonce window, scopes, rate limits
+    replica.rs        # read-side state for REST queries
+    venue.rs          # the venue assembly (workers, clock, WAL, ladder, drain)
+    gateway.rs        # connection handling, REST routes, WS sessions
+    bin/tps.rs        # engine throughput harness
+    bin/venue.rs      # ns-venue: the production binary
+    bin/venue_tps.rs  # gateway-fed throughput harness
   benches/latency.rs  # micro-latency suite
   tests/e2e_day.rs    # full-day + randomized + replay integration tests
+  tests/gateway_e2e.rs # end-to-end venue + adversarial attack suite
 ```
 
 ## Running it
 
 ```
 cd rust
-cargo test                          # 50 tests
-cargo bench                         # micro-latency table
-cargo run --release --bin ns-tps -- --shards 2 --seconds 10
-cargo run --release --bin ns-tps -- --shards 2 --seconds 5 --wal /tmp/wal   # durability mode
+cargo test                                        # 115 tests (engine + venue + attacks)
+cargo bench                                       # micro-latency table
+cargo run --release --bin ns-tps -- --shards 2 --seconds 10     # engine capacity
+cargo run --release --bin ns-tps -- --shards 2 --seconds 5 --wal /tmp/wal
+
+# Production venue (demo: keys, session ladder, sim feed):
+cargo run --release --bin ns-venue -- --demo
+# Explicit configuration:
+cargo run --release --bin ns-venue -- \
+  --bind 127.0.0.1:8080 --wal-dir ./wal \
+  --api-key a1b2c3d4:<64-hex>:admin:1 \
+  --account 1:prime --fund 1:0:100000000 \
+  --mark 500000 --ladder 3 --sim-feed
+
+# Gateway-fed throughput (venue must run with --loadtest and the bench key):
+cargo run --release --bin ns-venue -- --loadtest \
+  --api-key 00000bb8:bbbb..bb:trade:8 --account 8:prime --fund 8:0:10000000000 \
+  --mark 500000 --ladder 1 &
+cargo run --release --bin venue-tps -- --mode ws --conns 16 --secs 10
 ```
 
 ## Honest caveats
 
-* Throughput numbers are **engine capacity** of the full in-process
-  pipeline (risk → match → settle → journal serialize → events). Network
-  ingress (kernel-bypass gateways) is out of scope for this crate.
+* **Two throughput tiers, reported separately.** Engine capacity (the full
+  in-process pipeline: risk → match → settle → journal → events) measures
+  17–20M orders/s aggregate on this shared 2-vCPU sandbox depending on
+  neighbor load (best sustained 20.08M; pure-taker capacity is 18.5M/s per
+  shard at 54 ns/op, and shards scale linearly with dedicated cores).
+  Gateway-fed end-to-end throughput (TCP + HMAC + JSON + queue + engine +
+  ack) is ~5–6k orders/s on the same shared box with thread-per-conn
+  `std::net` — network ingress at the 20M class is a kernel-bypass
+  gateway-tier concern (DPDK/AF_XDP + multiple gateway nodes feeding the
+  shard queues), by design out of scope for this crate.
 * WAL mode is measured on the sandbox's storage; on NVMe class devices the
-  325 MB/s/shard journal write rate is the ceiling to watch.
+  325 MB/s/shard journal write rate is the ceiling to watch. WAL files are
+  per shard, append-only; segment rotation and snapshot compaction are
+  operational concerns not yet implemented (replay is from genesis).
 * The throughput harness uses non-binding risk limits (institutional scale)
   so capacity is measured rather than risk saturation; binding-limit
-  behavior is covered by tests.
+  behavior is covered by tests. `--loadtest` lifts rate ceilings for
+  benchmarking only — never enable it in production.
 * The delta used for delta-notional limits is a documented strike-based
   heuristic refreshed on oracle ticks — not a full pricing-model greek.
+* TLS termination, DDoS scrubbing and key custody (HSMs) belong to the
+  fronting infrastructure; the venue itself is TLS-agnostic by design.

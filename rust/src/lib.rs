@@ -19,16 +19,24 @@
 pub mod accounts;
 pub mod auction;
 pub mod book;
+pub mod auth;
+pub mod crypto;
 pub mod engine;
 pub mod expiry;
 pub mod fees;
+pub mod gateway;
+pub mod http;
+pub mod json;
 pub mod journal;
 pub mod margin;
 pub mod marketdata;
 pub mod platform;
+pub mod replica;
 pub mod sim;
 pub mod symbol;
 pub mod types;
+pub mod venue;
+pub mod ws;
 
 pub use engine::{Cmd, Phase, Shard, ShardConfig, ShardStats};
 pub use types::*;

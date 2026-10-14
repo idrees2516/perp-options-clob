@@ -21,6 +21,18 @@ pub enum Event {
         symbol: SymbolId,
         /// Leaves resting (0 = fully filled / not rested).
         leaves: Qty,
+        /// Side (false = buy).
+        buy: bool,
+        /// Limit price.
+        price: Price,
+        /// Original quantity.
+        qty: Qty,
+        /// TIF (0 gtc, 1 ioc, 2 fok).
+        tif: u8,
+        /// Kind (0 limit, 1 market).
+        kind: u8,
+        /// Behaviour flags.
+        flags: u8,
     },
     /// Order rejected.
     Reject {
@@ -169,6 +181,22 @@ pub enum Event {
         /// Fast market on?
         on: bool,
     },
+    /// Underlying oracle mark update (drives the public mark channel and
+    /// the read replica's underlier state).
+    UnderlyingMark {
+        /// Underlying id.
+        underlying: u16,
+        /// New underlying mark in ticks.
+        price: Price,
+    },
+    /// A new option series was listed (drives session-ladder acks and the
+    /// read replica's symbol registry).
+    SymbolListed {
+        /// The new local symbol id.
+        symbol: SymbolId,
+        /// The listing registry key (see [`crate::symbol::Listing::key`]).
+        listing_key: u64,
+    },
 }
 
 impl Event {
@@ -190,13 +218,25 @@ impl Event {
                 account,
                 symbol,
                 leaves,
+                buy,
+                price,
+                qty,
+                tif,
+                kind,
+                flags,
             } => {
                 buf[0] = 1;
                 put64(buf, 1, *order);
                 put32(buf, 9, *account);
                 put32(buf, 13, *symbol);
                 put32(buf, 17, *leaves);
-                21
+                buf[21] = *buy as u8;
+                put64(buf, 22, *price);
+                put32(buf, 30, *qty);
+                buf[34] = *tif;
+                buf[35] = *kind;
+                buf[36] = *flags;
+                37
             }
             Event::Reject {
                 order,
@@ -355,6 +395,22 @@ impl Event {
                 buf[2] = (*underlying >> 8) as u8;
                 buf[3] = *on as u8;
                 4
+            }
+            Event::UnderlyingMark { underlying, price } => {
+                buf[0] = 17;
+                buf[1] = (*underlying & 0xFF) as u8;
+                buf[2] = (*underlying >> 8) as u8;
+                put64(buf, 3, *price);
+                11
+            }
+            Event::SymbolListed {
+                symbol,
+                listing_key,
+            } => {
+                buf[0] = 18;
+                put32(buf, 1, *symbol);
+                put64(buf, 5, *listing_key);
+                13
             }
         }
     }

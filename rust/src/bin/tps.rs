@@ -287,6 +287,7 @@ fn worker(shard_id: u32, mode: Mode, seconds: f64, wal: Option<&str>, seed: u64)
                                 symbol: sym,
                                 price,
                                 qty,
+                                account: acct as u32,
                             },
                             &mut ev,
                         );
@@ -343,6 +344,7 @@ fn worker(shard_id: u32, mode: Mode, seconds: f64, wal: Option<&str>, seed: u64)
                             Cmd::Cancel {
                                 order: old_reseed,
                                 symbol: sym,
+                                account: acct as u32,
                             },
                             &mut ev,
                         );
@@ -378,6 +380,7 @@ fn worker(shard_id: u32, mode: Mode, seconds: f64, wal: Option<&str>, seed: u64)
                             Cmd::Cancel {
                                 order: old,
                                 symbol: symbols[sym_j],
+                                account: acct as u32,
                             },
                             &mut ev,
                         );

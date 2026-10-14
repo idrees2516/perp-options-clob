@@ -262,7 +262,7 @@ fn journal_replay_reproduces_state_exactly() {
     for _ in 0..30_000 {
         let c = match flow.next_cmd() {
             AgentCmd::Place(o) => Cmd::Place(o),
-            AgentCmd::Cancel(id, sym) => Cmd::Cancel { order: id, symbol: sym },
+            AgentCmd::Cancel(acct, id, sym) => Cmd::Cancel { order: id, symbol: sym, account: acct },
             AgentCmd::Tick => Cmd::Advance {
                 to: s.now() + clock_step,
             },
@@ -308,7 +308,7 @@ fn randomized_invariants_hold_after_every_operation() {
         for _ in 0..20_000 {
             let c = match flow.next_cmd() {
                 AgentCmd::Place(o) => Cmd::Place(o),
-                AgentCmd::Cancel(id, sym) => Cmd::Cancel { order: id, symbol: sym },
+                AgentCmd::Cancel(acct, id, sym) => Cmd::Cancel { order: id, symbol: sym, account: acct },
                 AgentCmd::Tick => Cmd::Advance {
                     to: s.now() + NANOS_PER_MIN / 500,
                 },
@@ -400,18 +400,20 @@ fn cancel_replace_roundtrip() {
             symbol: sym,
             price: 480,
             qty: 6,
+            account: 1,
         },
         &mut ev,
     );
     assert_eq!(s.symbols[0].book.best_bid(), Some((480, 6)));
     assert_eq!(s.accounts[1].hold, (480 + 65) * 6);
-    // Replace to a stale id: no-op.
+    // Replace to a stale id: rejected (UnknownOrder), book unchanged.
     s.execute(
         Cmd::Replace {
             order: oid,
             symbol: sym,
             price: 400,
             qty: 2,
+            account: 1,
         },
         &mut ev,
     );
@@ -514,7 +516,7 @@ fn wal_bytes_replay_disaster_recovery() {
     for _ in 0..8_000 {
         let c = match flow.next_cmd() {
             AgentCmd::Place(o) => Cmd::Place(o),
-            AgentCmd::Cancel(id, sym) => Cmd::Cancel { order: id, symbol: sym },
+            AgentCmd::Cancel(acct, id, sym) => Cmd::Cancel { order: id, symbol: sym, account: acct },
             AgentCmd::Tick => Cmd::Advance {
                 to: s.now() + NANOS_PER_MIN / 400,
             },
@@ -571,14 +573,14 @@ fn wal_bytes_replay_disaster_recovery() {
 fn record_len(raw: &[u8]) -> usize {
     match raw.first().copied().unwrap_or(0) {
         1 => 1 + 4 + 4 + 4 + 8 + 4 + 8,   // Place
-        2 => 1 + 8 + 4,                     // Cancel
-        3 => 1 + 8 + 4 + 8 + 4,             // Replace
-        4 => 1 + 4 + 1,                     // CreateAccount
-        5 | 6 => 1 + 4 + 16,                // Deposit / Withdraw
-        7 => 1 + 8,                          // CreateSymbol
-        8 => 1 + 8,                          // Oracle
-        9 => 1 + 8,                          // Advance
-        10 | 11 => 1,                        // Halt / ResumeNow
-        _ => raw.len(),                      // unknown: bail out
+        2 => 1 + 8 + 4 + 4,                // Cancel (order, symbol, account)
+        3 => 1 + 8 + 4 + 8 + 4 + 4,        // Replace (order, symbol, price, qty, account)
+        4 => 1 + 4 + 1,                    // CreateAccount
+        5 | 6 => 1 + 4 + 16,               // Deposit / Withdraw
+        7 => 1 + 8,                        // CreateSymbol
+        8 => 1 + 8,                        // Oracle
+        9 => 1 + 8,                        // Advance
+        10 | 11 => 1,                       // Halt / ResumeNow
+        _ => raw.len(),                     // unknown: bail out
     }
 }

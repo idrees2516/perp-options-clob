@@ -253,7 +253,7 @@ fn main() {
             // 1) Cancel a live pooled order (correct symbol pairing).
             let (id, sym) = pool[head];
             ev.clear();
-            s.execute(Cmd::Cancel { order: id, symbol: sym }, &mut ev);
+            s.execute(Cmd::Cancel { order: id, symbol: sym, account: accts[0] }, &mut ev);
             // 2) Requote on the same symbol.
             counter += 1;
             ev.clear();
@@ -513,7 +513,7 @@ fn main() {
             ev.clear();
             let c = match flow.next_cmd() {
                 ns_clob::sim::AgentCmd::Place(o) => Cmd::Place(o),
-                ns_clob::sim::AgentCmd::Cancel(i, sym) => Cmd::Cancel { order: i, symbol: sym },
+                ns_clob::sim::AgentCmd::Cancel(a, i, sym) => Cmd::Cancel { order: i, symbol: sym, account: a },
                 ns_clob::sim::AgentCmd::Tick => Cmd::Advance {
                     to: s.now() + NANOS_PER_MIN / 500,
                 },

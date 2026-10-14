@@ -237,14 +237,16 @@ impl Platform {
         &self.ev
     }
 
-    /// Cancel an order (global symbol id).
-    pub fn cancel(&mut self, order: OrderId, symbol: SymbolId) -> &EvBuf {
+    /// Cancel an order (global symbol id). The account must own the order;
+    /// ownership is enforced inside the engine.
+    pub fn cancel(&mut self, order: OrderId, symbol: SymbolId, account: AcctId) -> &EvBuf {
         let shard = symbol_shard(symbol) as usize;
         self.ev.clear();
         self.shards[shard].execute(
             Cmd::Cancel {
                 order,
                 symbol: symbol_local(symbol),
+                account,
             },
             &mut self.ev,
         );
