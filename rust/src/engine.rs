@@ -1328,7 +1328,7 @@ impl Shard {
 
         // Fill against the head maker.
         let q = rem.min(maker.leaves);
-        let (maker, price, _head) = self.symbols[sym].book.reduce_head(opp, q);
+        let (maker, price, mslot) = self.symbols[sym].book.reduce_head(opp, q);
         self.settle_fill(
             taker.symbol,
             taker.side,
@@ -1336,6 +1336,7 @@ impl Shard {
             taker_ref,
             taker_commit_pc,
             &maker,
+            mslot,
             price,
             q,
             ev,
@@ -1371,6 +1372,7 @@ impl Shard {
         taker_ref: u64,
         taker_commit_pc: u64,
         maker: &crate::book::Order,
+        maker_slot: u32,
         price: Price,
         qty: Qty,
         ev: &mut EvBuf,
@@ -1460,7 +1462,7 @@ impl Shard {
             price,
             qty,
             taker: taker_ref,
-            maker: pack_id(0, maker.uid),
+            maker: pack_id(maker_slot, maker.uid),
             taker_acct,
             maker_acct,
             aggressor: taker_side as u8,

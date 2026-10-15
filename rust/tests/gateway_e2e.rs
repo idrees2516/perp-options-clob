@@ -921,12 +921,21 @@ fn wal_recovery_restores_state() {
         // Symbols survived (replay).
         let (sym2, _) = pick_symbol(port2);
         assert_eq!(sym, sym2);
-        // A's state matches: same cash and the same resting order.
+        // A's state matches: same cash and the same resting orders.
         let (_, after) = http(port2, "GET", "/v1/account", "", Some((TRADER_A, SECRET_A)));
         let cash_before = extract_first_u64(&before, "\"cash\":");
         let cash_after = extract_first_u64(&after, "\"cash\":");
         assert_eq!(cash_before, cash_after, "cash must survive recovery");
-        assert!(after.contains("\"leaves\":3"), "resting order must survive: {after}");
+        // The live replica itself must reflect the maker fill (leaves 1) —
+        // guards the Trade event's maker order id end to end.
+        assert!(before.contains("\"leaves\":1"), "live replica must show maker-filled leaves 1: {before}");
+        // The trade in this scenario: B's crossing sell filled 2 as taker
+        // against A's resting 3@50 bid (maker) -> A's bid shows leaves 1,
+        // earned maker rebates, and A's follow-up 2@40 bid rests untouched.
+        // Order rows must survive recovery with the same leaves the live
+        // replica shows (the Trade event's maker id packs the true slot).
+        assert!(after.contains("\"leaves\":1"), "maker-filled order must show leaves 1: {after}");
+        assert!(after.contains("\"leaves\":2"), "resting follow-up order must survive: {after}");
         assert!(after.contains("\"qty\":2"), "position must survive: {after}");
         // Conservation holds after replay.
         let (_, audit) = http(port2, "GET", "/admin/audit", "", Some((ADMIN_KEY, ADMIN_SECRET)));

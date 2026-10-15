@@ -62,13 +62,10 @@ pub struct Order {
 }
 
 impl Order {
-    /// Public (packed) order id.
-    #[inline(always)]
-    pub fn oid(&self) -> OrderId {
-        // The slot is the Vec index this struct occupies; the engine knows it,
-        // callers use the ids returned by insert/cancel.
-        pack_id(0, self.uid)
-    }
+    // NOTE: there is deliberately no `oid()` helper — an order's public id is
+    // `pack_id(slot, uid)` and the slot is the Vec index, which the struct
+    // itself does not know. Callers must use the ids returned by insert /
+    // reduce_head / the level queue head, never a reconstructed one.
 }
 
 /// A price level: aggregated quantity plus an intrusive FIFO of orders.
