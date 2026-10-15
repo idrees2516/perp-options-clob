@@ -1,7 +1,7 @@
 # ns-venue 0DTE Platform — HTTP + WebSocket API Contract (v1)
 
 This document is the **normative interface** between the Rust matching engine
-(`rust/`, binary `ns-venue`) and the Next.js terminal (`frontend/`).
+(`rust/`, binary `ns-venue`) and the Next.js terminal (separate repo `ns-venue-terminal`).
 Both sides implement exactly this contract.
 
 - Transport: HTTP/1.1 + WebSocket (RFC 6455), default `http://localhost:8080`

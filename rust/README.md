@@ -19,8 +19,10 @@ cargo run --release --bin ns-venue -- --demo
 
 The API contract lives in [`docs/0DTE_API.md`](../docs/0DTE_API.md); the
 threat model and hardening inventory in
-[`docs/0DTE_PRODUCTION.md`](../docs/0DTE_PRODUCTION.md). The Next.js
-terminal is [`frontend/`](../frontend/).
+[`docs/0DTE_PRODUCTION.md`](../docs/0DTE_PRODUCTION.md). The trading
+terminal is a standalone Next.js application maintained separately at
+[github.com/idrees2516/ns-venue-terminal](https://github.com/idrees2516/ns-venue-terminal)
+(this repository is the backend).
 
 ## What it is
 

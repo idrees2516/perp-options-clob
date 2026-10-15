@@ -95,7 +95,7 @@ infrastructure.
 
 ## 7. Frontend hardening summary
 
-The terminal (Next.js 16.3.4, `frontend/`) mirrors the backend rules:
+The terminal (Next.js 16.3.4, separate repo `ns-venue-terminal`) mirrors the backend rules:
 HMAC signing in the browser with a strictly-increasing nonce; secret in
 `sessionStorage` only (cleared per session, never logged); every input
 validated client-side against the same schema the server enforces; WS
