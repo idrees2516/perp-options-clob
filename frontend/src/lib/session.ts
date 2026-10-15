@@ -101,7 +101,10 @@ export function isHex(s: string, len: number): boolean {
 /** Normalize a user-entered base URL; null when unusable. */
 export function normalizeBaseUrl(input: string): string | null {
   let s = input.trim();
-  if (!s) s = 'http://localhost:8080';
+  // Empty base URL ⇒ same-origin gateway mode: requests carry an
+  // XTransformPort routing parameter and are proxied to the venue by the
+  // reverse proxy that serves this terminal (see lib/api.ts).
+  if (!s) return '';
   if (!/^https?:\/\//i.test(s)) s = `http://${s}`;
   try {
     const u = new URL(s);

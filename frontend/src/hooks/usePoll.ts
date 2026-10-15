@@ -19,7 +19,11 @@ export function usePoll<T>(
   const [error, setError] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
   const fetcherRef = useRef(fetcher);
-  fetcherRef.current = fetcher;
+  // Keep the ref current without touching it during render (react-hooks/refs):
+  // a dependency-free effect runs after every render, before the poller reads it.
+  useEffect(() => {
+    fetcherRef.current = fetcher;
+  });
 
   useEffect(() => {
     let alive = true;

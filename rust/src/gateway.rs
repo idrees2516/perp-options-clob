@@ -840,6 +840,7 @@ fn submit_orders(ctx: &Arc<VenueCtx>, orders: &mut [NewOrder], _account: AcctId)
     let timeout = Duration::from_millis(ctx.cfg.rest_timeout_ms);
     let mut waiters = Vec::with_capacity(orders.len());
     for o in orders.iter_mut() {
+        ctx.metrics.order_ops.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = sync_channel(1);
         let await_id = ctx.register_await(Await::Rest(Mutex::new(Some(tx))));
         // Global -> local symbol id for the engine.
@@ -910,6 +911,7 @@ fn cancel_order(
     }
     let (tx, rx) = sync_channel(1);
     let await_id = ctx.register_await(Await::Rest(Mutex::new(Some(tx))));
+    ctx.metrics.order_ops.fetch_add(1, Ordering::Relaxed);
     let ok = ctx.enqueue(
         Cmd::Cancel {
             order,
@@ -996,6 +998,7 @@ fn replace_order(
     }
     let (tx, rx) = sync_channel(1);
     let await_id = ctx.register_await(Await::Rest(Mutex::new(Some(tx))));
+    ctx.metrics.order_ops.fetch_add(1, Ordering::Relaxed);
     let ok = ctx.enqueue(
         Cmd::Replace {
             order,
@@ -1423,6 +1426,12 @@ fn gateway_metrics_obj(ctx: &Arc<VenueCtx>, w: &mut crate::json::Writer) {
     w.comma();
     w.key("malformed");
     w.uint(ctx.metrics.malformed.load(Ordering::Relaxed));
+    w.comma();
+    w.key("tps");
+    w.raw(&format!(
+        "{:.1}",
+        ctx.metrics.tps_ema_milli.load(Ordering::Relaxed) as f64 / 1000.0
+    ));
     w.end_obj();
 }
 
@@ -1714,6 +1723,7 @@ fn handle_ws_message(
             match parsed {
                 Ok(mut list) => {
                     if let Some(o) = list.first_mut() {
+                        ctx.metrics.order_ops.fetch_add(1, Ordering::Relaxed);
                         let await_id = ctx.register_await(Await::Ws(conn));
                         let local = crate::platform::symbol_local(o.symbol);
                         let ok = ctx.enqueue(
@@ -1759,6 +1769,7 @@ fn handle_ws_message(
                         }
                     }
                     let await_id = ctx.register_await(Await::Ws(conn));
+                    ctx.metrics.order_ops.fetch_add(1, Ordering::Relaxed);
                     let ok = ctx.enqueue(
                         Cmd::Cancel {
                             order,

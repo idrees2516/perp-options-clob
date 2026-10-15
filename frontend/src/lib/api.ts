@@ -44,7 +44,29 @@ import {
 } from './types';
 import { loadNonce, saveNonce } from './session';
 
-export const DEFAULT_BASE_URL = process.env.NEXT_PUBLIC_VENUE_URL || 'http://localhost:8080';
+/**
+ * Transport selection (build-time):
+ *   NEXT_PUBLIC_VENUE_URL set (e.g. http://localhost:8080) → direct absolute
+ *     base URL, requests go straight to the venue.
+ *   NEXT_PUBLIC_VENUE_URL unset → gateway mode: same-origin requests with an
+ *     `XTransformPort` query parameter. For deployments where the terminal is
+ *     served by a reverse proxy that routes `?XTransformPort=<port>` to the
+ *     venue (e.g. the sandbox preview gateway). The parameter is part of the
+ *     signed path_with_query, so signatures verify end-to-end; the WS
+ *     query-auth signature covers the bare `/v1/ws` path and ignores it.
+ */
+const VENUE_URL_DIRECT = process.env.NEXT_PUBLIC_VENUE_URL || '';
+export const GATEWAY_PORT = process.env.NEXT_PUBLIC_VENUE_PORT || '8080';
+const GATEWAY_QUERY = `XTransformPort=${GATEWAY_PORT}`;
+
+/** '' ⇒ same-origin gateway mode (see transport note above). */
+export const DEFAULT_BASE_URL = VENUE_URL_DIRECT;
+
+/** Append the gateway routing parameter to a path (identity in direct mode). */
+function withGatewayQuery(pathWithQuery: string): string {
+  if (VENUE_URL_DIRECT) return pathWithQuery;
+  return pathWithQuery + (pathWithQuery.includes('?') ? '&' : '?') + GATEWAY_QUERY;
+}
 
 /** SHA-256 of the empty string — for body-less requests (contract §1). */
 const EMPTY_BODY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
@@ -331,12 +353,16 @@ export class VenueClient {
       const bodyHash = bodyStr === '' ? EMPTY_BODY_SHA256 : await sha256Hex(bodyStr);
       // Canonical string, contract §1, joined with '|' and no spaces:
       //   key_id|timestamp|nonce|METHOD|path_with_query|sha256_hex(body_bytes)
+      // path_with_query is EXACTLY as sent: in gateway mode the XTransformPort
+      // routing parameter is part of the signed string (the venue verifies the
+      // signature over the full request target it receives).
+      const sentPath = withGatewayQuery(pathWithQuery);
       const canonical = [
         this.creds.keyId,
         ts,
         nonce,
         method,
-        pathWithQuery,
+        sentPath,
         bodyHash,
       ].join('|');
       const signature = await hmacSha256Hex(this.creds.secretHex, canonical);
@@ -351,7 +377,7 @@ export class VenueClient {
 
       let res: Response;
       try {
-        res = await fetch(this.creds.baseUrl + pathWithQuery, {
+        res = await fetch(this.creds.baseUrl + sentPath, {
           method,
           headers,
           body: bodyStr === '' ? undefined : bodyStr,
@@ -359,7 +385,9 @@ export class VenueClient {
         });
       } catch {
         this.telemetry?.onResult?.({ ok: false, network: true, path: pathWithQuery });
-        throw new NetworkError(`Engine unreachable at ${this.creds.baseUrl}`);
+        throw new NetworkError(
+          `Engine unreachable at ${this.creds.baseUrl || 'same-origin gateway'}`,
+        );
       }
 
       if (res.status === 200) {
@@ -407,9 +435,9 @@ export class VenueClient {
 async function plainFetch<T>(baseUrl: string, path: string): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(baseUrl + path, { cache: 'no-store' });
+    res = await fetch(baseUrl + withGatewayQuery(path), { cache: 'no-store' });
   } catch {
-    throw new NetworkError(`Engine unreachable at ${baseUrl}`);
+    throw new NetworkError(`Engine unreachable at ${baseUrl || 'same-origin gateway'}`);
   }
   if (!res.ok) {
     let code = `Http${res.status}`;
@@ -706,13 +734,20 @@ export class WsManager {
   }
 
   private async buildAuthedUrl(): Promise<string> {
-    const base = new URL(this.creds.baseUrl);
-    base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
+    const origin = this.creds.baseUrl
+      ? new URL(this.creds.baseUrl).origin
+      : typeof window !== 'undefined'
+        ? window.location.origin
+        : '';
     const ts = this.now().toString();
     const nonce = this.nonce.next();
+    // Signature covers the bare path (contract §1 query-auth fallback);
+    // the gateway routing parameter rides along unsigned and is ignored
+    // by the venue's WS authenticator.
     const canonical = [this.creds.keyId, ts, nonce, 'GET', '/v1/ws', EMPTY_BODY_SHA256].join('|');
     const sig = await hmacSha256Hex(this.creds.secretHex, canonical);
-    return `${base.origin}/v1/ws?key=${this.creds.keyId}&ts=${ts}&nonce=${nonce}&sig=${sig}`;
+    const gw = VENUE_URL_DIRECT ? '' : `&${GATEWAY_QUERY}`;
+    return `${origin}/v1/ws?key=${this.creds.keyId}&ts=${ts}&nonce=${nonce}&sig=${sig}${gw}`;
   }
 
   private setStatus(s: WsStatus): void {

@@ -284,9 +284,12 @@ impl HttpParser {
         if has_te {
             return Parsed::Bad("transfer-encoding not supported");
         }
-        if matches!(method, Method::Post | Method::Delete) && content_length.is_none() {
-            return Parsed::Bad("content-length required");
-        }
+        // No Content-Length and no Transfer-Encoding = zero-length body for
+        // ANY method (RFC 9112 §6.3) — there is no framing ambiguity to
+        // smuggle through. Browsers legitimately send body-less DELETE /
+        // POST without a Content-Length header, so requiring one broke
+        // browser-native REST clients; CL/CL conflicts and TE are still
+        // rejected above.
         let body_len = content_length.unwrap_or(0);
 
         // Do we have the full body?
@@ -501,12 +504,36 @@ mod tests {
             p3.feed(b"POST /x HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello"),
             Parsed::Bad(_)
         ));
-        // POST without CL.
-        let mut p4 = HttpParser::new();
-        assert!(matches!(
-            p4.feed(b"POST /x HTTP/1.1\r\nHost: a\r\n\r\n"),
-            Parsed::Bad(_)
-        ));
+    }
+
+    #[test]
+    fn accepts_bodyless_without_content_length() {
+        // RFC 9112 §6.3: no CL and no TE = zero-length body for any method.
+        // Browsers send exactly this for body-less DELETE (fetch with
+        // body: undefined) — regression test for browser-native REST.
+        let mut p = HttpParser::new();
+        match p.feed(b"DELETE /v1/orders/42?symbol=7 HTTP/1.1\r\nHost: a\r\n\r\n") {
+            Parsed::Done(r) => {
+                assert_eq!(r.method, Method::Delete);
+                assert_eq!(r.path(), "/v1/orders/42");
+                assert_eq!(r.query(), "symbol=7");
+                assert!(r.body.is_empty());
+            }
+            _ => panic!("body-less DELETE must parse"),
+        }
+        let mut p2 = HttpParser::new();
+        match p2.feed(b"POST /v1/orders HTTP/1.1\r\nHost: a\r\n\r\n") {
+            Parsed::Done(r) => assert!(r.body.is_empty()),
+            _ => panic!("body-less POST must parse as zero-body"),
+        }
+        // Bytes after the header block belong to the NEXT message, not a
+        // phantom body (no CL ⇒ no body; trailing bytes are discarded by
+        // the non-pipelining reader, never absorbed into this request).
+        let mut p3 = HttpParser::new();
+        match p3.feed(b"DELETE /x HTTP/1.1\r\nHost: a\r\n\r\nGET /y HTTP/1.1\r\n") {
+            Parsed::Done(r) => assert!(r.body.is_empty()),
+            _ => panic!("extra bytes after body-less request must not be absorbed"),
+        }
     }
 
     #[test]

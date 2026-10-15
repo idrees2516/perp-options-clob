@@ -148,12 +148,15 @@ export default function LoginPage() {
             />
           </Field>
 
-          <Field label="Venue URL">
+          <Field
+            label="Venue URL"
+            hint="empty = same origin (routed through the preview gateway)"
+          >
             <input
               className="field"
               value={baseUrlInput}
               onChange={(e) => setBaseUrlInput(e.target.value)}
-              placeholder="http://localhost:8080"
+              placeholder="empty = same-origin gateway · or http://localhost:8080"
               autoCapitalize="off"
               spellCheck={false}
               disabled={busy}

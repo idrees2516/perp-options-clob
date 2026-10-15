@@ -21,15 +21,20 @@ export function VenueHealthCard() {
   const { client } = useTerminal();
   const { data, error, refresh } = usePoll(() => client.getMetrics(), 2000);
 
+  // Ring buffer mutated only inside the effect; the rendered series lives in
+  // state so nothing reads a ref during render (react-hooks/refs).
   const ring = useRef(new RingBuffer(SAMPLES));
-  const [, setVersion] = useState(0);
+  const [values, setValues] = useState<number[]>([]);
   useEffect(() => {
     if (data === null) return;
-    ring.current.push(data.gateway.tps);
-    setVersion((v) => v + 1);
+    const tps = Number(data.gateway.tps);
+    // Only finite samples enter the series — a backend without the gateway
+    // TPS field must not poison the sparkline with NaN points.
+    if (Number.isFinite(tps)) {
+      ring.current.push(tps);
+      setValues(ring.current.values());
+    }
   }, [data]);
-
-  const values = ring.current.values();
 
   return (
     <Panel

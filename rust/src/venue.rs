@@ -248,6 +248,12 @@ pub struct GatewayMetrics {
     pub slow_dropped: AtomicU64,
     /// Messages rejected as malformed.
     pub malformed: AtomicU64,
+    /// Order-entry ops accepted for processing (REST + WS place/batch/
+    /// replace/cancel) — numerator of the gateway TPS EMA.
+    pub order_ops: AtomicU64,
+    /// Gateway TPS EMA × 1000, sampled by the ns-gwtps thread every 200 ms
+    /// (same EMA methodology as the per-shard TPS).
+    pub tps_ema_milli: AtomicU64,
 }
 
 /// How an in-flight command's outcome is delivered.
@@ -2163,6 +2169,42 @@ impl Venue {
         } else {
             None
         };
+
+        // ---------------- Gateway TPS sampler ----------------
+        // EMA of order-entry ops/s through the gateway (REST + WS), sampled
+        // every 200 ms — mirrors the per-shard TPS EMA methodology so the
+        // admin health card has an apples-to-apples gateway throughput figure.
+        {
+            let ctx_s = ctx.clone();
+            let _ = std::thread::Builder::new()
+                .name("ns-gwtps".into())
+                .spawn(move || {
+                    let mut have_sample = false;
+                    let mut last_ns: u128 = 0;
+                    let mut last_ops: u64 = 0;
+                    let mut ema: f64 = 0.0;
+                    loop {
+                        std::thread::sleep(Duration::from_millis(200));
+                        if ctx_s.stopping.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let ops = ctx_s.metrics.order_ops.load(Ordering::Relaxed);
+                        let ns = ctx_s.now() as u128;
+                        if have_sample && ns > last_ns {
+                            let dt_s = (ns - last_ns) as f64 / 1e9;
+                            let rate = ops.saturating_sub(last_ops) as f64 / dt_s.max(1e-9);
+                            ema = if ema == 0.0 { rate } else { ema * 0.8 + rate * 0.2 };
+                            ctx_s
+                                .metrics
+                                .tps_ema_milli
+                                .store((ema * 1000.0) as u64, Ordering::Relaxed);
+                        }
+                        have_sample = true;
+                        last_ns = ns;
+                        last_ops = ops;
+                    }
+                });
+        }
 
         // ---------------- Acceptor ----------------
         let addr = cfg.to_addr()?;

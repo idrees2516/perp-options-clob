@@ -19,6 +19,10 @@ export function TopBar() {
 
   const host = useMemo(() => {
     if (!session) return '';
+    if (!session.baseUrl) {
+      // same-origin gateway mode: show the host actually serving the terminal
+      return typeof window !== 'undefined' ? window.location.host : '';
+    }
     try {
       return new URL(session.baseUrl).host;
     } catch {
