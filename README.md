@@ -23,6 +23,73 @@ rather than socialized losses. This workspace implements that stack
 end-to-end, with the design choices that dominate production — and the
 reasons for each — documented where they are made.
 
+## Proof of work — options venue engineering, end to end
+
+This repo doubles as a **portfolio piece**: the full stack an on-chain
+options and structured-products venue needs — pricing models, liquidity
+bootstrapping, hedging-aware margin, market risk, and the terminal traders
+actually use — implemented, tested, and runnable from one command. The
+three hard problems of that domain, and where each lives here:
+
+### 1 · Pricing & models — BSM, discrete-time, American early exercise
+
+| Piece | Where |
+|---|---|
+| Black-Scholes-Merton analytics: norm-CDF/PDF (Abramowitz–Stegun 7.1.26, \|ε\| < 1.5e-7), implied-vol inversion, degenerate inputs collapse to discounted intrinsic | [`crates/margin/src/blackscholes.rs`](crates/margin/src/blackscholes.rs) |
+| American marks: Barone-Adesi & Whaley (1987) quadratic approximation, validated against a Cox-Ross-Rubinstein binomial-tree referee (<0.3% of spot across the trading region), Merton (1973) perpetual closed form as the τ→∞ anchor | [`crates/margin/src/american.rs`](crates/margin/src/american.rs) |
+| Discrete-time marks wherever state transitions matter: TWAP funding premium, TWAP American exercise-assignment windows, deterministic settlement batches | [`crates/economics/src/funding.rs`](crates/economics/src/funding.rs), [`crates/settlement/`](crates/settlement) |
+| Portfolio greeks (Δ Γ ν Θ) per account, with vega/gamma caps enforced pre-trade (G-41) | [`crates/risk/src/greeks_limits.rs`](crates/risk/src/greeks_limits.rs) |
+
+### 2 · Liquidity bootstrapping — CLOB, vaults, RFQ
+
+| Piece | Where |
+|---|---|
+| Maker-rebate fee ladder (¼-bps steps, −1 to +1 bps at the ends) that pays MMs to run two-sided books from day zero | [`crates/economics/src/fees.rs`](crates/economics/src/fees.rs) |
+| MM tier program (G-15) + LP vaults sharing fee revenue through the 60/30/10 router | [`crates/economics/src/vaults.rs`](crates/economics/src/vaults.rs) |
+| Multi-dealer RFQ for size: atomic leg-packages, per-leg quotes, private counterparty lists, partial fills, delayed block tape (Paradigm/Derive-style) | [`crates/rfq/`](crates/rfq) |
+| zkLighter-style channel orderbook + auto-listing of new expiries | [`crates/orderbook/`](crates/orderbook) |
+
+### 3 · Delta-neutral hedging — recognized inside the margin grid
+
+The margin engine doesn't just price options; it **recognizes hedges**:
+
+- **G-20 spot-hedge-aware collateral** — a short call hedged by a long
+  perp nets to roughly delta-neutral inside the scenario grid: hedges
+  offset, only true residual risk is capitalized
+  ([`crates/margin/src/portfolio.rs`](crates/margin/src/portfolio.rs)).
+- The scenario grid reprices every leg under shocked spot/vol states —
+  discrete-time risk lattices, not delta approximations alone
+  ([`crates/margin/src/lib.rs`](crates/margin/src/lib.rs)).
+- Insurance-fund inventory rebalancing (G-23) — inventory acquired in
+  liquidations drips back into the book at an edge, never dumped into a
+  thin market ([`crates/engine/src/sweep.rs`](crates/engine/src/sweep.rs)).
+
+### Shipped, PR by PR
+
+Every feature below landed as a PR-grade change with tests attached:
+
+| PR / release | What landed |
+|---|---|
+| v0.6 — American options + channel book | American-style exercise (TWAP windows, pro-rata assignment), zkLighter-style channel matching |
+| Gap-closure waves 3–4 | OCO brackets (G-08), TWAP parents (G-10), MM tier program (G-15), vault revenue-share |
+| The trading terminal | Turborepo + Next.js 16.3.4, 12 views, sim + live-gateway transports |
+| The live venue gateway | socket.io market data + G-25 HMAC-signed REST, replay protection, rate limits |
+| RFQ v2 | partial fills, dealer program, privacy, delayed tape, execute-best |
+| v0.7 — the wiring release | FIX 4.4 gateway, multi-leg option structures over FIX, both-desk fills, whole-stack e2e proof |
+
+### The results
+
+- **370 Rust tests** (unit + integration + property — journal-replay
+  determinism included) plus **19 TypeScript tests** across the venue
+  simulator economics and the gateway contract (auth, sequencing, replay
+  protection, rate limits) in the
+  [frontend repo](https://github.com/idrees2516/perp-options-clob-frontend).
+- Benchmarks and architecture stress scenarios:
+  [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md),
+  [`docs/STRESS_TESTING.md`](docs/STRESS_TESTING.md).
+- One command runs the whole stack — engine, gateway, terminal — see
+  [the frontend section](#web-frontend--the-trading-terminal) below.
+
 ## Web frontend — the trading terminal
 
 The **production-grade trading terminal** lives in its own repository,
