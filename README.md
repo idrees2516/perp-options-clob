@@ -25,83 +25,36 @@ reasons for each — documented where they are made.
 
 ## Web frontend — the trading terminal
 
-This repository now ships a **production-grade trading terminal** in
-[`apps/web`](apps/web/README.md) — a Turborepo monorepo:
+The **production-grade trading terminal** lives in its own repository,
+connected to this one as a git submodule mounted at `frontend/`:
 
-```
-bun install && bun run dev      # from the repo root → http://localhost:3000
-```
+> **[idrees2516/perp-options-clob-frontend](https://github.com/idrees2516/perp-options-clob-frontend)**
+> Next.js 16 + Turborepo monorepo — the 12-view terminal (`apps/web`), the
+> socket.io venue gateway with G-25 signed REST (`apps/gateway`), and the
+> TypeScript packages that mirror this engine's domain 1:1: `@perp/types`
+> (all 28 `Command`s / all 57 `Event`s, exact `bigint` money),
+> `@perp/sim-engine` (the deterministic venue simulator — channel orderbook,
+> SFPM margin, fee ladder, funding, everlasting rolls, American exercise,
+> liquidation cascade, circuit breakers, LP vaults, PoR, governance) and
+> `@perp/api-client` (the one-contract-two-transports connection layer).
 
-- **Next.js 16.3.4** (App Router, single-route terminal), TypeScript strict,
-  Tailwind 4, Turborepo 2.
-- **`@perp/types`** — the domain mirrored 1:1 from the Rust engine: all 28
-  `Command`s, all 57 `Event`s, exact `bigint` money (u128 minor units).
-- **`@perp/sim-engine`** — a deterministic TypeScript venue simulator running
-  in a Web Worker: channel orderbook, SFPM portfolio margin, the fee ladder
-  with maker rebates and the 60/30/10 revenue router, premium+interest
-  funding, everlasting rolls, American exercise with pro-rata assignment,
-  the liquidation cascade (book → insurance → ADL), circuit breakers, LP
-  vaults, the MM tier program, PoR merkle trees, governance, and the
-  time-locked withdrawal pipeline.
-- **`@perp/api-client`** — the gateway contract: snapshot/delta market-data
-  sessions with sequence gap detection and resync, HMAC-SHA256 request
-  signing (`key|nonce|method|path|body_hash`), rate-limit backoff.
+```bash
+# clone everything (engine + terminal)
+git clone --recurse-submodules https://github.com/idrees2516/perp-options-clob.git
 
-The terminal renders every subsystem: book ladder + canvas chart + the full
-order-type ticket (stops, trailing, icebergs, OCO, TWAP), the options chain
-matrix, portfolio margin and greeks, funding, the risk desk (insurance
-coverage, liquidation feed, breakers), incentives (revenue router, MM
-tiers), LP vaults, the RFQ desk, governance (multisig → timelock → veto),
-proof-of-reserves with **in-browser merkle proof verification**, the live
-event journal, and a raw command console over the full `Command` surface.
+# or, from inside an existing checkout
+git submodule update --init --recursive
 
-The same message contract drives both the embedded simulator (demo mode —
-zero backend) and a remote gateway (production path). Deep dive:
-[`apps/web/README.md`](apps/web/README.md).
-
-### The live venue gateway
-
-[`apps/gateway`](apps/gateway/README.md) is the production transport: one
-HTTP server, two planes — a **socket.io venue stream** (bootstrap →
-snapshot/delta books with per-session sequencing → prints → journal →
-account deltas) and a **signed REST surface**. It runs the same
-`@perp/sim-engine` venue server-side as the authoritative book, so the
-terminal, the contract and the economics stay identical whether the venue
-lives in a Web Worker (demo) or behind the gateway (live).
-
-- **G-25 auth**: HMAC-SHA256 over `key_id|nonce|method|path|body_hash`,
-  strictly-increasing per-key nonces (replays → `409`), ±30s timestamps,
-  AES-256-GCM-encrypted secrets at rest under a server pepper, key
-  provisioning endpoint, trader/admin roles.
-- **Market data**: per-connection subscriptions, per-connection `G-27`
-  book sequencer (a visible seq gap is a real drop — the client resyncs),
-  2.5s full snapshots, 80ms delta drain, 700ms market rows.
-- **Order entry**: commands over the socket with synchronous drain so the
-  issuer sees its own fills immediately (`trade_fill` receipts routed to
-  every session that owns a leg of the trade).
-- **Abuse controls**: token-bucket rate limits per key / per socket / per
-  IP with `Retry-After`, request body caps, client caps.
-- **Ops**: `/healthz` + `/readyz`, structured JSON logs, graceful drain on
-  shutdown, env-driven frozen config; `bun test` boots real gateways and
-  exercises the whole surface (auth, sockets, replays, rate limits).
-
-Run the full stack (edge router on `:8080`, web on `/`, gateway under
-`/gateway/*` — one origin, no CORS):
-
-```
-docker compose up --build
+# run the terminal (simulation mode by default — zero backend)
+cd frontend && bun install && bun run dev    # -> http://localhost:3000
 ```
 
-Or standalone: `bun run dev:gateway` → `:3031`, then point the terminal's
-connection dialog at it (direct origin, same-origin proxy port, or a
-mounted path prefix — all three are supported by `RemoteConnection`).
-
-**Embedded mode (default).** The web app boots the gateway *in-process*
-through `apps/web/src/instrumentation.ts` → `@perp/gateway/embed`: the
-Next.js server itself listens on `:3031` next to the terminal, so dev and
-single-container deploys get the live venue with zero external supervision
-(idempotent boot — an already-serving gateway is detected and reused;
-`VENUE_GATEWAY_EMBED=0` opts out).
+The terminal runs standalone in simulation mode and can also drive a live
+venue through the gateway (embedded in-process, or a dedicated container via
+the frontend repo's `docker-compose.yml`). Deep dives:
+[`frontend/apps/web/README.md`](frontend/apps/web/README.md) -
+[`frontend/apps/gateway/README.md`](frontend/apps/gateway/README.md) -
+[Vercel deployment](https://github.com/idrees2516/perp-options-clob-frontend/blob/main/docs/DEPLOY-VERCEL.md).
 
 ## The crates
 

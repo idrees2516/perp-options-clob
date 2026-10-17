@@ -3,16 +3,6 @@
 **/*.rs.bk
 Cargo.lock.orig
 
-# Node / Turborepo
-node_modules/
-.next/
-.turbo/
-out/
-build/
-dist/
-*.tsbuildinfo
-next-env.d.ts
-
 # env & logs
 .env
 .env.*
