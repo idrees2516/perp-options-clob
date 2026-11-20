@@ -27,6 +27,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "poc-combo"
+version = "0.1.0"
+dependencies = [
+ "poc-core",
+]
+
+[[package]]
 name = "poc-core"
 version = "0.1.0"
 
@@ -55,6 +62,7 @@ dependencies = [
 name = "poc-engine"
 version = "0.1.0"
 dependencies = [
+ "poc-combo",
  "poc-core",
  "poc-economics",
  "poc-margin",
@@ -70,6 +78,7 @@ dependencies = [
 name = "poc-fix"
 version = "0.1.0"
 dependencies = [
+ "poc-combo",
  "poc-core",
  "poc-engine",
  "poc-orderbook",
@@ -109,6 +118,7 @@ dependencies = [
 name = "poc-persist"
 version = "0.1.0"
 dependencies = [
+ "poc-combo",
  "poc-core",
  "poc-engine",
  "poc-rfq",

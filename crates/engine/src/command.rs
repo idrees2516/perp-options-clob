@@ -1,5 +1,6 @@
 //! Engine commands — the only inputs the sequencer accepts.
 
+use poc_combo::ComboTif;
 use poc_core::{
     OrderType, SelfTradePrevention, Side, SubaccountId, Symbol, TimeInForce, TimestampMs,
 };
@@ -499,6 +500,62 @@ pub enum Command {
         /// Engine wall-clock.
         now: TimestampMs,
     },
+    /// Place a combined (multi-leg) order (G-11 depth): a package of
+    /// instruments traded as one atomic unit at one signed net price.
+    /// Matches opposing combos, then implied liquidity on the leg
+    /// books, then rests (GTC) or hands the shortfall to the RFQ
+    /// network (IOC/FOK).
+    PlaceCombo {
+        /// Owning subaccount.
+        owner: SubaccountId,
+        /// Package legs, buyer-convention sides, per-unit ratios.
+        legs: Vec<ComboLegCommand>,
+        /// The OWNER's side on the package.
+        side: Side,
+        /// Net limit, quote minor per package unit, buyer-cost
+        /// convention: buy = max acceptable net cost (may be negative
+        /// for credit packages), sell = min acceptable net proceeds.
+        limit_quote_minor_per_unit: i128,
+        /// Package units.
+        units: u64,
+        /// Time-in-force.
+        tif: ComboTif,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Governance application (G-33 wiring): the host submits this AFTER
+    /// `poc_governance::Governor::execute` succeeds; the engine
+    /// journals the parameter change so replay carries parameter
+    /// history instead of silently diverging from the live config.
+    GovernanceApply {
+        /// The governed parameter key (see `apply_governed_parameter`).
+        key: String,
+        /// The new value, string-encoded.
+        value: String,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Cancel one resting combo order.
+    CancelCombo {
+        /// Owning subaccount.
+        owner: SubaccountId,
+        /// Engine-assigned combo id.
+        combo_id: u64,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
+    /// Best-execution router: price the RFQ's best live quote AND the
+    /// composite book route (per-leg market sweeps, all-or-nothing,
+    /// taker fees, margin-gated, collared by the RFQ's own bounds) and
+    /// execute the cheaper one net of fees.
+    RfqExecuteBest {
+        /// Executing taker.
+        taker: SubaccountId,
+        /// The RFQ.
+        rfq_id: u64,
+        /// Engine wall-clock.
+        now: TimestampMs,
+    },
 }
 
 /// One RFQ package leg as issued by a client.
@@ -510,4 +567,16 @@ pub struct RfqLegCommand {
     pub side: Side,
     /// Quantity in lots.
     pub qty_lots: u64,
+}
+
+/// One combined-order package leg as issued by a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComboLegCommand {
+    /// Instrument symbol.
+    pub symbol: Symbol,
+    /// The package BUYER's side on this leg (a sell order takes the
+    /// mirrored side on every leg).
+    pub side: Side,
+    /// Lots per package unit (`units × ratio = leg lots`).
+    pub ratio: u32,
 }

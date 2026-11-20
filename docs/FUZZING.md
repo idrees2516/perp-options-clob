@@ -100,3 +100,41 @@ Findings: **none** — the wave-4 code paths survived their first
 property run. (The wave-3 credit for catching real defects belongs to
 the suite's predecessors; the bar this wave had to clear was not
 regressing them.)
+
+## Implied matching (`fuzz_implied_matching`)
+
+The combined-order fuzz target drives random command sequences —
+plain orders (GTC/IOC/FOK), combined orders (1–2 legs, random
+structures/ratios/sides/limits/tifs), cancels, cancel-alls, oracle
+moves, ticks, and quotes/executions against auto-published RFQs —
+through an option-wing venue with implied matching enabled. The same
+generator runs as a seeded property suite
+(`crates/engine/tests/implied_properties.rs`, 32 seeds × 96 commands)
+in the stable CI profile, so continuous fuzzing and CI check the same
+invariants (I-62..I-68):
+
+* **conservation** of the entry-anchored conserved quantity (options
+  and perps are both premium-unpaid in this venue, so the position
+  entry term covers every instrument) up to per-lot rounding dust;
+* **no self-trades** across every fill;
+* **position-model agreement** — a shadow model recomputed from
+  journaled trades (plus the non-trade movers: liquidations, ADL,
+  expiry, migration) must equal the engine's positions, which catches
+  lot-ratio drift, double-fills, and phantom fills;
+* **book sanity** — leg books never cross at rest; the combo book's
+  indexes stay consistent; every open combo holds a reservation;
+* **replay determinism** — a shadow engine fed identical commands
+  lands on the identical fingerprint.
+
+**Track record:** the first run of the property suite caught a real
+defect — the combo-vs-combo opponent scan did not exclude the taker's
+own resting combos, allowing a self-trade (I-63). Fixed with the
+owner filter in `opponents_in_priority_order`; the suite keeps the
+regression. The initial conservation checker also had to learn the
+venue's premium-unpaid option model — the corrected law (entry terms
+for ALL instruments) is now the property's conserved quantity.
+
+Measured coverage: 16,765 runs / 210 s clean (libFuzzer, ASAN);
+sibling targets re-verified after the combo integration:
+`fuzz_matching` 20,616 runs / 60 s, `fuzz_fees` 3.49 M runs / 46 s,
+`fuzz_oracle` 19,314 runs / 31 s.

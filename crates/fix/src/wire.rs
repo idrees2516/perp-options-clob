@@ -161,8 +161,9 @@ pub mod tag {
     pub const LEG_SIDE: u32 = 624;
     /// LegQty (lots).
     pub const LEG_QTY: u32 = 687;
-    /// LegPrice (ticks; the dealer's per-leg price inside a Quote).
-    pub const LEG_PRICE: u32 = 686;
+    /// LegOfferPx(686): the dealer's per-leg offered price in ticks
+    /// inside a Quote.
+    pub const LEG_OFFER_PX: u32 = 686;
     /// LegOrderQty (working size the dealer commits on that leg).
     pub const LEG_ORDER_QTY: u32 = 685;
     /// QuoteRespID (venue-assigned quote ack reference).
@@ -171,6 +172,20 @@ pub mod tag {
     pub const QUOTE_RESP_TYPE: u32 = 694;
     /// QuoteType (0=Indicative, 1=Tradable).
     pub const QUOTE_TYPE: u32 = 537;
+
+    // -- Multi-leg (combined order) tags ---------------------------------
+
+    /// LegRatioQty(623): lots per package unit on one leg.
+    pub const LEG_RATIO_QTY: u32 = 623;
+    /// LegPrice(566): per-leg reference price (informational on
+    /// net-priced multileg orders).
+    pub const LEG_PRICE: u32 = 566;
+    /// MultiLegReportingType(442): 3 = the multileg security itself.
+    pub const MULTI_LEG_RPT_TYPE: u32 = 442;
+    /// LegLastPx(639): the price the leg actually traded at.
+    pub const LEG_LAST_PX: u32 = 639;
+    /// LegPositionEffect(563): O = open, C = close (informational).
+    pub const LEG_POSITION_EFFECT: u32 = 563;
 }
 
 /// FIX message types this gateway understands.
@@ -192,6 +207,8 @@ pub enum MsgType {
     Logon,
     /// NewOrderSingle.
     NewOrderSingle,
+    /// NewOrderMultileg (combined / multi-leg order).
+    NewOrderMultileg,
     /// OrderCancelRequest.
     OrderCancelRequest,
     /// OrderCancelReplaceRequest.
@@ -233,6 +250,7 @@ impl MsgType {
             Self::Logout => "5",
             Self::Logon => "A",
             Self::NewOrderSingle => "D",
+            Self::NewOrderMultileg => "AB",
             Self::OrderCancelRequest => "F",
             Self::OrderCancelReplaceRequest => "G",
             Self::OrderStatusRequest => "H",
@@ -264,6 +282,7 @@ impl MsgType {
             "5" => Self::Logout,
             "A" => Self::Logon,
             "D" => Self::NewOrderSingle,
+            "AB" => Self::NewOrderMultileg,
             "F" => Self::OrderCancelRequest,
             "G" => Self::OrderCancelReplaceRequest,
             "H" => Self::OrderStatusRequest,

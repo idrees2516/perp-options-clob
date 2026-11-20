@@ -1052,6 +1052,64 @@ impl RfqBook {
         self.rfqs.get(&rfq_id)
     }
 
+    /// Consume `take_per_leg` lots from an OPEN RFQ outside the quote
+    /// path — the best-execution router's book-route settlement
+    /// (G-11 depth): the taker swept the leg books directly, so the
+    /// RFQ's remaining size shrinks exactly like a quote execution.
+    ///
+    /// Bounds are NOT re-checked here: the router's pricing already
+    /// enforced them against the identical pure match outcomes.
+    /// Mirrors `settle`'s mutation core: consumes the take, marks the
+    /// RFQ `Filled` when complete, and drains every other live quote.
+    pub fn consume_external_take(
+        &mut self,
+        rfq_id: u64,
+        take_per_leg: &[u64],
+    ) -> Result<(), RfqError> {
+        let legs = {
+            let rfq = self.rfqs.get(&rfq_id).ok_or(RfqError::UnknownRfq)?;
+            if rfq.status != RfqStatus::Open {
+                return Err(RfqError::NotOpen);
+            }
+            if take_per_leg.len() != rfq.legs.len() {
+                return Err(RfqError::InvalidPartial);
+            }
+            for i in 0..rfq.legs.len() {
+                if take_per_leg[i] > rfq.remaining_lots[i] {
+                    return Err(RfqError::InvalidPartial);
+                }
+            }
+            rfq.legs.len()
+        };
+        let rfq_filled = match self.rfqs.get_mut(&rfq_id) {
+            None => false,
+            Some(r) => {
+                for (rem, &t) in r.remaining_lots.iter_mut().zip(take_per_leg) {
+                    *rem = rem.saturating_sub(t);
+                }
+                let filled = r.remaining_lots.iter().all(|&rem| rem == 0);
+                if filled {
+                    r.status = RfqStatus::Filled;
+                }
+                filled
+            }
+        };
+        if rfq_filled {
+            let others: Vec<u64> = self
+                .rfq_quotes
+                .get(&rfq_id)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect();
+            for qid in others {
+                self.cancel_if_live(qid);
+            }
+        }
+        let _ = legs;
+        Ok(())
+    }
+
     /// Look up a quote by id.
     #[must_use]
     pub fn quote(&self, quote_id: u64) -> Option<&Quote> {

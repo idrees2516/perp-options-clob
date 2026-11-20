@@ -42,6 +42,7 @@ pub mod algorithms;
 pub mod amend;
 pub mod auction;
 pub mod collateral;
+pub mod combo;
 pub mod command;
 pub mod engine;
 pub mod event;
@@ -49,16 +50,18 @@ pub mod exercise;
 pub mod institutions;
 pub mod listing;
 pub mod mm;
+pub mod router;
 pub mod sweep;
 pub mod vaults;
 
 pub use collateral::{CollateralCurrency, PriceSource, QUOTE_CODE};
-pub use command::{Command, OrderRequest, RfqLegCommand};
+pub use combo::{ComboConfig, CompositeBbo};
+pub use command::{ComboLegCommand, Command, OrderRequest, RfqLegCommand};
 pub use engine::{Engine, EngineConfig, EngineStats, ListingPolicy, PorLiabilityRow};
 pub use event::{
-    AccountView, AdlExecuted, BookView, Event, FundingPaid, FundingSettled, LiquidationExecuted,
-    LiquidityObservation, MarketStateView, OptionSettled, OrderCloseReason, OrderRejected,
-    RewardPaid, Trade, TwapParent, VaultEpoch,
+    AccountView, AdlExecuted, BookView, ComboTrade, Event, FundingPaid, FundingSettled,
+    LiquidationExecuted, LiquidityObservation, MarketStateView, OptionSettled, OrderCloseReason,
+    OrderRejected, RewardPaid, Trade, TwapParent, VaultEpoch,
 };
 pub use listing::{default_btc_template, OptionTemplate, UnderlyingListing};
 

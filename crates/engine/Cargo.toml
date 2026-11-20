@@ -9,6 +9,7 @@ description = "Deterministic exchange engine for the perp-options-clob: command-
 
 [dependencies]
 poc-core = { path = "../core" }
+poc-combo = { path = "../combo" }
 poc-rfq = { path = "../rfq" }
 poc-volsurface = { path = "../volsurface" }
 poc-orderbook = { path = "../orderbook" }

@@ -10,6 +10,7 @@
 //! | FIX inbound | Engine command | FIX outbound |
 //! |---|---|---|
 //! | `NewOrderSingle (D)` | `Place` | `ExecutionReport (8)` ack + fills |
+//! | `NewOrderMultileg (AB)` | `PlaceCombo` | `ExecutionReport (8)` with `NoLegs` groups |
 //! | `NewOrderSingle (D)` + `QuoteID(117)` | `RfqExecute` / `RfqExecutePartial` | `ExecutionReport` fills |
 //! | `OrderCancelRequest (F)` | `Cancel` | `ExecutionReport` / `OrderCancelReject (9)` |
 //! | `OrderCancelReplaceRequest (G)` | `Amend` | `ExecutionReport` ack |
@@ -50,6 +51,7 @@
 use std::collections::BTreeMap;
 
 use poc_core::{OrderType, Side, SubaccountId, TimeInForce};
+use poc_engine::ComboLegCommand;
 use poc_engine::{Command, Engine, Event, OrderCloseReason, OrderRequest, RfqLegCommand};
 
 use crate::session::{FixSession, Inbound, SessionError};
@@ -123,6 +125,26 @@ impl TrackedOrder {
     pub fn leaves_qty(&self) -> u64 {
         self.qty_lots.saturating_sub(self.cum_qty_lots)
     }
+}
+
+/// The gateway's view of one combined (multi-leg) order, keyed by the
+/// desk's ClOrdID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedCombo {
+    /// The desk's ClOrdID.
+    pub cl_ord_id: String,
+    /// Engine-assigned combo id (its own id space).
+    pub combo_id: u64,
+    /// The package side the desk took.
+    pub side: Side,
+    /// Total package units.
+    pub units: u64,
+    /// Units cumulatively executed.
+    pub cum_units: u64,
+    /// Volume-weighted net accumulator (net-per-unit x units, minor).
+    pub cum_net_weighted: i128,
+    /// Terminal?
+    pub done: bool,
 }
 
 /// ClOrdID ⇄ engine-order-id routing and fill accounting.
@@ -266,6 +288,10 @@ pub struct FixGateway {
     /// (rfq req id, dealer) → the dealer's QuoteID for the current
     /// live quote on that RFQ.
     live_quote_ids: BTreeMap<(String, SubaccountId), String>,
+    /// ClOrdID → tracked combined order (NewOrderMultileg desks).
+    combos: BTreeMap<String, TrackedCombo>,
+    /// Engine combo id → the desk's ClOrdID.
+    combo_cl_by_id: BTreeMap<u64, String>,
     next_session_id: u64,
 }
 
@@ -281,6 +307,8 @@ impl FixGateway {
             rfq_by_req_id: BTreeMap::new(),
             quote_by_id: BTreeMap::new(),
             live_quote_ids: BTreeMap::new(),
+            combos: BTreeMap::new(),
+            combo_cl_by_id: BTreeMap::new(),
             next_session_id: 1,
         }
     }
@@ -371,6 +399,7 @@ impl FixGateway {
         };
         match mtype {
             MsgType::NewOrderSingle => self.on_new_order(session_id, msg, now),
+            MsgType::NewOrderMultileg => self.on_new_order_multileg(session_id, msg, now),
             MsgType::OrderCancelRequest => self.on_cancel(session_id, msg, now),
             MsgType::OrderCancelReplaceRequest => self.on_replace(session_id, msg, now),
             MsgType::OrderStatusRequest => self.on_order_status(session_id, msg, now),
@@ -413,6 +442,432 @@ impl FixGateway {
         let qty = request.qty_lots;
         let events = self.engine.process(Command::Place { request, now });
         self.drain_order_events(session_id, &cl_ord_id, qty, events, now)
+    }
+
+    // -- NewOrderMultileg (combined orders) -------------------------------
+
+    /// `NewOrderMultileg (AB)`: place a combined (multi-leg) order.
+    ///
+    /// Field map:
+    ///
+    /// | Tag | Field | Engine |
+    /// |-----|-------|--------|
+    /// | 54 | Side | the package side (1 = buy the package) |
+    /// | 38 | OrderQty | package UNITS |
+    /// | 44 | Price | net limit, quote minor per unit (SIGNED decimal; negative = credit) |
+    /// | 59 | TimeInForce | 0/1 = GTC, 3 = IOC, 4 = FOK |
+    /// | 555 | NoLegs | leg count |
+    /// | 600 | LegSymbol | leg instrument |
+    /// | 624 | LegSide | the package BUYER's side on the leg |
+    /// | 623 | LegRatioQty | lots per unit (default 1) |
+    /// | 685 | LegOrderQty | per-leg lots (must equal ratio x units) |
+    ///
+    /// When `Price(44)` is absent but every leg carries `LegPrice(566)`,
+    /// the net limit is derived from the leg prices (buyer-cost sum,
+    /// quote minor per unit).
+    fn on_new_order_multileg(
+        &mut self,
+        session_id: u64,
+        msg: &FixMessage,
+        now: u64,
+    ) -> Vec<Vec<u8>> {
+        let sub = self.sub_of(session_id);
+        let cl_ord_id = msg.get(tag::CL_ORD_ID).unwrap_or_default().to_string();
+
+        let Some((legs, side, limit, units, tif)) = self.translate_multileg(sub, msg) else {
+            return vec![self.execution_reject_simple(
+                session_id,
+                &cl_ord_id,
+                "malformed multileg order",
+                now,
+            )];
+        };
+        let events = self.engine.process(Command::PlaceCombo {
+            owner: sub,
+            legs,
+            side,
+            limit_quote_minor_per_unit: limit,
+            units,
+            tif,
+            now,
+        });
+        self.drain_combo_events(session_id, &cl_ord_id, events, now)
+    }
+
+    /// Parse a `NewOrderMultileg` into the engine's combo placement.
+    #[allow(clippy::type_complexity)]
+    fn translate_multileg(
+        &self,
+        _sub: SubaccountId,
+        msg: &FixMessage,
+    ) -> Option<(Vec<ComboLegCommand>, Side, i128, u64, poc_combo::ComboTif)> {
+        let side = match msg.get(tag::SIDE)? {
+            "1" => Side::Bid,
+            "2" => Side::Ask,
+            _ => return None,
+        };
+        let units = msg.get_u64(tag::ORDER_QTY)?;
+        if units == 0 {
+            return None;
+        }
+        let tif = match msg.get(tag::TIME_IN_FORCE).unwrap_or("0") {
+            "3" => poc_combo::ComboTif::Ioc,
+            "4" => poc_combo::ComboTif::Fok,
+            _ => poc_combo::ComboTif::Gtc,
+        };
+        let n = msg.get_u64(tag::NO_LEGS)?;
+        if n == 0 || n > 64 {
+            return None;
+        }
+        let n = n as usize;
+        let symbols = msg.get_all(tag::LEG_SYMBOL);
+        let sides = msg.get_all(tag::LEG_SIDE);
+        if symbols.len() != n || sides.len() != n {
+            return None;
+        }
+        let ratios = msg.get_all(tag::LEG_RATIO_QTY);
+        let leg_prices = msg.get_all(tag::LEG_PRICE);
+        let leg_qtys = msg.get_all(tag::LEG_ORDER_QTY);
+        let mut legs = Vec::with_capacity(n);
+        for i in 0..n {
+            let ratio: u32 = ratios.get(i).and_then(|r| r.parse().ok()).unwrap_or(1);
+            if ratio == 0 {
+                return None;
+            }
+            let leg_side = match sides[i] {
+                "1" => Side::Bid,
+                "2" => Side::Ask,
+                _ => return None,
+            };
+            // LegOrderQty, when present, must be consistent.
+            if let Some(q) = leg_qtys.get(i) {
+                let q: u64 = q.parse().ok()?;
+                if q != u64::from(ratio) * units {
+                    return None;
+                }
+            }
+            legs.push(ComboLegCommand {
+                symbol: symbols[i].to_string(),
+                side: leg_side,
+                ratio,
+            });
+        }
+        // Net limit: Price(44) is the signed net per unit in quote
+        // minor; absent that, derive from LegPrice(566) sums.
+        let limit = if let Some(p) = msg.get(tag::PRICE) {
+            Self::parse_signed_minor(p)?
+        } else if leg_prices.len() == n {
+            let mut net: i128 = 0;
+            for (i, lp) in leg_prices.iter().enumerate() {
+                let ticks: i128 = lp.parse().ok()?;
+                let ratio = legs[i].ratio;
+                // Buyer-cost convention: buying legs add, selling legs
+                // subtract; the venue's leg prices are tick counts.
+                // Per-unit value of one tick is leg-dependent; use the
+                // instrument geometry from the engine.
+                // Per-unit leg value at the leg price: ticks x tick
+                // size x ratio x lot size / 10^decimals — fractional
+                // per-tick values (0.1 minor) need mul_div, not integer
+                // division.
+                let flow_abs = self
+                    .engine
+                    .instruments()
+                    .get(&legs[i].symbol)
+                    .and_then(|inst| {
+                        let price = u128::try_from(ticks.unsigned_abs())
+                            .ok()?
+                            .checked_mul(inst.tick_size())?;
+                        poc_core::mul_div(
+                            price,
+                            u128::from(ratio) * inst.lot_size(),
+                            10_u128.checked_pow(inst.base_decimals())?,
+                            poc_core::Rounding::NearestHalfUp,
+                        )
+                    })?;
+                let flow = if legs[i].side == Side::Bid {
+                    i128::try_from(flow_abs).ok()?
+                } else {
+                    -i128::try_from(flow_abs).ok()?
+                };
+                net = net.checked_add(flow)?;
+            }
+            net
+        } else {
+            return None;
+        };
+        Some((legs, side, limit, units, tif))
+    }
+
+    /// Consume combo events into multileg ExecutionReports.
+    fn drain_combo_events(
+        &mut self,
+        session_id: u64,
+        cl_ord_id: &str,
+        events: Vec<Event>,
+        now: u64,
+    ) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for ev in events {
+            match ev {
+                Event::ComboPlaced {
+                    combo_id,
+                    side,
+                    units,
+                    ..
+                } => {
+                    self.combos.insert(
+                        cl_ord_id.to_string(),
+                        TrackedCombo {
+                            cl_ord_id: cl_ord_id.to_string(),
+                            combo_id,
+                            side,
+                            units,
+                            cum_units: 0,
+                            cum_net_weighted: 0,
+                            done: false,
+                        },
+                    );
+                    self.combo_cl_by_id.insert(combo_id, cl_ord_id.to_string());
+                    out.push(self.multileg_report(
+                        session_id,
+                        cl_ord_id,
+                        combo_id,
+                        side,
+                        units,
+                        0,
+                        0,
+                        ord_status::NEW,
+                        exec_type::NEW,
+                        None,
+                        now,
+                    ));
+                }
+                Event::ComboRejected { reason, .. } => {
+                    let text = reason.to_string();
+                    out.push(self.execution_reject_simple(session_id, cl_ord_id, &text, now));
+                }
+                Event::ComboTraded(trade) => {
+                    // Update the tracked combo(s): both sides when the
+                    // counterparty was also a combo this gateway tracks.
+                    let mut sides: Vec<(u64, u64)> = vec![(trade.combo_id, trade.units)];
+                    if let Some(counter_id) = trade.counterparty_combo_id {
+                        sides.push((counter_id, trade.units));
+                    }
+                    for (combo_id, units_done) in sides {
+                        if let Some(tc) = self.combos.get_mut(
+                            &self
+                                .combo_cl_by_id
+                                .get(&combo_id)
+                                .cloned()
+                                .unwrap_or_default(),
+                        ) {
+                            if tc.combo_id == combo_id && !tc.done {
+                                tc.cum_units += units_done;
+                                tc.cum_net_weighted += trade.effective_net_quote_minor_per_unit
+                                    * i128::from(units_done);
+                                if tc.cum_units >= tc.units {
+                                    tc.done = true;
+                                }
+                            }
+                        }
+                    }
+                    // The issuing desk's report.
+                    if let Some(tc) = self.combos.get(cl_ord_id).cloned() {
+                        let status = if tc.done {
+                            ord_status::FILLED
+                        } else {
+                            ord_status::PARTIALLY_FILLED
+                        };
+                        out.push(self.multileg_report(
+                            session_id,
+                            cl_ord_id,
+                            tc.combo_id,
+                            tc.side,
+                            tc.units,
+                            tc.cum_units,
+                            tc.cum_net_weighted,
+                            status,
+                            exec_type::TRADE,
+                            Some(&trade),
+                            now,
+                        ));
+                    }
+                    // The counterparty desk (when tracked and online).
+                    if let Some(counter_id) = trade.counterparty_combo_id {
+                        if let Some(counter_cl) = self.combo_cl_by_id.get(&counter_id).cloned() {
+                            if counter_cl != cl_ord_id {
+                                if let Some(tc) = self.combos.get(&counter_cl).cloned() {
+                                    let counter_sub = self.sub_of(session_id);
+                                    let _ = counter_sub;
+                                    if let Some(sid) = self.combo_session(&counter_id) {
+                                        let status = if tc.done {
+                                            ord_status::FILLED
+                                        } else {
+                                            ord_status::PARTIALLY_FILLED
+                                        };
+                                        out.push(self.multileg_report(
+                                            sid,
+                                            &counter_cl,
+                                            tc.combo_id,
+                                            tc.side,
+                                            tc.units,
+                                            tc.cum_units,
+                                            tc.cum_net_weighted,
+                                            status,
+                                            exec_type::TRADE,
+                                            Some(&trade),
+                                            now,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Implied-out: the counterparty is a plain aggressor;
+                    // the combo owner's desk (if any) still gets its fill.
+                    if trade.counterparty_combo_id.is_none() && trade.regime == "implied-out" {
+                        if let Some(sid) = self.combo_session(&trade.combo_id) {
+                            if let Some(tc) = self
+                                .combo_cl_by_id
+                                .get(&trade.combo_id)
+                                .and_then(|cl| self.combos.get(cl).cloned())
+                            {
+                                let status = if tc.done {
+                                    ord_status::FILLED
+                                } else {
+                                    ord_status::PARTIALLY_FILLED
+                                };
+                                out.push(self.multileg_report(
+                                    sid,
+                                    &tc.cl_ord_id,
+                                    tc.combo_id,
+                                    tc.side,
+                                    tc.units,
+                                    tc.cum_units,
+                                    tc.cum_net_weighted,
+                                    status,
+                                    exec_type::TRADE,
+                                    Some(&trade),
+                                    now,
+                                ));
+                            }
+                        }
+                    }
+                }
+                Event::ComboClosed {
+                    combo_id, reason, ..
+                } => {
+                    let cl = self
+                        .combo_cl_by_id
+                        .get(&combo_id)
+                        .cloned()
+                        .unwrap_or_else(|| cl_ord_id.to_string());
+                    if let Some(tc) = self.combos.get_mut(&cl) {
+                        if !tc.done && reason != "filled" {
+                            tc.done = true;
+                        }
+                    }
+                    if let Some(tc) = self.combos.get(&cl).cloned() {
+                        let status = if reason == "filled" || tc.cum_units >= tc.units {
+                            ord_status::FILLED
+                        } else {
+                            ord_status::CANCELED
+                        };
+                        let et = if reason == "filled" {
+                            exec_type::TRADE
+                        } else {
+                            exec_type::CANCELED
+                        };
+                        out.push(self.multileg_report(
+                            session_id,
+                            &cl,
+                            combo_id,
+                            tc.side,
+                            tc.units,
+                            tc.cum_units,
+                            tc.cum_net_weighted,
+                            status,
+                            et,
+                            None,
+                            now,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The session of a tracked combo's owner, when online.
+    fn combo_session(&self, combo_id: &u64) -> Option<u64> {
+        let cl = self.combo_cl_by_id.get(combo_id)?;
+        let tc = self.combos.get(cl)?;
+        // The owner is the desk that placed it: find its session by
+        // matching the engine's combo owner to a registered CompID.
+        let owner = self.engine.combos_view().get(*combo_id)?.owner;
+        let _ = tc;
+        self.sessions
+            .iter()
+            .find(|(_, s)| s.subaccount == owner)
+            .map(|(id, _)| *id)
+    }
+
+    /// One multileg ExecutionReport: package-level fields plus the
+    /// per-leg `NoLegs` group.
+    #[allow(clippy::too_many_arguments)]
+    fn multileg_report(
+        &mut self,
+        session_id: u64,
+        cl_ord_id: &str,
+        combo_id: u64,
+        side: Side,
+        units: u64,
+        cum_units: u64,
+        cum_net_weighted: i128,
+        status: &str,
+        etype: &str,
+        trade: Option<&poc_engine::ComboTrade>,
+        now: u64,
+    ) -> Vec<u8> {
+        let mut body = FixMessage::new();
+        body.push(tag::ORDER_ID, format!("COMBO-{combo_id}"));
+        body.push(tag::CL_ORD_ID, cl_ord_id.to_string());
+        body.push(tag::EXEC_ID, format!("X{}", self.router.next_exec_id()));
+        body.push(tag::EXEC_TYPE, etype);
+        body.push(tag::ORD_STATUS, status);
+        // MultiLegReportingType(442) = 3: report the multileg itself.
+        body.push(tag::MULTI_LEG_RPT_TYPE, "3");
+        body.push(tag::SIDE, if side == Side::Bid { "1" } else { "2" });
+        body.push(tag::ORDER_QTY, units.to_string());
+        body.push(tag::CUM_QTY, cum_units.to_string());
+        body.push(tag::LEAVES_QTY, units.saturating_sub(cum_units).to_string());
+        // AvgPx(6): the cumulative net per unit, signed decimal.
+        if cum_units > 0 {
+            let avg = cum_net_weighted / i128::from(cum_units);
+            body.push(tag::AVG_PX, avg.to_string());
+        }
+        if let Some(trade) = trade {
+            body.push(tag::LAST_QTY, trade.units.to_string());
+            body.push(
+                tag::LAST_PX,
+                trade.effective_net_quote_minor_per_unit.to_string(),
+            );
+            // The per-leg group: LegSymbol/LegSide/LegQty/LegLastPx.
+            let legs = &trade.leg_executions;
+            body.push(tag::NO_LEGS, legs.len().to_string());
+            for (symbol, leg_side, lots, ticks) in legs {
+                body.push(tag::LEG_SYMBOL, symbol.clone());
+                body.push(
+                    tag::LEG_SIDE,
+                    if *leg_side == Side::Bid { "1" } else { "2" },
+                );
+                body.push(tag::LEG_QTY, lots.to_string());
+                body.push(tag::LEG_LAST_PX, ticks.to_string());
+            }
+        }
+        body.push(tag::TRANSACT_TIME, now.to_string());
+        self.emit(session_id, MsgType::ExecutionReport, body)
     }
 
     /// Translate the FIX fields into an engine `OrderRequest`.
@@ -543,6 +998,35 @@ impl FixGateway {
                         now,
                     ));
                 }
+                Event::ComboTraded(trade) => {
+                    // A resting combo consumed this plain order's
+                    // remainder: the combo owner's desk gets its fill.
+                    if let Some(sid) = self.combo_session(&trade.combo_id) {
+                        if let Some(tc) = self
+                            .combo_cl_by_id
+                            .get(&trade.combo_id)
+                            .and_then(|cl| self.combos.get(cl).cloned())
+                        {
+                            out.push(self.multileg_report(
+                                sid,
+                                &tc.cl_ord_id,
+                                tc.combo_id,
+                                tc.side,
+                                tc.units,
+                                tc.cum_units,
+                                tc.cum_net_weighted,
+                                if tc.done {
+                                    ord_status::FILLED
+                                } else {
+                                    ord_status::PARTIALLY_FILLED
+                                },
+                                exec_type::TRADE,
+                                Some(&trade),
+                                now,
+                            ));
+                        }
+                    }
+                }
                 Event::OrderClosed {
                     order_id,
                     order,
@@ -592,6 +1076,15 @@ impl FixGateway {
         let sub = self.sub_of(session_id);
         let cl_ord_id = msg.get(tag::CL_ORD_ID).unwrap_or_default().to_string();
         let orig = msg.get(tag::ORIG_CL_ORD_ID).unwrap_or_default().to_string();
+        // Combined orders cancel through their own command.
+        if let Some(combo) = self.combos.get(&orig).cloned() {
+            let events = self.engine.process(Command::CancelCombo {
+                owner: sub,
+                combo_id: combo.combo_id,
+                now,
+            });
+            return self.drain_combo_events(session_id, &orig, events, now);
+        }
         let Some(order) = self.router.by_cl_ord_id(&orig).cloned() else {
             return vec![self.cancel_reject(session_id, &cl_ord_id, &orig, "unknown order", now)];
         };
@@ -1108,6 +1601,12 @@ impl FixGateway {
             .iter()
             .find(|(_, s)| s.subaccount == sub)
             .map(|(id, _)| *id)
+    }
+
+    /// Parse a signed integer in quote minor units (the venue's
+    /// integer-FIX convention; negative = a credit to the buyer).
+    fn parse_signed_minor(raw: &str) -> Option<i128> {
+        raw.trim().parse::<i128>().ok()
     }
 
     /// The quoting dealer's side of an RFQ fill: an ExecutionReport on

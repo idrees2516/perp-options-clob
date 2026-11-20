@@ -227,3 +227,36 @@ costs about the same as the RFQ negotiation cycle itself.
 | Integer price/qty encoding | Deribit / Derive FIX practice | No floating point near money |
 | `ExecInst` P/R extensions | venue practice | Post-only and reduce-only without protocol surgery |
 | One pure `on_frame` function | the engine's plan/apply discipline | The gateway is replayable and testable like the engine |
+
+## NewOrderMultileg (AB) — combined orders over FIX
+
+`NewOrderMultileg` places a combined (multi-leg) order on the venue's
+combo book. Field map:
+
+| Tag | Field | Engine |
+|-----|-------|--------|
+| 54 | Side | the package side (1 = buy the package) |
+| 38 | OrderQty | package UNITS |
+| 44 | Price | net limit, quote minor per unit (signed integer; negative = credit) |
+| 59 | TimeInForce | 0/1 = GTC, 3 = IOC, 4 = FOK |
+| 555 | NoLegs | leg count |
+| 600 | LegSymbol | leg instrument |
+| 624 | LegSide | the package BUYER's side on the leg (1 = buy, 2 = sell) |
+| 623 | LegRatioQty | lots per unit (default 1) |
+| 685 | LegOrderQty | per-leg lots (validated: must equal ratio × units) |
+| 566 | LegPrice | per-leg reference price (ticks) — derives the net when 44 is absent |
+
+Leg-priced orders (no `Price(44)`, every leg carrying `LegPrice(566)`)
+derive the net limit as the buyer-cost sum of the leg values — the
+fractional per-tick values (e.g. 0.1 quote minor per tick per unit)
+are computed with `mul_div`, never integer division.
+
+Acks and fills are multileg `ExecutionReport (8)` frames:
+`MultiLegReportingType(442) = 3`, package-level `LastQty`/`LastPx`
+(units / net per unit), `AvgPx` as the signed cumulative net, and a
+`NoLegs` group with `LegSymbol(600)`, `LegSide(624)`, `LegQty(687)`,
+and `LegLastPx(639)` per leg. Fills from all three regimes —
+combo-vs-combo, implied-in, and implied-out — reach the owner's desk;
+an implied-out fill of a plain aggressor into a resting multileg order
+reports to the combo desk as well. Cancellation is the standard
+`OrderCancelRequest (F)` with `OrigClOrdID` of the multileg order.

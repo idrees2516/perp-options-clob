@@ -10,6 +10,7 @@ description = "FIX 4.4 gateway for the perp-options-clob: wire codec, session pr
 [dependencies]
 poc-core = { path = "../core" }
 poc-orderbook = { path = "../orderbook" }
+poc-combo = { path = "../combo" }
 poc-engine = { path = "../engine" }
 poc-rfq = { path = "../rfq" }
 

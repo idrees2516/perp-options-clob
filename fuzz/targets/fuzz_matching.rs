@@ -59,9 +59,9 @@ fuzz_target!(|data: &[u8]| {
                 base_symbol: "BTC".into(),
                 provider: if next(&mut seed) % 2 == 0 { "pyth".into() } else { "chainlink".into() },
                 ts: 3_000 + step * 10,
-                price_quote_minor: 7_800_000 + next(&mut seed) % 400_000,
+                price_quote_minor: u128::from(7_800_000 + next(&mut seed) % 400_000),
             },
-            _ => Command::Withdraw { subaccount: 1 + next(&mut seed) % 4, amount_quote_minor: next(&mut seed) % 1_000_000 },
+            _ => Command::Withdraw { subaccount: 1 + next(&mut seed) % 4, amount_quote_minor: u128::from(next(&mut seed) % 1_000_000) },
         };
         e.process(cmd.clone());
         shadow.process(cmd);

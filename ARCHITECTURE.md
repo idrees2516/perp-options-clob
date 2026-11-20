@@ -371,6 +371,35 @@ expires unexecuted proposals, and a guardian can veto anything
 instantly. Every transition emits a `GovernanceEvent` so the host
 journals governance with the same discipline as the engine journal.
 
+**Wired to the engine (v0.10):** after `Governor::execute` succeeds,
+the host submits `Command::GovernanceApply { key, value }`; the engine
+validates the key against the governed whitelist, journals
+`ParameterChanged`, and mutates `EngineConfig` through the single
+`apply_governed_parameter` path. Replay applies the identical
+mutation — parameter history is auditable by replay — and every
+application bumps `config_version`, which keys the margin cache so
+governed risk changes invalidate cached summaries.
+
+## Combined orders & implied matching (v0.10)
+
+**Crates:** `poc-combo` (pure algebra) + `poc-engine::combo` (planning)
++ `poc-engine::router` (best execution). Combined orders trade a
+package of instruments atomically at one signed net price (buyer-cost
+convention: debits, credits, and shorts in one inequality). Three
+matching regimes: combo-vs-combo at the resting limit with the
+mark-anchored on-grid `distribute_net` split; implied-in (a
+level-synchronous greedy walk over per-leg depth, executed as
+synthetic IOC takers with a two-pass STP correction that keeps lot
+ratios exact); implied-out (a plain order's remainder fills into a
+resting combo at its implied leg price while the combo hedges at the
+touch). Every regime settles through the ordinary `TradeExecuted`
+path — positions, cash, fees, revenue routing, MMP — so the combo
+layer adds no money paths. IOC/FOK shortfalls auto-publish RFQs
+collared by the taker's limit (the thin-book handoff), and
+`RfqExecuteBest` prices the best live quote against the composite
+book route and executes the cheaper net of fees. See
+`docs/COMBO_BOOK.md`.
+
 ## Execution algorithms (second closure wave)
 
 **Crate:**  + 

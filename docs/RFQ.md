@@ -380,3 +380,49 @@ mapping lives in `docs/FIX_GATEWAY.md`; the implementation in
 | Grouped multi-leg discounts | Derive V3 fee schedule | Structures trade at rational cost |
 | MMP + cancel-on-disconnect | Derive V3 MM protections | The dealer's side of the bargain |
 | Unsigned intents, event-wise settlement | dYdX v4 journal discipline | Replay determinism for the whole rail |
+
+## 11. The best-execution router (`RfqExecuteBest`)
+
+The taker of any RFQ can ask the venue to route the execution instead
+of hand-picking a quote. The router prices **both** routes for the
+RFQ's full remaining size:
+
+* **Quote route** — the best live quote that can cover the full
+  remaining (priced through `plan_take`, so ownership, windows,
+  sizes, and the RFQ's own bounds are all enforced on the candidate
+  set), cost net of the negotiated taker fees.
+* **Book route** — per-leg market sweeps of the full remaining,
+  ALL-OR-NOTHING per leg (a leg that cannot cover the size kills the
+  route), taker fees included, margin-gated, and collared by the
+  RFQ's own bounds via the signed generalization of
+  `cost_within_bounds` (a net credit to the taker satisfies any cost
+  cap; a cost floor still applies).
+
+The cheaper route **net of fees** executes, and a
+`BestExecutionReport` journals both prices plus the choice. Book-route
+settlement is ordinary `TradeExecuted` events against real resting
+makers (makers earn maker fees) followed by `RfqBookSwept`, which
+consumes the RFQ's remaining size exactly like a quote execution
+(`RfqBook::consume_external_take` — bounds need no re-check because
+the router priced the identical pure match outcomes).
+
+Fallback ladder: partial book coverage → the best (possibly partial)
+quote; margin-blocked cheaper route → the quote; nothing → rejection.
+
+## 12. The one-pool model: RFQs and the combo book
+
+The RFQ book and the combo book share the thin-liquidity mission and
+hand off to each other:
+
+* Every IOC/FOK shortfall — a single-leg sweep or a combined order —
+  **auto-publishes an RFQ** collared by the taker's limit where the
+  non-negative bound system can represent it (buyer caps yes, seller
+  floors no). The taker's explicit execution remains the control:
+  nothing auto-executes.
+* A dealer answering a combo-shaped RFQ can price inside the
+  original limit and be picked up by `RfqExecuteBest` even when the
+  taker is offline from the RFQ UI (the router executes the cheaper
+  route on demand).
+* The composite BBO (`Engine::composite_bbo`) prices what the leg
+  books imply for a structure, so desks can compare the package's
+  book route against dealer quotes before requesting anything.

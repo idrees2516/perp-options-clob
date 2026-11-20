@@ -958,6 +958,135 @@ pub enum Event {
         /// Engine wall-clock.
         ts: TimestampMs,
     },
+    /// A combined order rests on the combo book (G-11 depth).
+    ComboPlaced {
+        /// Engine-assigned combo id (own id space).
+        combo_id: u64,
+        /// Owner.
+        owner: SubaccountId,
+        /// Canonical legs (sorted, no duplicates), buyer convention.
+        legs: Vec<poc_combo::ComboLeg>,
+        /// The owner's side on the package.
+        side: Side,
+        /// Buyer-cost net limit, quote minor per unit.
+        limit_quote_minor_per_unit: i128,
+        /// Total package units.
+        units: u64,
+        /// Time-in-force.
+        tif: poc_combo::ComboTif,
+        /// Order margin reserved while the combo rests.
+        margin_reserved_quote_minor: u128,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A combined order executed `units` package units through one of
+    /// the three matching regimes. The per-leg money movements are
+    /// carried by the ordinary `TradeExecuted` events emitted alongside;
+    /// this event mutates only the combo book and its reservation.
+    ComboTraded(Box<ComboTrade>),
+    /// A combined order left the book (filled / canceled / CoD).
+    ComboClosed {
+        /// The combo.
+        combo_id: u64,
+        /// Owner.
+        owner: SubaccountId,
+        /// Why (`filled` | `canceled` | `cod` | `ioc-remainder` | `fok`).
+        reason: &'static str,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A combined-order placement was rejected at the plan gate.
+    ComboRejected {
+        /// The id the combo would have taken.
+        combo_id: u64,
+        /// Owner.
+        owner: SubaccountId,
+        /// Why.
+        reason: &'static str,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A governed parameter changed (G-33 wiring). Applied by mutating
+    /// `EngineConfig`; replay carries the identical mutation, so
+    /// parameter history is auditable by replay.
+    ParameterChanged {
+        /// The governed parameter key.
+        key: String,
+        /// The new value.
+        value: String,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// A governed parameter application was rejected at the plan gate
+    /// (unknown or unparseable key).
+    ParameterRejected {
+        /// The requested key.
+        key: String,
+        /// Why.
+        reason: &'static str,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// The best-execution router priced both routes for an RFQ and
+    /// executed one (the executed route's settlement events follow).
+    BestExecutionReport {
+        /// The RFQ.
+        rfq_id: u64,
+        /// The executing taker.
+        taker: SubaccountId,
+        /// Net-of-fees cost of the best live quote (`None` = no live
+        /// quote could cover the take).
+        quote_cost_quote_minor: Option<i128>,
+        /// Net-of-fees cost of the composite book route (`None` = the
+        /// books cannot cover the take within the RFQ's bounds).
+        book_cost_quote_minor: Option<i128>,
+        /// Which route executed (`quote` | `book`).
+        chosen: &'static str,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+    /// The best-execution router settled an RFQ by sweeping the leg
+    /// books directly (the ordinary `TradeExecuted` events against the
+    /// resting makers precede this event; it consumes the RFQ's
+    /// remaining size exactly like a quote execution).
+    RfqBookSwept {
+        /// The RFQ.
+        rfq_id: u64,
+        /// The executing taker.
+        taker: SubaccountId,
+        /// Lots consumed per leg, aligned with the RFQ's leg order.
+        take_per_leg: Vec<u64>,
+        /// Engine wall-clock.
+        ts: TimestampMs,
+    },
+}
+
+/// One combined-order execution: the combo-side view of a package
+/// trade through one of the three matching regimes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComboTrade {
+    /// The combo that executed.
+    pub combo_id: u64,
+    /// Its owner.
+    pub owner: SubaccountId,
+    /// The counterparty subaccount (opposing combo owner, or the plain
+    /// aggressor in implied-out).
+    pub counterparty: SubaccountId,
+    /// The counterparty's combo when both sides were combos.
+    pub counterparty_combo_id: Option<u64>,
+    /// Package units executed.
+    pub units: u64,
+    /// Which regime produced the fill (`combo` | `implied-in` |
+    /// `implied-out`).
+    pub regime: &'static str,
+    /// Per-leg executions from the OWNER's viewpoint: the owner's side
+    /// on the leg, lots, and tick price that traded.
+    pub leg_executions: Vec<(Symbol, Side, u64, u64)>,
+    /// The buyer-cost net that actually traded, recomputed from the
+    /// final leg ticks (quote minor per package unit).
+    pub effective_net_quote_minor_per_unit: i128,
+    /// Engine wall-clock.
+    pub ts: TimestampMs,
 }
 
 /// Why an order left the book.

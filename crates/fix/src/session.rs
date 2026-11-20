@@ -340,6 +340,7 @@ impl FixSession {
             MsgType::Reject => Ok(Inbound::Admin),
             // Application traffic: handed to the app layer.
             MsgType::NewOrderSingle
+            | MsgType::NewOrderMultileg
             | MsgType::OrderCancelRequest
             | MsgType::OrderCancelReplaceRequest
             | MsgType::OrderStatusRequest

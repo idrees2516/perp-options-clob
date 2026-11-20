@@ -1,0 +1,1 @@
+{"$message_type":"unused_extern","lint_level":"force-warn","unused_extern_names":["poc_combo","poc_economics","poc_margin","poc_oracle","poc_settlement"]}

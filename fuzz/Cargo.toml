@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# Standalone crate outside the workspace (cargo-fuzz requirement).
+[workspace]
+
 [package.metadata]
 cargo-fuzz = true
 
@@ -13,6 +16,7 @@ poc-core = { path = "../crates/core" }
 poc-engine = { path = "../crates/engine" }
 poc-oracle = { path = "../crates/oracle" }
 poc-margin = { path = "../crates/margin" }
+poc-combo = { path = "../crates/combo" }
 poc-economics = { path = "../crates/economics" }
 poc-settlement = { path = "../crates/settlement" }
 
@@ -47,6 +51,13 @@ bench = false
 [[bin]]
 name = "fuzz_fees"
 path = "targets/fuzz_fees.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_implied_matching"
+path = "targets/fuzz_implied_matching.rs"
 test = false
 doc = false
 bench = false

@@ -129,6 +129,9 @@ pub struct EngineConfig {
     /// `RfqQuote`/`RfqQuoteSized` on enrollment + not-suspended. Rollout
     /// default is open quoting (false).
     pub enforce_dealer_program: bool,
+    /// Combined-order configuration (G-11 depth): the combo book,
+    /// implied matching, and the thin-book RFQ handoff.
+    pub combo: crate::combo::ComboConfig,
 }
 
 /// Circuit-breaker parameters (G-21).
@@ -192,8 +195,114 @@ impl Default for EngineConfig {
             quote_interest_bps_per_day: 0,
             dealer_program: poc_rfq::ProgramConfig::default(),
             enforce_dealer_program: false,
+            combo: crate::combo::ComboConfig::default(),
         }
     }
+}
+
+/// The content key of a margin-summary memoization entry: every input
+/// `margin_summary_ex` reads for a no-collateral account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MarginCacheKey {
+    /// Account cash.
+    pub cash_quote_minor: i128,
+    /// Order margin reserved by resting orders.
+    pub order_margin_quote_minor: u128,
+    /// Positions: (symbol, signed lots, avg entry per base).
+    pub positions: Vec<(Symbol, i64, u128)>,
+    /// Digest of the whole mark set (spots + instrument marks).
+    pub marks_digest: u64,
+    /// Governance version (config mutations bump it).
+    pub config_version: u64,
+}
+
+/// FNV-1a digest of a mark set: per underlying (sorted), the spot and
+/// every instrument mark. Any mark or spot movement changes the digest.
+pub(crate) fn marks_digest(marks: &BTreeMap<String, poc_margin::MarkSet>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mix = |h: &mut u64, bytes: &[u8]| {
+        for &b in bytes {
+            *h ^= u64::from(b);
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for (base, set) in marks {
+        mix(&mut h, base.as_bytes());
+        mix(&mut h, &set.spot_quote_minor_per_base.to_le_bytes());
+        for (symbol, mark) in &set.marks {
+            mix(&mut h, symbol.as_bytes());
+            let price = match mark {
+                poc_margin::Mark::Perp {
+                    mark_quote_minor_per_base,
+                } => *mark_quote_minor_per_base,
+                poc_margin::Mark::Option {
+                    premium_quote_minor_per_base,
+                    ..
+                } => *premium_quote_minor_per_base,
+            };
+            mix(&mut h, &price.to_le_bytes());
+        }
+    }
+    h
+}
+
+/// Apply a governed parameter to the engine configuration. The governed
+/// surface is a deliberate whitelist: risk figures venues actually
+/// tune at runtime, each independently parseable and replayable.
+pub(crate) fn apply_governed_parameter(
+    config: &mut EngineConfig,
+    key: &str,
+    value: &str,
+) -> Result<(), &'static str> {
+    let parse_bool = |v: &str| match v.trim() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err("value must be true/false"),
+    };
+    match key {
+        "combo.max_legs" => {
+            let v: usize = value.trim().parse().map_err(|_| "bad usize")?;
+            if v == 0 || v > 64 {
+                return Err("combo.max_legs out of range");
+            }
+            config.combo.max_legs = v;
+        }
+        "combo.implied_matching" => config.combo.implied_matching = parse_bool(value)?,
+        "combo.implied_depth_levels" => {
+            let v: usize = value.trim().parse().map_err(|_| "bad usize")?;
+            if v == 0 || v > 256 {
+                return Err("combo.implied_depth_levels out of range");
+            }
+            config.combo.implied_depth_levels = v;
+        }
+        "combo.auto_rfq_on_shortfall" => config.combo.auto_rfq_on_shortfall = parse_bool(value)?,
+        "combo.auto_rfq_ttl_ms" => {
+            let v: u64 = value.trim().parse().map_err(|_| "bad u64")?;
+            if v == 0 {
+                return Err("ttl must be positive");
+            }
+            config.combo.auto_rfq_ttl_ms = v;
+        }
+        "enforce_dealer_program" => config.enforce_dealer_program = parse_bool(value)?,
+        "quote_interest_bps_per_day" => {
+            let v: u64 = value.trim().parse().map_err(|_| "bad u64")?;
+            config.quote_interest_bps_per_day = v;
+        }
+        "adl_max_rounds" => {
+            let v: u32 = value.trim().parse().map_err(|_| "bad u32")?;
+            config.adl_max_rounds = v;
+        }
+        "vol_index_band_bps" => {
+            let v: u64 = value.trim().parse().map_err(|_| "bad u64")?;
+            config.vol_index_band_bps = v;
+        }
+        "insurance_rebalance_max_lots" => {
+            let v: u64 = value.trim().parse().map_err(|_| "bad u64")?;
+            config.insurance_rebalance_max_lots = v;
+        }
+        _ => return Err("unknown governed parameter"),
+    }
+    Ok(())
 }
 
 /// One proof-of-reserves liability row (G-35): what the venue owes one
@@ -328,6 +437,19 @@ pub struct Engine {
     /// Active MM tier fee discounts per subaccount (G-15), bps. Set
     /// only by journaled `MmTierAdjusted` events.
     pub(crate) mm_discount_bps: BTreeMap<SubaccountId, u64>,
+    /// Combined orders (G-11 depth): the combo book.
+    pub(crate) combo_book: poc_combo::ComboBook,
+    /// Order margin reserved per resting combo id (own id space —
+    /// combo ids never collide with order ids).
+    pub(crate) combo_reservations: BTreeMap<u64, u128>,
+    /// Content-addressed margin-summary memoization (planning-only,
+    /// never journaled): account -> (key, summary). A hit returns
+    /// exactly what a recompute would; stale entries simply never hit.
+    pub(crate) margin_cache:
+        std::cell::RefCell<BTreeMap<SubaccountId, (MarginCacheKey, poc_margin::MarginSummary)>>,
+    /// Governance version: bumped by every applied `ParameterChanged`;
+    /// part of the margin-cache key so governed risk changes invalidate.
+    pub(crate) config_version: u64,
     /// Next MM tier review boundary (G-15).
     pub(crate) next_mm_review_ts: TimestampMs,
     /// Day index of the last quote-interest accrual (G-18).
@@ -420,6 +542,10 @@ impl Engine {
             next_vault_id: 1,
             mm_ledger: poc_economics::MmLedger::new(),
             mm_discount_bps: BTreeMap::new(),
+            combo_book: poc_combo::ComboBook::new(),
+            combo_reservations: BTreeMap::new(),
+            margin_cache: std::cell::RefCell::new(BTreeMap::new()),
+            config_version: 1,
             next_mm_review_ts,
             last_quote_interest_day: 0,
             trades: 0,
@@ -660,6 +786,23 @@ impl Engine {
         let siblings = self.plan_oco_siblings(&events);
         events.extend(siblings);
         self.commit(events)
+    }
+
+    /// Process one single command WITHOUT returning the events — the
+    /// hot path for sequencer/WAL feed. The journal keeps the only
+    /// copy, so the per-command clone `process` pays to hand the batch
+    /// back to the caller disappears (roughly halving event
+    /// allocations per command). Behavior is identical to `process`
+    /// for single commands (batches, OCO pairs, TWAPs, and ticks keep
+    /// their sequential-commit paths in `process`).
+    pub fn process_quiet(&mut self, cmd: Command) {
+        let mut events = self.plan(&cmd);
+        let siblings = self.plan_oco_siblings(&events);
+        events.extend(siblings);
+        for event in &events {
+            self.apply_event(event);
+        }
+        self.journal.extend(events);
     }
 
     /// Apply a planned event batch and journal it.
@@ -912,10 +1055,54 @@ impl Engine {
                     Vec::new()
                 }
             }
+            Command::PlaceCombo {
+                owner,
+                legs,
+                side,
+                limit_quote_minor_per_unit,
+                units,
+                tif,
+                now,
+            } => crate::combo::plan_place_combo(
+                self,
+                *owner,
+                legs,
+                *side,
+                *limit_quote_minor_per_unit,
+                *units,
+                *tif,
+                *now,
+            ),
+            Command::CancelCombo {
+                owner,
+                combo_id,
+                now,
+            } => crate::combo::plan_cancel_combo(self, *owner, *combo_id, *now),
+            Command::RfqExecuteBest { taker, rfq_id, now } => {
+                crate::router::plan_rfq_execute_best(self, *taker, *rfq_id, *now)
+            }
+            Command::GovernanceApply { key, value, now } => {
+                // Validate against the live config so only applicable,
+                // parseable changes journal.
+                let mut probe = self.config.clone();
+                match apply_governed_parameter(&mut probe, key, value) {
+                    Ok(()) => vec![Event::ParameterChanged {
+                        key: key.clone(),
+                        value: value.clone(),
+                        ts: *now,
+                    }],
+                    Err(reason) => vec![Event::ParameterRejected {
+                        key: key.clone(),
+                        reason,
+                        ts: *now,
+                    }],
+                }
+            }
         }
     }
 
-    fn plan_rfq_create(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_rfq_create(
         &self,
         taker: SubaccountId,
         legs: &[crate::command::RfqLegCommand],
@@ -1612,10 +1799,36 @@ impl Engine {
         }
 
         // Taker lifecycle: what remains after fills and STP consumption.
-        let remaining = outcome.taker_remaining_lots;
-        let consumed = order.open_qty().saturating_sub(remaining);
+        let mut remaining = outcome.taker_remaining_lots;
+
+        // Implied matching (G-11 depth): the remainder can fill into
+        // resting combos at their implied leg price while they hedge at
+        // the touch — improvements through the taker's limit, never
+        // worse. Applies to any remainder (GTC included) before it
+        // rests or cancels.
+        if remaining > 0 && self.config.combo.implied_matching {
+            let (mut implied_events, after_implied) =
+                crate::combo::plan_implied_out_fills(self, order, remaining, now);
+            events.append(&mut implied_events);
+            remaining = after_implied;
+        }
+
+        // Thin-book handoff (G-11): an IOC/FOK remainder auto-publishes
+        // an RFQ collared by the taker's limit where the non-negative
+        // bound system can represent it (buyer caps yes, seller floors
+        // no; the taker's explicit execution remains the control).
+        // GTC/GTD never publish.
+        if remaining > 0
+            && matches!(order.tif, TimeInForce::Ioc | TimeInForce::Fok)
+            && self.config.combo.auto_rfq_on_shortfall
+        {
+            events.extend(crate::combo::plan_single_leg_shortfall_rfq(
+                self, order, remaining, now,
+            ));
+        }
+
         let mut final_order = order.clone();
-        final_order.filled_lots = consumed; // STP decrements count as consumed
+        final_order.filled_lots = order.open_qty().saturating_sub(remaining);
 
         if remaining == 0 {
             events.push(Event::OrderClosed {
@@ -1721,6 +1934,10 @@ impl Engine {
                 reason: OrderCloseReason::Canceled,
             });
         }
+        // Combined orders ride every cancel-all (G-11 depth).
+        events.extend(crate::combo::plan_cancel_all_combos(
+            self, subaccount, symbol, self.now,
+        ));
         events
     }
 
@@ -2052,6 +2269,108 @@ impl Engine {
                     }
                 }
                 crate::mm::mark_quote_interest_day(self, *ts);
+            }
+            Event::ComboPlaced {
+                combo_id,
+                owner,
+                legs,
+                side,
+                limit_quote_minor_per_unit,
+                units,
+                tif,
+                margin_reserved_quote_minor,
+                ts,
+            } => {
+                let order = poc_combo::ComboOrder {
+                    id: *combo_id,
+                    owner: *owner,
+                    legs: legs.clone(),
+                    side: *side,
+                    limit_quote_minor_per_unit: *limit_quote_minor_per_unit,
+                    units: *units,
+                    filled_units: 0,
+                    tif: *tif,
+                    seq: u64::MAX, // assigned by the book's counter
+                    ts: *ts,
+                };
+                let placed_id = self.combo_book.place(order);
+                debug_assert_eq!(placed_id, *combo_id);
+                if let Some(account) = self.accounts.get_mut(owner) {
+                    account.order_margin_quote_minor = account
+                        .order_margin_quote_minor
+                        .saturating_add(*margin_reserved_quote_minor);
+                }
+                self.combo_reservations
+                    .insert(*combo_id, *margin_reserved_quote_minor);
+            }
+            Event::ComboTraded(trade) => {
+                // Reduce the combo, scale its reservation to the remaining
+                // units (release fully when it fills).
+                let resting = self.combo_book.get(trade.combo_id).is_some();
+                let before = self
+                    .combo_book
+                    .get(trade.combo_id)
+                    .map(|c| c.open_units())
+                    .unwrap_or(0);
+                let after = self
+                    .combo_book
+                    .apply_fill(trade.combo_id, trade.units)
+                    .unwrap_or(0);
+                if !resting {
+                    // A combo that filled entirely at placement (never
+                    // rested): consume its predicted id.
+                    self.combo_book.note_rejected(trade.combo_id);
+                }
+                let reserved = self.combo_reservations.remove(&trade.combo_id);
+                if let Some(reserved) = reserved {
+                    if after > 0 {
+                        let scaled = crate::combo::scale_reservation(reserved, before, after);
+                        self.combo_reservations.insert(trade.combo_id, scaled);
+                        if let Some(account) = self.accounts.get_mut(&trade.owner) {
+                            account.order_margin_quote_minor = account
+                                .order_margin_quote_minor
+                                .saturating_sub(reserved.saturating_sub(scaled));
+                        }
+                    } else if let Some(account) = self.accounts.get_mut(&trade.owner) {
+                        account.order_margin_quote_minor =
+                            account.order_margin_quote_minor.saturating_sub(reserved);
+                    }
+                }
+            }
+            Event::ComboClosed {
+                combo_id, owner, ..
+            } => {
+                self.combo_book.remove(*combo_id);
+                if let Some(reserved) = self.combo_reservations.remove(combo_id) {
+                    if let Some(account) = self.accounts.get_mut(owner) {
+                        account.order_margin_quote_minor =
+                            account.order_margin_quote_minor.saturating_sub(reserved);
+                    }
+                }
+            }
+            Event::ComboRejected { combo_id, .. } => {
+                // Consume the predicted id so later placements never
+                // collide with a rejected one.
+                self.combo_book.note_rejected(*combo_id);
+            }
+            Event::BestExecutionReport { .. } => {
+                // Pure journal: the settlement events carry the mutations.
+            }
+            Event::ParameterChanged { key, value, .. } => {
+                // The single config-mutation path. Replay applies the
+                // identical change, so parameter history is auditable
+                // by replay (G-33 wiring).
+                if apply_governed_parameter(&mut self.config, key, value).is_ok() {
+                    self.config_version += 1;
+                }
+            }
+            Event::ParameterRejected { .. } => {}
+            Event::RfqBookSwept {
+                rfq_id,
+                take_per_leg,
+                ..
+            } => {
+                let _ = self.rfq_book.consume_external_take(*rfq_id, take_per_leg);
             }
             Event::Reward(paid) => {
                 if let Some(account) = self.accounts.get_mut(&paid.subaccount) {
@@ -3444,6 +3763,61 @@ impl Engine {
         &self.rfq_book
     }
 
+    /// Margin summary with content-addressed memoization: identical
+    /// (account content, marks, config version) returns the cached
+    /// summary instead of re-running the 18-scenario grid. Only
+    /// no-collateral accounts are cached (collateral valuation is
+    /// time-windowed and would need a time key). Planning-only state —
+    /// never journaled, rebuilt lazily, and a hit is by construction
+    /// equal to a recompute.
+    pub fn effective_margin_summary_cached(
+        &self,
+        account: &poc_margin::MarginAccount,
+        marks: &BTreeMap<String, poc_margin::MarkSet>,
+    ) -> Option<poc_margin::MarginSummary> {
+        if self
+            .collateral
+            .get(&account.id)
+            .is_some_and(|m| !m.is_empty())
+        {
+            // Collateral accounts: no cache (time-dependent valuation).
+            return self.effective_margin_summary_at(account, marks, self.now);
+        }
+        let key = MarginCacheKey {
+            cash_quote_minor: account.cash_quote_minor,
+            order_margin_quote_minor: account.order_margin_quote_minor,
+            positions: account
+                .positions
+                .iter()
+                .map(|(s, p)| (s.clone(), p.signed_lots, p.avg_entry_quote_minor))
+                .collect(),
+            marks_digest: marks_digest(marks),
+            config_version: self.config_version,
+        };
+        if let Some((hit_key, summary)) = self.margin_cache.borrow().get(&account.id) {
+            if *hit_key == key {
+                return Some(*summary);
+            }
+        }
+        let summary = self.effective_margin_summary_at(account, marks, self.now)?;
+        self.margin_cache
+            .borrow_mut()
+            .insert(account.id, (key, summary));
+        Some(summary)
+    }
+
+    /// The combined-order book (G-11 depth).
+    #[must_use]
+    pub fn combos_view(&self) -> &poc_combo::ComboBook {
+        &self.combo_book
+    }
+
+    /// Order margin reserved per resting combo id.
+    #[must_use]
+    pub fn combo_reservations_view(&self) -> &BTreeMap<u64, u128> {
+        &self.combo_reservations
+    }
+
     /// The block-trade tape (read-only).
     #[must_use]
     pub fn blocks_view(&self) -> &BlockLedger {
@@ -3753,7 +4127,15 @@ fn event_ts(event: &Event) -> TimestampMs {
         | Event::DealerStruck { ts, .. }
         | Event::DealerSuspended { ts, .. }
         | Event::DealerDropped { ts, .. }
-        | Event::DealerTierSet { ts, .. } => *ts,
+        | Event::DealerTierSet { ts, .. }
+        | Event::ComboPlaced { ts, .. }
+        | Event::ComboClosed { ts, .. }
+        | Event::ComboRejected { ts, .. }
+        | Event::BestExecutionReport { ts, .. }
+        | Event::RfqBookSwept { ts, .. }
+        | Event::ParameterChanged { ts, .. }
+        | Event::ParameterRejected { ts, .. } => *ts,
+        Event::ComboTraded(trade) => trade.ts,
     }
 }
 

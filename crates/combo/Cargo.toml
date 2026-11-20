@@ -1,0 +1,14 @@
+[package]
+name = "poc-combo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Combined (multi-leg) orders, the combo book, and implied matching for the perp-options-clob venue"
+
+[lints]
+workspace = true
+
+[dependencies]
+poc-core = { path = "../core" }

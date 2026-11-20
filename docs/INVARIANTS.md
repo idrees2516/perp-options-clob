@@ -487,3 +487,92 @@ exercise settles all agree bit for bit.
 the e2e script runs twice and compares.
 *Tests:* `full_stack_wiring_end_to_end` (lane A vs lane B
 fingerprint equality).
+
+## Combined orders & implied matching (G-11 depth)
+
+### I-62 Combo settlement conserves
+Every combined-order execution settles through the ordinary
+`TradeExecuted` path (positions, cash, fees, revenue routing, MMP,
+volume ledger), so the I-5 conserved quantity moves only by routed
+fees and custody — the combo layer adds no new money paths.
+*Enforcement:* all three regimes emit per-leg `TradeExecuted` events;
+`ComboTraded` mutates only the combo book and its reservation.
+*Tests:* `combo_settlement_conserves_cash`;
+`implied_matching_properties_hold_across_seeds` (32 seeds × 96
+commands, conservation checked after every command).
+
+### I-63 No combo self-trades
+An incoming combo never matches a resting combo of the same owner;
+implied-in/out synthetic takers run with the account's STP policy
+against the leg books.
+*Enforcement:* owner filter in `opponents_in_priority_order`; STP
+preserved per leg in the synthetic IOC passes.
+*Tests:* caught live by the property suite (the first run of
+`implied_matching_properties_hold_on_edge_seeds` found the missing
+owner filter and failed on a self-trade); regression-covered by the
+same suite.
+
+### I-64 Implied fills respect both limits
+Implied-in walks stop at the first depth stratum whose per-unit net
+violates the taker's limit; implied-out fills only at implied prices
+that satisfy the aggressor's limit, and the bound derivation floors
+(max-pay) or ceils (min-receive) against the combo's own constraint.
+*Enforcement:* `poc_combo::plan_implied_in` monotone walk;
+`poc_combo::implied_out_bound` grid rounding; post-hoc net
+verification from the actual fills.
+*Tests:* `implied_in_respects_the_net_limit`,
+`implied_out_never_worse_than_the_taker_limit`.
+
+### I-65 The effective net is recomputed from final ticks
+The net that trades is recomputed from the integer tick prices that
+actually executed, never the target — grid rounding lands in the
+absorber leg and both limits are re-verified against the effective
+net.
+*Enforcement:* `poc_combo::distribute_net` returns the recomputed
+effective net; both `accepts_net` checks in `plan_place_combo`.
+*Tests:* `combo_vs_combo_trades_at_the_resting_limit` (net within a
+tick of the resting limit).
+
+### I-66 Implied-in lot ratios are exact
+A package unit always executes `ratio × units` lots on every leg —
+the two-pass STP correction shrinks all legs together when STP
+consumes part of one.
+*Enforcement:* pass 1 discovers STP-adjusted availability; pass 2
+re-matches at the exact shrunk size.
+*Tests:* the trade-derived position model in
+`implied_properties.rs` / `fuzz_implied_matching` (engine positions
+must equal the sum of journaled trade quantities, which catches any
+ratio drift); `spread_assembles_atomically_from_thin_wings`.
+
+### I-67 Combo reservations scale and release
+Order margin reserved by a resting combo scales with its remaining
+units on every fill and releases fully at close (fill, cancel, CoD,
+IOC remainder).
+*Enforcement:* `ComboTraded`/`ComboClosed` apply arms; reservations
+live in their own id space.
+*Tests:* `cancel_releases_and_fills_scale_reservations`,
+`cancel_all_pulls_combos`; the property suite checks every open combo
+has a reservation entry after every command.
+
+### I-68 The best-execution router prices both routes before choosing
+`RfqExecuteBest` prices the best full-cover live quote (via
+`plan_take`, so only executable quotes count) and the all-or-nothing
+composite book route (bounds-checked with the signed generalization of
+`cost_within_bounds`, margin-gated), journals a `BestExecutionReport`
+with both numbers, and executes the cheaper net of fees.
+*Enforcement:* `router.rs` decision table; the book route settles as
+ordinary trades + `RfqBookSwept` (consuming the RFQ exactly like a
+quote execution).
+*Tests:* `cheaper_book_route_wins`, `cheaper_quote_wins`,
+`cost_collar_blocks_an_expensive_book_route`,
+`partial_book_coverage_falls_back_to_the_quote`,
+`router_journal_replays_bit_for_bit`.
+
+### I-69 Governed parameters journal (G-33 wiring)
+Every `EngineConfig` mutation flows through `GovernanceApply` →
+`ParameterChanged` → `apply_governed_parameter`; replay applies the
+identical change, so parameter history is auditable by replay.
+*Enforcement:* the governed-key whitelist; `config_version` bumps on
+every application and keys the margin cache.
+*Tests:* `governed_parameter_applies_and_changes_behavior`,
+`replay_carries_parameter_history`.

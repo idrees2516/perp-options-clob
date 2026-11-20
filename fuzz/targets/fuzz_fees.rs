@@ -22,7 +22,7 @@ fuzz_target!(|data: &[u8]| {
     let tier = schedule.tier_for(0).clone();
     for _ in 0..32 {
         let notional = u128::from(next(&mut seed) % 1_000_000_000);
-        let premium = 1 + next(&mut seed) % 100_000;
+        let premium = u128::from(1 + next(&mut seed) % 100_000);
         let fee = FeeCalculator::option_taker_fee(&tier, &caps, notional, premium).unwrap_or(0);
         let cap = poc_core::mul_div(
             premium,

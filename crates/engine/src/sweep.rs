@@ -778,7 +778,10 @@ fn plan_liquidations(
     // Candidates, most severe deficit first (deterministic order).
     let mut candidates: Vec<LiquidationCandidate> = Vec::new();
     for (sub, account) in &engine.accounts {
-        if let Some(summary) = engine.effective_margin_summary_at(account, marks, now) {
+        // The content-addressed margin cache (docs/EFFICIENCY.md):
+        // unchanged (account, marks, config) skips the 18-scenario
+        // grid — the candidacy scan becomes O(at-risk accounts).
+        if let Some(summary) = engine.effective_margin_summary_cached(account, marks) {
             if summary.equity_quote_minor < to_i128(summary.maintenance_quote_minor) {
                 candidates.push(LiquidationCandidate {
                     subaccount: *sub,

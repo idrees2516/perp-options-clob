@@ -590,7 +590,9 @@ Feature history, PR by PR: v0.6 (American options + channel book) ·
 gap-closure waves 3–4 (OCO, TWAP parents, MM tiers, vault revenue) · the
 trading terminal · the live venue gateway · RFQ v2 (partials, privacy,
 delayed tape) · v0.7 (FIX 4.4 wiring, multi-leg structures, whole-stack
-e2e proof) · the nanosecond 0DTE platform (branch).
+e2e proof) · v0.10 (combo book + implied matching, `NewOrderMultileg`,
+best-execution router, governance wiring, margin cache) · the
+nanosecond 0DTE platform (branch).
 
 ## Web frontend — the trading terminal
 
@@ -650,7 +652,9 @@ the frontend repo's `docker-compose.yml`). Deep dives:
 | [`docs/INVARIANTS.md`](docs/INVARIANTS.md) | The invariant list the test suite enforces |
 | [`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md) | The original audit and how all 41 gaps closed |
 | [`docs/FIX_GATEWAY.md`](docs/FIX_GATEWAY.md) | The FIX 4.4 acceptor |
-| [`docs/RFQ.md`](docs/RFQ.md) | The dealer RFQ system |
+| [`docs/RFQ.md`](docs/RFQ.md) | The dealer RFQ system + best-execution router |
+| [`docs/COMBO_BOOK.md`](docs/COMBO_BOOK.md) | Combined orders, implied matching, the thin-book handoff |
+| [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md) | The six-axis architectural review: done / scoped / roadmap |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Running the venue |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) / [`docs/STRESS_TESTING.md`](docs/STRESS_TESTING.md) | Measurement and stress scenarios |
 | [`docs/FUZZING.md`](docs/FUZZING.md) / [`docs/EFFICIENCY.md`](docs/EFFICIENCY.md) | Fuzz targets; efficiency notes |

@@ -20,7 +20,7 @@ use poc_core::{
     OptionMarginParams, OptionMarket, OptionVariant, OrderType, PerpMarket, SelfTradePrevention,
     Side, Symbol, TimeInForce, TimestampMs,
 };
-use poc_engine::{Command, OrderRequest, RfqLegCommand};
+use poc_engine::{ComboLegCommand, Command, OrderRequest, RfqLegCommand};
 
 /// Encode an instrument (the genesis-frame payload).
 #[must_use]
@@ -589,6 +589,56 @@ fn decode_request(d: &mut Decoder<'_>) -> Result<OrderRequest, DecodeError> {
     })
 }
 
+fn encode_combo_leg(e: &mut Encoder, l: &ComboLegCommand) {
+    e.str(&l.symbol);
+    encode_side(e, l.side);
+    e.varint(u128::from(l.ratio));
+}
+
+fn decode_combo_leg(d: &mut Decoder<'_>) -> Result<ComboLegCommand, DecodeError> {
+    Ok(ComboLegCommand {
+        symbol: d.str()?,
+        side: decode_side(d)?,
+        ratio: u32::try_from(d.varint()?).unwrap_or(0),
+    })
+}
+
+fn encode_combo_tif(e: &mut Encoder, t: poc_combo::ComboTif) {
+    let tag: u8 = match t {
+        poc_combo::ComboTif::Gtc => 0,
+        poc_combo::ComboTif::Ioc => 1,
+        poc_combo::ComboTif::Fok => 2,
+    };
+    e.varint(u128::from(tag));
+}
+
+fn decode_combo_tif(d: &mut Decoder<'_>) -> Result<poc_combo::ComboTif, DecodeError> {
+    match d.varint()? {
+        0 => Ok(poc_combo::ComboTif::Gtc),
+        1 => Ok(poc_combo::ComboTif::Ioc),
+        2 => Ok(poc_combo::ComboTif::Fok),
+        other => Err(DecodeError::UnknownTag(other as u8)),
+    }
+}
+
+/// Signed 128-bit as one sign byte + u128 magnitude varint.
+fn encode_i128(e: &mut Encoder, v: i128) {
+    let negative = v < 0;
+    e.bool(negative);
+    e.varint(v.unsigned_abs());
+}
+
+fn decode_i128(d: &mut Decoder<'_>) -> Result<i128, DecodeError> {
+    let negative = d.bool()?;
+    let magnitude = d.varint()?;
+    let v = i128::try_from(magnitude).map_err(|_| DecodeError::Malformed)?;
+    if negative {
+        Ok(-v)
+    } else {
+        Ok(v)
+    }
+}
+
 fn encode_rfq_leg(e: &mut Encoder, l: &RfqLegCommand) {
     e.str(&l.symbol);
     encode_side(e, l.side);
@@ -967,6 +1017,49 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
             e.varint(u128::from(*subaccount));
             e.varint(u128::from(*now));
         }
+        Command::PlaceCombo {
+            owner,
+            legs,
+            side,
+            limit_quote_minor_per_unit,
+            units,
+            tif,
+            now,
+        } => {
+            e.varint(35);
+            e.varint(u128::from(*owner));
+            e.varint(u128::try_from(legs.len()).unwrap_or(u128::MAX));
+            for leg in legs {
+                encode_combo_leg(&mut e, leg);
+            }
+            encode_side(&mut e, *side);
+            encode_i128(&mut e, *limit_quote_minor_per_unit);
+            e.varint(u128::from(*units));
+            encode_combo_tif(&mut e, *tif);
+            e.varint(u128::from(*now));
+        }
+        Command::CancelCombo {
+            owner,
+            combo_id,
+            now,
+        } => {
+            e.varint(36);
+            e.varint(u128::from(*owner));
+            e.varint(u128::from(*combo_id));
+            e.varint(u128::from(*now));
+        }
+        Command::RfqExecuteBest { taker, rfq_id, now } => {
+            e.varint(37);
+            e.varint(u128::from(*taker));
+            e.varint(u128::from(*rfq_id));
+            e.varint(u128::from(*now));
+        }
+        Command::GovernanceApply { key, value, now } => {
+            e.varint(38);
+            e.str(key);
+            e.str(value);
+            e.varint(u128::from(*now));
+        }
         Command::RfqExecutePartial {
             taker,
             rfq_id,
@@ -1271,6 +1364,41 @@ pub fn decode_command(data: &[u8]) -> Result<Command, DecodeError> {
             subaccount: d.u64()?,
             now: d.u64()?,
         },
+        35 => {
+            let owner = d.u64()?;
+            let n = usize::try_from(d.varint()?).unwrap_or(usize::MAX);
+            if n > 64 {
+                return Err(DecodeError::Malformed);
+            }
+            let mut legs = Vec::with_capacity(n);
+            for _ in 0..n {
+                legs.push(decode_combo_leg(&mut d)?);
+            }
+            Command::PlaceCombo {
+                owner,
+                legs,
+                side: decode_side(&mut d)?,
+                limit_quote_minor_per_unit: decode_i128(&mut d)?,
+                units: d.u64()?,
+                tif: decode_combo_tif(&mut d)?,
+                now: d.u64()?,
+            }
+        }
+        36 => Command::CancelCombo {
+            owner: d.u64()?,
+            combo_id: d.u64()?,
+            now: d.u64()?,
+        },
+        37 => Command::RfqExecuteBest {
+            taker: d.u64()?,
+            rfq_id: d.u64()?,
+            now: d.u64()?,
+        },
+        38 => Command::GovernanceApply {
+            key: d.str()?,
+            value: d.str()?,
+            now: d.u64()?,
+        },
         60 => Command::Exercise {
             subaccount: d.u64()?,
             symbol: Symbol::from(d.str()?),
@@ -1519,6 +1647,68 @@ mod tests {
         };
         let buf = encode_command(&cmd);
         assert_eq!(decode_command(&buf).as_ref(), Ok(&cmd));
+    }
+
+    #[test]
+    fn combo_commands_round_trip() {
+        use super::*;
+        let commands = vec![
+            Command::PlaceCombo {
+                owner: 7,
+                legs: vec![
+                    ComboLegCommand {
+                        symbol: "BTC-C1".into(),
+                        side: Side::Bid,
+                        ratio: 1,
+                    },
+                    ComboLegCommand {
+                        symbol: "BTC-C2".into(),
+                        side: Side::Ask,
+                        ratio: 3,
+                    },
+                ],
+                side: Side::Bid,
+                limit_quote_minor_per_unit: -825,
+                units: 12,
+                tif: poc_combo::ComboTif::Ioc,
+                now: 99,
+            },
+            Command::PlaceCombo {
+                owner: 8,
+                legs: vec![ComboLegCommand {
+                    symbol: "BTC-PERP".into(),
+                    side: Side::Ask,
+                    ratio: 2,
+                }],
+                side: Side::Ask,
+                limit_quote_minor_per_unit: 1_000_000,
+                units: 1,
+                tif: poc_combo::ComboTif::Gtc,
+                now: 100,
+            },
+            Command::CancelCombo {
+                owner: 7,
+                combo_id: 3,
+                now: 101,
+            },
+            Command::RfqExecuteBest {
+                taker: 9,
+                rfq_id: 4,
+                now: 102,
+            },
+            Command::GovernanceApply {
+                key: "combo.implied_matching".into(),
+                value: "false".into(),
+                now: 103,
+            },
+        ];
+        for cmd in &commands {
+            let buf = encode_command(cmd);
+            assert!(
+                decode_command(&buf).as_ref() == Ok(cmd),
+                "round trip {cmd:?}"
+            );
+        }
     }
 
     #[test]

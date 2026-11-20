@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/combo",
     "crates/core",
     "crates/orderbook",
     "crates/oracle",
